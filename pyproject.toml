@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+dynamic = ["version"]
+
+[project]
+name = "vehicles"
+authors = [
+  {name = "David Graey", email = "graeyband@gmail.com" },
+]
+
+description = "fill in a description"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib",
+    "dvc",
+    "numpy"
+]
+
+
+[project.optional-dependencies]
+gui=["matplotlib.pyplot"]
+
+classifiers = [
+    "Development Status :: Development Pre-Release",
+    "Programming Language :: Python >= 3.10",
+    "License :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+keywords = ["good", "stuff"]
+
+
+
+[project.urls]
+"Homepage" = "https://github.com/pypa/sampleproject"
+"Repository" = "https://github.com/me/spam.git"
+"Changelog" = "https://github.com/me/spam/blob/master/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/pypa/sampleproject/issues"
