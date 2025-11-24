@@ -1,5 +1,0 @@
-""" defining custom colors """
-
-COLORS = {
-    "" : ()
-}

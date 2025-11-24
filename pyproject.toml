@@ -5,19 +5,23 @@ build-backend = "setuptools.build_meta"
 dynamic = ["version"]
 
 [project]
-name = "vehicles"
+name = "ml-tools"
+dynamic = ["version"]
 authors = [
   {name = "David Graey", email = "graeyband@gmail.com" },
 ]
 
-description = "fill in a description"
+description = "tools for ML, supervised and unsupervised tasks"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "matplotlib",
     "dvc",
-    "numpy"
+    "numpy",
+    ""
 ]
+
+[project.dependencies]
 
 
 [project.optional-dependencies]
