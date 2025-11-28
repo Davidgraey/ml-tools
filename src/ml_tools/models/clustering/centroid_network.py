@@ -2,10 +2,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial.distance import cdist
-from .cluster_metrics import silhouette_score
+from ml_tools.models.clustering.cluster_metrics import silhouette_score
 EPSILON = 1e-12
 
 
+# TODO: fucked up the plotting?  Or the "closest labels" --> centroids appear good, but labels are wack
 class CentroidNeuralNetwork:
     def __init__(self,
                  max_clusters: int,
@@ -86,10 +87,10 @@ class CentroidNeuralNetwork:
         the unstandardized centroid locations and the class labels for each data point
         """
         # check and see if we've done the standardization process:
-        if self.x_means:
-            pass
-        else:
+        if self.x_means is None:
             self.init_standardize(x_data)
+        else:
+            pass
 
         x_data = self.standardize(x_data)
         num_samples, num_features = x_data.shape
@@ -117,7 +118,7 @@ class CentroidNeuralNetwork:
             self.centroids = self.standardize(self.centroids)
 
         num_centroids = self.centroids.shape[0]
-
+        print(num_centroids)
         while num_centroids <= self.max_clusters:
             # minibatch
             mini_mask = self.RNG.randint(0, num_samples, size=batch_size)
@@ -181,8 +182,8 @@ class CentroidNeuralNetwork:
         # Calculate for all datapoints ----
         full_distances = self.distance_metric(data_x=x_data, data_y=self.centroids[:num_centroids])
         closest_centroids = np.argmin(full_distances, axis=-1)
-
-        return self.unstandardize(self.centroids[:num_centroids, ...]), self._label_tracker.get(num_centroids + 1)
+        print(num_centroids)
+        return self.unstandardize(self.centroids[:num_centroids-1, ...]), self._label_tracker.get(num_centroids-1, None)
 
     def get_optimal(self) -> tuple[int, NDArray, NDArray]:
         """
@@ -213,7 +214,7 @@ def plot_clusters(x_data: NDArray, centroids: NDArray, labels: NDArray) -> None:
     ax = plt.figure(figsize=(8, 6)).add_subplot()
     k = 15
     current_k = len(centroids)
-    colors = plt.get_cmap('tab20', k)
+    colors = plt.get_cmap('tab20', current_k)
     for clust_idx in range(current_k):
         cluster_points = x_data[labels == clust_idx]
         ax.scatter(
@@ -223,6 +224,7 @@ def plot_clusters(x_data: NDArray, centroids: NDArray, labels: NDArray) -> None:
             color=colors(clust_idx),
             label=f'Cluster {clust_idx + 1}',
             alpha=0.25)
+        plt.show()
     for clust_idx in range(current_k):
         ax.scatter(
             x=centroids[clust_idx, 0],
@@ -248,38 +250,36 @@ if __name__ == "__main__":
     import time
     from ml_tools.generators import RandomDatasetGenerator
 
-    np.random.seed(42)
-    X = np.vstack(
-        [
-            np.random.randn(300, 2) + [0, 0],
-            np.random.randn(300, 2) + [2, 2],
-            np.random.randn(300, 2) + [4, 4],
-            np.random.randn(300, 2) + [6, 6],
-            np.random.randn(300, 2) + [0, 6],
-            np.random.randn(300, 2) + [6, 0],
-        ]
-    )
-    st = time.time()
-    cnn = CentroidNeuralNetwork(max_clusters=20, epsilon=0.05)
-    centroids, labels = cnn.fit_predict(X, verbose=False, fast_forward=True)
-    print(cnn.metrics)
-    print("took", (time.time() - st) * 1000)
-    plot_clusters(X, centroids, labels)
+    gen = RandomDatasetGenerator(random_seed=42)
+    X, y, meta = gen.generate(task="clustering",
+                              num_samples=1000,
+                              num_features=2,
+                              noise_scale=0.33,
+                              num_clusters=3,
+                              verbose=True
+                              )
 
-    # st = time.time()
-    # cnn = CentroidNeuralNetwork(max_clusters=20, epsilon=0.1)
-    # centroids, labels = cnn.fit(X, verbose=False, fast_forward=True)
-    # print(cnn.metrics)
-    # print("verbose took", (time.time() - st )* 1000)
-    # plot_clusters(X, centroids, labels)
-    # clust_count, opt_centroids, opt_labels = cnn.get_optimal()
-    # plot_clusters(X, opt_centroids, opt_labels)
+    plot_clusters(X, meta["centroids"], y)
+    plt.show()
+    st = time.time()
+
+    for eps in np.arange(3, 5):
+        cnn = CentroidNeuralNetwork(max_clusters=eps, epsilon=0.1)
+        centroids, labels = cnn.fit_predict(X, verbose=False, fast_forward=False)
+        print(cnn.metrics)
+        print("verbose took", (time.time() - st ) * 1000)
+        plot_clusters(X, centroids, labels)
+        # clust_count, opt_centroids, opt_labels = cnn.get_optimal()
+        # plot_clusters(X, opt_centroids, opt_labels)
+
 
     # for eps in np.arange(2, 5):
     #     st = time.time()
-    #     cnn = CentroidNeuralNetwork(max_clusters=20, epsilon=1/eps)
-    #     centroids, labels = cnn.fit(X, verbose=False, fast_forward=False)
+    #     cnn = CentroidNeuralNetwork(max_clusters=10, epsilon=1/eps)
+    #     centroids, labels = cnn.fit_predict(X, verbose=False, fast_forward=False)
     #     print("EPS: ", 1/eps)
     #     print(cnn.metrics)
     #     print("verbose took", (time.time() - st) * 1000)
+    #     plt.scatter(X[:, 0], X[:, 1], color=labels)
     #     plot_clusters(X, centroids, labels)
+    #     plt.show()
