@@ -10,32 +10,19 @@ dynamic = ["version"]
 authors = [
   {name = "David Graey", email = "graeyband@gmail.com" },
 ]
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "scipy"
+]
 
 description = "tools for ML, supervised and unsupervised tasks"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "matplotlib",
-    "dvc",
-    "numpy",
-    ""
-]
-
-[project.dependencies]
 
 
 [project.optional-dependencies]
 gui=["matplotlib.pyplot"]
-
-classifiers = [
-    "Development Status :: Development Pre-Release",
-    "Programming Language :: Python >= 3.10",
-    "License :: MIT License",
-    "Operating System :: OS Independent",
-]
-
-keywords = ["good", "stuff"]
-
 
 
 [project.urls]

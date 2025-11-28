@@ -3,6 +3,7 @@ description
 https://packaging.python.org/en/latest/
 
 """
+from .data_generators import RandomDatasetGenerator
 import logging
 
 __version__ = "0.1.0"

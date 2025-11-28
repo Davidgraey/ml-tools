@@ -246,6 +246,7 @@ def plot_clusters(x_data: NDArray, centroids: NDArray, labels: NDArray) -> None:
 # Example usage:
 if __name__ == "__main__":
     import time
+    from ml_tools.generators import RandomDatasetGenerator
 
     np.random.seed(42)
     X = np.vstack(
