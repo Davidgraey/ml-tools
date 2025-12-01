@@ -6,7 +6,9 @@ from ml_tools.models.clustering.cluster_metrics import silhouette_score
 from ml_tools.types import BasalModel
 EPSILON = 1e-12
 
-# class CentroidNeuralNetwork(BasalModel)
+
+# class CentroidNeuralNetwork(BasalModel):
+    # super().__init__()
 class CentroidNeuralNetwork:
     def __init__(self,
                  max_clusters: int,

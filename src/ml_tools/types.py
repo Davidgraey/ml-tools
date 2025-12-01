@@ -49,6 +49,9 @@ class BasalModel(ABC):
     def weights(self):
         return self.weights[1:, ...]
 
+    @property
+    def params(self):
+        return
 # -------------- Protocols for functional processes  --------------
 
 # Loss protocol
