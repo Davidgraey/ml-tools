@@ -6,13 +6,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 # Local Files
-import mltools.smlib.mltools.models.plsom_utils as plsom_utils
-# we could remove this
-from mltools.smlib.mltools.models.centroid_network import CentroidNeuralNetwork, plot_clusters
-from mltools.smlib.mltools.models.constants import EPSILON
+import ml_tools.models.clustering.plsom_utils as plsom_utils
+from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork, plot_clusters
+from ml_tools.models.constants import EPSILON
+from ml_tools.types import BasalModel
 
 
-class PLSOM(object):
+class PLSOM:
     """
     Parameterless Self Organizing Map
     https://arxiv.org/pdf/0705.0199
@@ -91,11 +91,6 @@ class PLSOM(object):
     def initialize_weights(self, x: NDArray, method='kaiming') -> NDArray:
         """
         We will use a nnet-style of initialization for weights
-        https://arxiv.org/pdf/1210.5873.pdf
-
-        :param method:
-
-        :return: returns the init weights
         Parameters
         ----------
         x : array of x dataponts
@@ -105,7 +100,6 @@ class PLSOM(object):
         -------
         returns the init weights -> to assing to self.weights
         """
-        # TODO: enum the options
         if method in ['kaiming', 'he']:
             # may need to scale down bound further!
             bound = np.sqrt(2 / self.N_DIMS)
@@ -130,7 +124,7 @@ class PLSOM(object):
             self.weights = self.initialize_weights(_x, method='sample_space')
         return _x
 
-    def train(self, x: NDArray, epochs: int) -> None:
+    def fit(self, x: NDArray, epochs: int) -> None:
 
         _x = self.pretrain_step(x)
 
@@ -194,9 +188,7 @@ class PLSOM(object):
         BMU for each sample (shape batch_size, 1), distances to each neuron (shape batch_size, n_neurons)
         """
         dist = self.distance_function(x, self.weights)
-        # TODO: axis may have to change if we move to batching
         bmu_i = np.argmin(dist, axis=-1)
-
         return bmu_i, dist
 
     def calc_epsilon(self, bmu_distance: NDArray) -> NDArray:
@@ -476,8 +468,8 @@ class PLSOM(object):
         )
 
         _, _ = self.clust_model.fit_predict(
-            x_data=self.weights,
-            num_iterations=15,
+            org_x_data=self.weights,
+            num_iterations=25,
             fast_forward=False,
             verbose=False
         )
@@ -519,7 +511,7 @@ def plsom_fit_predict(processed_features: NDArray, grid_dim: int, max_clusters: 
                      lock_seed=1,
                      distance='euclidean')
 
-    som_nnet.train(processed_features, epochs=n_epochs)
+    som_nnet.fit(processed_features, epochs=n_epochs)
     som_nnet.plot_grid(samples=0, highlight_idx=None)
 
     prediction = som_nnet.predict_clusters(x=processed_features,
@@ -533,15 +525,16 @@ def plsom_fit_predict(processed_features: NDArray, grid_dim: int, max_clusters: 
 
 if __name__ == "__main__":
     # Example usage
-    from data_generators import RandomDatasetGenerator
+    from ml_tools.generators import RandomDatasetGenerator
+    from ml_tools.models.clustering.cluster_metrics import homogeneity
 
     gen = RandomDatasetGenerator(random_seed=123)
     x_clust, y_clust, meta_clust = gen.generate(
         task='clustering',
         num_samples=1500,
-        num_features=512,
+        num_features=128,
         num_clusters=9,
-        noise_scale=0.66
+        noise_scale=0.33
     )
 
     max_clusters = 15
@@ -551,9 +544,8 @@ if __name__ == "__main__":
                                         grid_dim=dim,
                                         max_clusters=max_clusters)
         print("one_cluster predict took: ", time.time() - st)
-        from sklearn.metrics import normalized_mutual_info_score, homogeneity_score
+
 
         print("Predictions:", predictions[:20])
         print("Truth:", y_clust[:20])
-        print(normalized_mutual_info_score(predictions, y_clust))
-        print(homogeneity_score(predictions, y_clust))
+        print(homogeneity(predictions, y_clust))

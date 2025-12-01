@@ -4,7 +4,7 @@ from collections import deque
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
-from mltools.smlib.mltools.models.constants import EPSILON
+from ml_tools.models.constants import EPSILON
 
 # from smlib.mltools import log
 

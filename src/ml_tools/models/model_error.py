@@ -4,7 +4,7 @@ ERROR FUNCTIONS all done in Numpy--
 import numpy as np
 from numpy.typing import NDArray
 from enum import Enum
-from mltools.smlib.mltools.models.plsom_utils import cosine_distance
+from ml_tools.models.plsom_utils import cosine_distance
 
 class Reductions(Enum):
     MEAN = 'mean'

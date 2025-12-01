@@ -4,10 +4,8 @@ Typing complex objects & definitions for __package__
 from enum import Enum, auto
 import numpy as np
 from numpy.typing import NDArray, ArrayLike
-from typing import Protocol, Tuple, Dict, List, Optional, Union, Iterable, Callable
-from typing_extensions import TypedDict
+from typing import Protocol, Tuple, Dict, List, Optional, Union, Iterable, Callable, TypedDict
 from abc import ABC, abstractmethod
-from typing_extensions import TypedDict
 
 
 # -------------- Model Base Class  --------------
@@ -54,7 +52,7 @@ class BasalModel(ABC):
 # -------------- Protocols for functional processes  --------------
 
 # Loss protocol
-@Protocol
+# @Protocol
 def basal_loss(prediction: NDArray, targets: NDArray, **kwargs) -> NDArray:
     return
 
