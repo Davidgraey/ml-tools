@@ -46,3 +46,4 @@ def determine_classification_task(targets: NDArray) -> ClassificationTask:
         task = ClassificationTask("multilabel")
 
     return task
+

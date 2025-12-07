@@ -7,25 +7,23 @@ from ml_tools.types import BasalModel
 EPSILON = 1e-12
 
 
-# class CentroidNeuralNetwork(BasalModel):
-    # super().__init__()
-class CentroidNeuralNetwork:
+class CentroidNeuralNetwork(BasalModel):
     def __init__(self,
                  max_clusters: int,
                  seed: int = 42,
                  initial_clusters: NDArray | None = None,
                  epsilon: float = 2e-3):
+        super().__init__(seed=seed)
         self.max_clusters = max_clusters
         self.epsilon = epsilon
-        self.RNG = np.random.RandomState(seed)
 
         if initial_clusters is not None:
             self.centroids = initial_clusters
         else:
             self.centroids = None
         self.previous_labels = None
-        self.x_means = None
-        self.x_stds = None
+        self.num_seen_samples: int = 0
+
         self._label_tracker = {}
         self._centroid_tracker = {}
 
@@ -48,51 +46,6 @@ class CentroidNeuralNetwork:
         """
         distances = cdist(data_x, data_y, metric='sqeuclidean')
         return distances
-
-    def standardize(self, data_array: NDArray) -> NDArray:
-        """
-        Standardize our data array
-        Parameters
-        ----------
-        data_array : numpy array of x-variable
-
-        Returns
-        -------
-        the mean and standard deviation of the data array
-        """
-        assert data_array.shape[-1] == self.x_means.shape[0]
-
-        return (data_array - self.x_means) / (self.x_stds + EPSILON)
-
-    def unstandardize(self, data_array: NDArray) -> NDArray:
-        """
-
-        Parameters
-        ----------
-        data_array :
-
-        Returns
-        -------
-
-        """
-        assert data_array.shape[-1] == self.x_means.shape[0]
-
-        return data_array * (self.x_stds - EPSILON) + self.x_means
-
-    def init_standardize(self, x_data: NDArray) -> None:
-        """
-
-        Parameters
-        ----------
-        x_data : NDArray
-
-        Returns
-        -------
-
-        """
-        self.x_means = np.mean(x_data, axis=0)
-        self.x_stds = np.std(x_data, axis=0)
-        pass
 
     def batch_update(
             self,
@@ -117,26 +70,6 @@ class CentroidNeuralNetwork:
 
         return changed_count
 
-    def _calculate_closest_centroids(self, xs: NDArray, num_centroids: int, axis: int=-1) -> NDArray:
-        """
-
-        Parameters
-        ----------
-        xs : the data array
-        num_centroids : integer, the number of centroids
-        axis : which axis to collect across (usually -1)
-
-        Returns
-        -------
-        array of integers for the closest centroid to each datapoint
-        """
-        full_distances = self.distance_metric(
-            data_x=xs,
-            data_y=self.centroids[:num_centroids],
-        )
-        closest_centroids = np.argmin(full_distances, axis=axis)
-        return closest_centroids
-
     def _update_labels(
             self,
             num_clusters: int,
@@ -149,7 +82,7 @@ class CentroidNeuralNetwork:
         self._label_tracker[num_clusters][shuffle_mask] = closest_centroids
         pass
 
-    def fit_predict(
+    def fit(
         self,
         org_x_data: NDArray,
         verbose: bool = False,
@@ -170,10 +103,7 @@ class CentroidNeuralNetwork:
         the unstandardized centroid locations and the class labels for each data point
         """
         # check and see if we've done the standardization process:
-        if self.x_means is None:
-            self.init_standardize(org_x_data)
-        else:
-            pass
+        self.init_standardize(org_x_data)
 
         x_data = self.standardize(org_x_data)
         num_samples, num_features = x_data.shape
@@ -211,7 +141,7 @@ class CentroidNeuralNetwork:
             xs = x_data[shuffle_mask, ...]
             for i in range(0, num_iterations):
                 # get the "previous labels" --------------------------
-                closest_centroids = self._calculate_closest_centroids(xs, num_centroids, axis=-1)
+                closest_centroids = self.forward(xs, num_centroids, axis=-1)
 
                 changed_count = self.batch_update(
                     num_centroids=num_centroids,
@@ -229,19 +159,12 @@ class CentroidNeuralNetwork:
                 print(f"breaking from iterations at {num_centroids} centroids created ")
                 break
 
-            error = np.zeros(num_centroids)
-            for cluster_idx in range(0, num_centroids):
-                mask = (closest_centroids == cluster_idx)
-                if np.any(mask):
-                    # distance metric --
-                    error[cluster_idx] = np.sum(
-                        self.distance_metric(
-                            xs[mask],
-                            self.centroids[cluster_idx].reshape(1, -1)
-                        )
-                    )
-                else:
-                    error[cluster_idx] = 0
+            # calculate loss
+            error = self.calculate_loss(
+                x_data=xs,
+                closest_centroids=closest_centroids,
+                num_centroids=num_centroids
+            )
 
             if verbose and (fast_forward is False):
                 plot_clusters(xs, self.centroids[:num_centroids], closest_centroids)
@@ -283,6 +206,115 @@ class CentroidNeuralNetwork:
             self.unstandardize(self.centroids[:num_centroids, ...]),
             self._label_tracker[num_centroids]
             )
+
+    def fit_predict(
+            self,
+            org_x_data: NDArray,
+            verbose: bool = False,
+            num_iterations: int = 25,
+            fast_forward: bool = True,
+            mini_batch: bool = False
+        ) -> tuple[NDArray, NDArray]:
+        """
+        Fit the clustering model to the data, return the centroids and labels for each data point.
+        Parameters
+        ----------
+        org_x_data : numpy.ndarray
+        verbose : bool Verbose will trigger plotting and additional outputs during the fit process
+        fast_forward : bool - if True, will skip metric calculations and plotting
+
+        Returns
+        -------
+        the unstandardized centroid locations and the class labels for each data point
+        """
+
+        return self.fit(org_x_data, verbose, num_iterations, fast_forward, mini_batch)
+
+    def forward(self, x_data: NDArray, num_centroids: int, axis: int=-1) -> NDArray:
+        """
+        Calculate the closest centroid to each sampl in x_data
+
+        Parameters
+        ----------
+        x_data : the data array
+        num_centroids : integer, the number of centroids
+        axis : which axis to collect across (usually -1)
+
+        Returns
+        -------
+        array of integers (cluster membership for the closest centroid to each datapoint
+        """
+        full_distances = self.distance_metric(
+            data_x=x_data,
+            data_y=self.centroids[:num_centroids],
+        )
+
+        closest_centroids = np.argmin(full_distances, axis=axis)
+
+        return closest_centroids
+
+    def predict(self, x_data: NDArray) -> tuple[int, NDArray, NDArray]:
+        """
+        Standardize and predict the x_data using the already fitted parameters of the centroid nnet
+
+        Parameters
+        ----------
+        x_data : input sample data -> must match the dimension count of the data used during fitting
+
+        Returns
+        -------
+        the results of get_optimal -> optimal number of centroids, the centroid positions, and the centroid
+        membership (integer per x data sample)
+        """
+
+        xs = self.standardize(x_data)
+        for num_centroids in range(0, self.max_clusters):
+            closest_centroids = self.forward(
+                x_data=xs,
+                num_centroids=num_centroids,
+                axis=-1
+            )
+            self._update_labels(
+                num_clusters=num_centroids,
+                closest_centroids=closest_centroids,
+                shuffle_mask=np.arange(0, xs.shape[0])
+            )
+
+        return self.get_optimal()
+
+    # predictions, targets
+    def calculate_loss(
+            self,
+            x_data: NDArray,
+            closest_centroids: NDArray,
+            num_centroids: int
+    ) -> NDArray:
+        """
+
+        Parameters
+        ----------
+        x_data :
+        closest_centroids :
+        num_centroids :
+
+        Returns
+        -------
+
+        """
+        error = np.zeros(num_centroids)
+        for cluster_idx in range(0, num_centroids):
+            mask = (closest_centroids == cluster_idx)
+            if np.any(mask):
+                # distance metric --
+                error[cluster_idx] = np.sum(
+                    self.distance_metric(
+                        x_data[mask],
+                        self.centroids[cluster_idx].reshape(1, -1)
+                    )
+                )
+            else:
+                error[cluster_idx] = 0
+        return error
 
     def get_optimal(self) -> tuple[int, NDArray, NDArray]:
         """
@@ -343,7 +375,6 @@ def plot_clusters(x_data: NDArray, centroids: NDArray, labels: NDArray) -> None:
     plt.ylabel('X2')
     plt.legend()
     plt.show()
-
 
 
 # Example usage:

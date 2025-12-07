@@ -23,31 +23,6 @@ def preformat_expected_shapes(x: NDArray, y: NDArray) -> tuple[NDArray, NDArray]
 
     return x_prime, y_prime
 
-# --------------- Standardization / Normalize ---------------
-def update_mean_std(mean1, std1, count1, mean2, std2, count2):
-    '''**********ARGUMENTS**********
-    :param mean1: self.data_type_means
-    :param std1: self.data_type_stds
-    :param count1: num_before
-    :param mean2: this_data_mean
-    :param std2: this_data_std
-    :param count2: num_new
-    **********RETURNS**********
-    :return: new mean value, new std value
-    '''
-    full_count = count1 + count2
-    full_mean = (count1 * mean1 + count2 * mean2) / full_count
-    var1 = std1 ** 2
-    var2 = std2 ** 2
-    # error sum of squares
-    sum_square_errors = var1 * (count1 - 1) + var2 * (count2 - 1)
-    # total group sum of squares
-    sum_squares = (mean1 - full_mean) ** 2 * count1 + (mean2 - full_mean) ** 2 * count2
-    full_var = (sum_square_errors + sum_squares) / (full_count - 1)
-    full_std = np.sqrt(full_var)
-
-    return full_mean, full_std
-
 
 def scale_colormap(col: NDArray) -> NDArray:
     absmax = np.abs(col).max()
