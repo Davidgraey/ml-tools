@@ -4,7 +4,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
-
+from typing import Optional
 # Local Files
 import ml_tools.models.clustering.plsom_utils as plsom_utils
 from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork, plot_clusters
@@ -12,7 +12,13 @@ from ml_tools.models.constants import EPSILON
 from ml_tools.types import BasalModel
 
 
-class PLSOM:
+DISTANCE_DICT = {'euclidean': plsom_utils.euclidian_distance,
+                 'manhattan': plsom_utils.manhattan_distance,
+                 'hamming': plsom_utils.hamming_distance,
+                 'cosine': plsom_utils.cosine_distance}
+
+
+class PLSOM(BasalModel):
     """
     Parameterless Self Organizing Map
     https://arxiv.org/pdf/0705.0199
@@ -39,7 +45,8 @@ class PLSOM:
                  theta_min=None,
                  theta_max=None,
                  lock_seed: int = 42,
-                 distance='euclidean'):
+                 distance='euclidean',
+                 verbose: bool = False):
         """
         Create the Self Organizing Map  - rectangular / square grids
 
@@ -54,15 +61,13 @@ class PLSOM:
         lock_seed :int, give an int to lock numpy seed
         distance :distance measure to use, can be 'euclidean', 'manhattan', 'cosine', 'hamming'
         """
+        super().__init__(input_dimension=input_dim, output_dimension=width * height)
 
-        distance_dict = {'euclidean': plsom_utils.euclidian_distance,
-                         'manhattan': plsom_utils.manhattan_distance,
-                         'hamming': plsom_utils.hamming_distance,
-                         'cosine': plsom_utils.cosine_distance}
+        self.width = width
+        self.height = height
+        self.weights = None
 
-        np.random.seed(lock_seed)
         self.N_DIMS = input_dim
-
         self.VERBOSE = True
 
         # variables that will need to be updated as we grow / shrink
@@ -71,6 +76,7 @@ class PLSOM:
         self.grid_distances = self.build_grid()
 
         self.hit_map = np.zeros(shape=self.n_neurons)
+        self.verbose = verbose
 
         # Constants
         # minimum theta (within neighborhood influence)- 1 for alternate equations - might be worth trying both!
@@ -78,14 +84,14 @@ class PLSOM:
         # Maximum value for neighborhood influence - also called Beta in some papers
         self.THETAMAX = theta_max if theta_max else width
 
-        # TODO: add feedback messaging if invalid selection.
-        self.distance_function = distance_dict[distance]
+        # TODO: add feedback messaging if invalid selection. Convert to Enum distances
+        self.distance_function = DISTANCE_DICT[distance]
 
         self.n_iter = 0
-        self.means = 0
-        self.stds = 1
+
         self.q_error_trace = []
         self.epsilon_trace = []
+
         self.previous_step_r = 0
 
     def initialize_weights(self, x: NDArray, method='kaiming') -> NDArray:
@@ -117,20 +123,34 @@ class PLSOM:
         else:
             return np.random.uniform(low=-0.1, high=0.1, size=(self.n_neurons, self.N_DIMS))
 
-    def pretrain_step(self, x: NDArray) -> NDArray:
-        _x = copy.deepcopy(x)
+    def initalize_params(self, x_data: NDArray) -> NDArray:
+        """
+        Initalize the starting parameters for weights and standardization
+        Parameters
+        ----------
+        x_data :
 
-        if self.n_iter == 0:
+        Returns
+        -------
+
+        """
+        _x = copy.deepcopy(x_data)
+        self.init_standardize(_x)
+        _x = self.standardize(_x)
+
+        if self.weights is not None:
+            pass
+        else:
             self.weights = self.initialize_weights(_x, method='sample_space')
+
         return _x
 
-    def fit(self, x: NDArray, epochs: int) -> None:
+    def fit(self, x: NDArray, num_iterations: int, verbose: Optional[bool] = None) -> None:
+        # initalize our paramters, weights and standaridzaion trackers
+        _x = self.initalize_params(x)
 
-        _x = self.pretrain_step(x)
-
-        for e_iter in range(epochs):
-            np.random.shuffle(_x)
-
+        for step in range(num_iterations):
+            self.RNG.shuffle(_x)
             # Decay our maximum value of THETA slightly - To  keep the full grid from being pulled back and forth by outliers
             self.THETAMAX = self.THETAMAX * 0.98 if self.THETAMAX > self.THETAMIN else self.THETAMIN + 1
 
@@ -158,22 +178,19 @@ class PLSOM:
                 error_trace.append(np.mean(sample_distances))
                 epsilon_trace.append(epsilon)
 
-                # two debugging calls-
-                # print('BMU:', self._idx_to_grid(bmu_i),'epsilon: ', epsilon)
-                # self.plot_neighborhood(epsilon * (neighborhood.reshape(self.n_neurons, -1)))
+                if (self.verbose or verbose) and (sample_i % 100 == 0):
+                    self.plot_neighborhood(epsilon * (neighborhood.reshape(self.n_neurons, -1)))
 
             self.q_error_trace.append(np.mean(error_trace))
             self.epsilon_trace.append(np.mean(epsilon_trace))
-            # debug step:
-            # self.plot_grid(samples=_x, highlight_idx=np.argmin(self.hit_map))
 
-        # self.plot_grid(samples=_x, highlight_idx=np.argmin(self.hit_map))
-        # plt.plot(self.q_error_trace)
-        # plt.plot(self.epsilon_trace)
-        # plt.legend(['q_error', 'epsilon'])
-        # plt.show()
+        if (self.verbose or verbose):
+            self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
+            plt.plot(self.q_error_trace)
+            plt.plot(self.epsilon_trace)
+            plt.legend(['q_error', 'epsilon'])
+            plt.show()
 
-        self.n_iter += x.shape[0]
 
     def calc_bmu(self, x: NDArray) -> tuple[NDArray | int, NDArray]:
         """
@@ -305,34 +322,6 @@ class PLSOM:
 
         return distance_matrix
 
-    def standardize_inputs(self, x: NDArray) -> NDArray:
-        """
-        apply standardization to our inputs - reducing to zero mean and 1 stdev
-        Parameters
-        ----------
-        x : array of datapoints
-
-        Returns
-        -------
-        the standardized data
-        """
-        this_means = np.mean(x, axis=0)
-        this_stds = np.std(x, axis=0)
-
-        num_new = x.shape[0]
-        if self.n_iter == 0:
-            self.means = this_means
-            self.stds = this_stds
-        else:
-            self.means, self.stds = plsom_utils.update_mean_std(self.means,
-                                                                self.stds,
-                                                                self.n_iter,
-                                                                this_means,
-                                                                this_stds,
-                                                                num_new)
-
-        return (x - self.means) / (self.stds + EPSILON)
-
     def plot_grid(self, samples=0, highlight_idx=None):
         """ utility function to plot the first two dimensions of the grid of weights"""
         ws = self.weights.reshape(self.network_shape[0], self.network_shape[1], self.N_DIMS)
@@ -367,96 +356,24 @@ class PLSOM:
         plt.imshow(self.hit_map.reshape(self.network_shape), cmap="hot", interpolation="nearest")
         plt.show()
 
-    def u_matrix(self):
-        """
-        Build a u_matrix
-        :return:
-        """
-        # for each neuron, we need to get the self.distance() to each adjacent unit
-        # 3x3 will become
-        # o - o - o - o
-        # |   |   |   |
-        # o - o - o - o
-        # |   |   |   |
-        # o - o - o - o
+    def forward(self, x_data: NDArray) -> tuple[NDArray, NDArray]:
+        _x = self.standardize(x_data)
+        idxs, dist = self.calc_bmu(_x[:, np.newaxis, :])
+        return idxs, dist
 
-        # n*2-1 x n*2-1
-        # I'm sure there's a more elegant way to do this...
-        rows = self.network_shape[0] * 2 - 1
-        cols = self.network_shape[1] * 2 - 1
-        u_matrix = np.zeros((rows, cols))
-        # now iter
-        for row_i in range(rows):
-            for col_i in range(cols):
-                if row_i % 2 == 0:
-                    if col_i % 2 == 0:
-                        idx = self._grid_to_idx((row_i / 2, col_i / 2))
-                        # u_matrix[row_i, col_i] = copy.copy(self.weights[idx])
-                    else:
-                        # 'horizontal linkage'
-                        left = self._grid_to_idx((row_i // 2, col_i // 2))
-                        right = self._grid_to_idx((row_i // 2, (col_i // 2) + 1))
-                        u_matrix[row_i, col_i] = self.distance_function(self.weights[left], self.weights[right])
-                else:
-                    if col_i % 2 == 0:
-                        # vertical linkage
-                        upper = self._grid_to_idx((row_i // 2, col_i // 2))
-                        lower = self._grid_to_idx(((row_i // 2) + 1, col_i // 2))
-                        u_matrix[row_i, col_i] = self.distance_function(self.weights[upper], self.weights[lower])
-                    else:
-                        pass
+    def calculate_loss(self, **kwargs):
+        pass
 
-        u_matrix = plsom_utils.umat_fill_outer(u_matrix, rows, cols)
-        u_matrix = plsom_utils.umat_infill(u_matrix, rows, cols)
-
-        blurred = plsom_utils.blur(u_matrix)
-        # adding original image to the blur - essentially 50/50 blend so we don't 'overweight' the blurred version.
-        u_matrix += blurred
-
-        # inverting -
-        # u_matrix = u_matrix.max() - u_matrix
-
-        u_matrix *= 1.0 / u_matrix.max()
-        return u_matrix
-
-    def neural_distances(self, w_prime: NDArray = None):
-        """
-        calc the distances between neurons in the map with the determined distance func on the embedding dimensions
-
-        Parameters
-        ----------
-        w_prime :
-
-        Returns
-        -------
-
-        """
-        if type(w_prime) == np.ndarray:
-            neural_dist = self.distance_function(w_prime[:, np.newaxis, :], w_prime)
-            for n_i in range(neural_dist.shape[0]):
-                neural_dist[n_i, n_i] = np.inf
-            return neural_dist
-        else:
-            neural_dist = self.distance_function(self.weights[:, np.newaxis, :], self.weights)
-            for n_i in range(neural_dist.shape[0]):
-                neural_dist[n_i, n_i] = np.inf
-
-            return neural_dist
-
-    def predict_clusters(self, x: NDArray, n_clusters: int, verbose: bool = False):
+    def predict(self, x: NDArray, n_clusters: int, verbose: bool = False) -> NDArray:
         """
         Using a dedicated clustering method to predict classes of samples based on the SOM's re-projected
         representation
         We use the clustering method on the SOM's weights, rather than on the dataset directly
         """
         # determine which protoype (SOM neuron) is closest to each sample
-        _x = self.standardize_inputs(x)
-        idxs, dist = self.calc_bmu(_x[:, np.newaxis, :])
-        # grid_idxs = np.array(
-        #     [self._idx_to_grid(_i) for _i in idxs]
-        # )
+        idxs, dist = self.forward(x)
 
-        if verbose:
+        if verbose or self.verbose:
             print(f"Weights: {self.weights.shape}")
             self.plot_heatmap()
 
@@ -471,78 +388,94 @@ class PLSOM:
             org_x_data=self.weights,
             num_iterations=25,
             fast_forward=False,
-            verbose=False
+            verbose=(verbose or self.verbose)
         )
 
         best_scoring, centroids, labels = self.clust_model.get_optimal()
         print(f"Optimal Clusters at {best_scoring}")
 
-        if verbose:
+        if verbose or self.verbose:
             plot_clusters(self.weights, centroids, labels)
 
         # assign each sample to its closest neuron prototype (idxs), then assign that neuron to its cluster (labels)
         return np.take_along_axis(labels, idxs, axis=0)
 
 
-# ------------------------predict function------------------------
-def plsom_fit_predict(processed_features: NDArray, grid_dim: int, max_clusters: int):
-    """
+    def fit_predict(self,
+                    x_data: NDArray,
+                    grid_dim: int,
+                    num_iterations: int,
+                    max_clusters: int,
+                    verbose: Optional[bool] = None):
+        """
 
-    Parameters
-    ----------
-    processed_features :
-    max_clusters :  maximum count of clusters to estimate
+        Parameters
+        ----------
+        processed_features :
+        max_clusters :  maximum count of clusters to estimate
 
-    Returns
-    -------
+        Returns
+        -------
 
-    """
-    start = time.time()
-    n_dims = processed_features.shape[-1]
+        """
+        start = time.time()
 
-    size = min(n_dims, grid_dim)
-    n_epochs = 25  # min(size // 4, 2)
+        self.fit(x_data, num_iterations)
 
-    som_nnet = PLSOM(width=size,
-                     height=size,
-                     input_dim=n_dims,
-                     theta_min=0 + 0.01,
-                     theta_max=size - 0.01,
-                     lock_seed=1,
-                     distance='euclidean')
+        if self.verbose or verbose:
+            self.plot_grid(samples=0, highlight_idx=None)
 
-    som_nnet.fit(processed_features, epochs=n_epochs)
-    som_nnet.plot_grid(samples=0, highlight_idx=None)
+        prediction = self.predict(x=x_data,
+                                   n_clusters=max_clusters,
+                                   verbose=True)
 
-    prediction = som_nnet.predict_clusters(x=processed_features,
-                                           n_clusters=max_clusters,
-                                           verbose=True)
+        print('plsom_fit_predict took', time.time() - start)
 
-    print('plsomv_fit_predict took', time.time() - start)
 
-    return prediction
+
+        return prediction
+
+    @property
+    def params(self):
+        return self.weights
 
 
 if __name__ == "__main__":
     # Example usage
     from ml_tools.generators import RandomDatasetGenerator
     from ml_tools.models.clustering.cluster_metrics import homogeneity
-
+    feature_dim = 128
     gen = RandomDatasetGenerator(random_seed=123)
     x_clust, y_clust, meta_clust = gen.generate(
         task='clustering',
         num_samples=1500,
-        num_features=128,
+        num_features=feature_dim,
         num_clusters=9,
         noise_scale=0.33
     )
 
     max_clusters = 15
+    num_steps=25
     for dim in [5, 10, 15, 20, 35]:
         st = time.time()
-        predictions = plsom_fit_predict(x_clust,
-                                        grid_dim=dim,
-                                        max_clusters=max_clusters)
+        som = PLSOM(width=dim,
+                    height=dim,
+                    input_dim=feature_dim,
+                    theta_min=0 + 0.01,
+                    theta_max=dim - 0.01,
+                    lock_seed=42,
+                    distance='euclidean',
+                    verbose=True)
+
+
+        predictions = som.fit_predict(
+            x_data=x_clust,
+            grid_dim=dim,
+            num_iterations=num_steps,
+            max_clusters=max_clusters,
+            verbose=True
+        )
+
         print("one_cluster predict took: ", time.time() - st)
 
 

@@ -129,13 +129,13 @@ class BasalModel(ABC):
         ----------
         x_data : NDArray
         """
-        if self.x_means is None:
+        if (self.x_means is None) or (self.num_seen_samples == 0):
             # set up the initial values for the new incoming data
             self.num_seen_samples = x_data.shape[0]
             self.x_means = np.mean(x_data, axis=0)
             self.x_stds = np.std(x_data, axis=0)
         else:
-            # set up the initial values for the new incoming data
+            # update the running standardization parameters with proportional weighting
             self.update_running_standardize(
                 new_data_mean=np.mean(x_data, axis=0),
                 new_data_std=np.std(x_data, axis=0),

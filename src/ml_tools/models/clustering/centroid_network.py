@@ -119,7 +119,7 @@ class CentroidNeuralNetwork(BasalModel):
             breakpoint = batch_size * 0.1
         else:
             batch_size = num_samples
-            breakpoint = batch_size * 0.1
+            breakpoint = batch_size * 0.02
 
         # initalize the first two centroids ------------------
         if self.centroids is None:
@@ -397,7 +397,7 @@ if __name__ == "__main__":
     st = time.time()
 
     # for eps in np.arange(3, 5):
-    cnn = CentroidNeuralNetwork(max_clusters=20, epsilon=0.1)
+    cnn = CentroidNeuralNetwork(max_clusters=20, epsilon=0.2)
     centroids, labels = cnn.fit_predict(X, num_iterations=512, mini_batch=False, verbose=True, fast_forward=False)
     print(cnn.metrics)
     print("verbose took", (time.time() - st ) * 1000)
