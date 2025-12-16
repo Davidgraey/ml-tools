@@ -7,9 +7,11 @@ from numpy.typing import NDArray
 from typing import Optional
 # Local Files
 import ml_tools.models.clustering.plsom_utils as plsom_utils
-from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork, plot_clusters
+from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork
+from ml_tools.models.clustering.cluster_visuals import plot_clusters
 from ml_tools.models.constants import EPSILON
 from ml_tools.types import BasalModel
+from ml_tools.models.clustering import log
 
 
 DISTANCE_DICT = {'euclidean': plsom_utils.euclidian_distance,
@@ -178,8 +180,8 @@ class PLSOM(BasalModel):
                 error_trace.append(np.mean(sample_distances))
                 epsilon_trace.append(epsilon)
 
-                if (self.verbose or verbose) and (sample_i % 100 == 0):
-                    self.plot_neighborhood(epsilon * (neighborhood.reshape(self.n_neurons, -1)))
+                # if (self.verbose or verbose) and (sample_i % 10 == 0):
+                #     self.plot_neighborhood(epsilon * (neighborhood.reshape(self.n_neurons, -1)))
 
             self.q_error_trace.append(np.mean(error_trace))
             self.epsilon_trace.append(np.mean(epsilon_trace))
@@ -327,6 +329,7 @@ class PLSOM(BasalModel):
         ws = self.weights.reshape(self.network_shape[0], self.network_shape[1], self.N_DIMS)
         # Draw lines between each 2d weight vector in grid
         plt.figure(figsize=(15, 10))
+        plt.title("PLSOM Grid")
         if samples != 0:
             plt.scatter(samples[:, 0], samples[:, 1])
         for row in range(self.network_shape[0]):
@@ -343,7 +346,8 @@ class PLSOM(BasalModel):
         # shape the weights into the 2D grid representation
         ns = neighborhood.reshape(self.network_shape[0], self.network_shape[1])
         # Draw lines between each 2d weight vector in grid
-        plt.figure(figsize=(5, 5))
+        plt.figure(figsize=(10, 10))
+        plt.title("PLSOM neighborhood")
         for row in range(self.network_shape[0]):
             for col in range(self.network_shape[1]):
                 plt.scatter(row, col, s=ns[row, col] * 1000)
@@ -352,13 +356,13 @@ class PLSOM(BasalModel):
     def plot_heatmap(self):
         """ utilty function to draw the hit map as aa heat map"""
         plt.figure(figsize=(10, 10))
+        plt.title("PLSOM Heatmap")
         self.hit_map.reshape(self.network_shape)
         plt.imshow(self.hit_map.reshape(self.network_shape), cmap="hot", interpolation="nearest")
         plt.show()
 
     def forward(self, x_data: NDArray) -> tuple[NDArray, NDArray]:
-        _x = self.standardize(x_data)
-        idxs, dist = self.calc_bmu(_x[:, np.newaxis, :])
+        idxs, dist = self.calc_bmu(x_data[:, np.newaxis, :])
         return idxs, dist
 
     def calculate_loss(self, **kwargs):
@@ -371,7 +375,14 @@ class PLSOM(BasalModel):
         We use the clustering method on the SOM's weights, rather than on the dataset directly
         """
         # determine which protoype (SOM neuron) is closest to each sample
-        idxs, dist = self.forward(x)
+        _x = self.standardize(x)
+
+        idxs, dist = self.forward(_x)
+        # grid_idxs = np.array(
+        #     [self._idx_to_grid(_i) for _i in idxs]
+        # )
+        print(idxs)
+
 
         if verbose or self.verbose:
             print(f"Weights: {self.weights.shape}")
@@ -386,19 +397,24 @@ class PLSOM(BasalModel):
 
         _, _ = self.clust_model.fit_predict(
             org_x_data=self.weights,
-            num_iterations=25,
+            num_iterations=100,
             fast_forward=False,
-            verbose=(verbose or self.verbose)
+            verbose=False,
+            skip_standardize=True
         )
 
         best_scoring, centroids, labels = self.clust_model.get_optimal()
         print(f"Optimal Clusters at {best_scoring}")
 
-        if verbose or self.verbose:
-            plot_clusters(self.weights, centroids, labels)
+        # assign each sample to its closest SOM neuron / prototype (idxs), then assign that neuron to its cluster (
+        # labels)
+        x_labels =np.take_along_axis(labels, idxs, axis=0)
 
-        # assign each sample to its closest neuron prototype (idxs), then assign that neuron to its cluster (labels)
-        return np.take_along_axis(labels, idxs, axis=0)
+        if verbose or self.verbose:
+            plot_clusters(self.weights, labels, centroids)
+            plot_clusters(x, x_labels)
+
+        return x_labels
 
 
     def fit_predict(self,
@@ -411,27 +427,23 @@ class PLSOM(BasalModel):
 
         Parameters
         ----------
-        processed_features :
-        max_clusters :  maximum count of clusters to estimate
 
         Returns
         -------
 
         """
         start = time.time()
-
         self.fit(x_data, num_iterations)
 
-        if self.verbose or verbose:
-            self.plot_grid(samples=0, highlight_idx=None)
-
         prediction = self.predict(x=x_data,
-                                   n_clusters=max_clusters,
-                                   verbose=True)
+                                  n_clusters=max_clusters,
+                                  verbose=True)
 
         print('plsom_fit_predict took', time.time() - start)
 
-
+        if self.verbose or verbose:
+            self.plot_grid(samples=0, highlight_idx=None)
+            plot_clusters(x_data, prediction)
 
         return prediction
 
@@ -444,20 +456,24 @@ if __name__ == "__main__":
     # Example usage
     from ml_tools.generators import RandomDatasetGenerator
     from ml_tools.models.clustering.cluster_metrics import homogeneity
-    feature_dim = 128
+
+    feature_dim = 2
     gen = RandomDatasetGenerator(random_seed=123)
-    x_clust, y_clust, meta_clust = gen.generate(
+    x_clust, y_clust, meta = gen.generate(
         task='clustering',
         num_samples=1500,
         num_features=feature_dim,
-        num_clusters=9,
-        noise_scale=0.33
+        num_clusters=4,
+        noise_scale=0.22
     )
+    plot_clusters(x_clust, y_clust,  meta["centroids"])
 
-    max_clusters = 15
-    num_steps=25
-    for dim in [5, 10, 15, 20, 35]:
+    max_clusters = 10
+
+    for dim in [10, 20]:
+        num_steps = dim * 5
         st = time.time()
+
         som = PLSOM(width=dim,
                     height=dim,
                     input_dim=feature_dim,
@@ -466,7 +482,6 @@ if __name__ == "__main__":
                     lock_seed=42,
                     distance='euclidean',
                     verbose=True)
-
 
         predictions = som.fit_predict(
             x_data=x_clust,

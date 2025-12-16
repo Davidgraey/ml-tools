@@ -9,17 +9,11 @@ Including regularization via elasticnet to extend usability a bit
 import numpy as np
 import copy
 from numpy.typing import NDArray
-from .constants import EPSILON, SIGMA_ZERO, LAMBDA_MAX, LAMBDA_MIN
-from .data_generators import to_onehot, to_int_classes
+from ml_tools.models.constants import EPSILON, SIGMA_ZERO, LAMBDA_MAX, LAMBDA_MIN
+from ml_tools.generators.data_generators import to_onehot, to_int_classes, RandomDatasetGenerator
 from typing import Optional
-from .constants import ClassificationTask, determine_classification_task
-import logging
-log = logging.getLogger(__name__)
-handler = logging.StreamHandler()
-handler.setLevel(logging.INFO)
-str_format = logging.Formatter("%(name)s - %(levelname)s - %(message)s")
-handler.setFormatter(str_format)
-log.addHandler(handler)
+from ml_tools.models.constants import ClassificationTask, determine_classification_task
+from ml_tools.models.supervised import log
 
 
 # TODO: move to dedicated funcs
@@ -554,7 +548,6 @@ class GradientDescent:
 
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
-    from data_generators import RandomDatasetGenerator
 
     num_samples = 2000
     num_features = 8

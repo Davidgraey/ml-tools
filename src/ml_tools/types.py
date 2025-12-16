@@ -102,7 +102,10 @@ class BasalModel(ABC):
         -------
         the mean and standard deviation of the data array
         """
-        assert data_array.shape[-1] == self.x_means.shape[0]
+        try:
+            assert data_array.shape[-1] == self.x_means.shape[0]
+        except AssertionError:
+            log.error(f"initialize process hasn't been done yet!")
 
         return (data_array - self.x_means) / (self.x_stds + EPSILON)
 

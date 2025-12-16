@@ -9,8 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 import scipy.stats as ss
-from .scg_regression import GradientDescent
-from .constants import ClassificationTask, EPSILON, determine_classification_task
+from ml_tools.models.supervised import log
+from ml_tools.models.supervised.scg_regression import GradientDescent
+from ml_tools.models.constants import ClassificationTask, EPSILON, determine_classification_task
+from ml_tools.models.supervised import log
 
 
 def standardize_data(design_matrix: NDArray, axis=0):
