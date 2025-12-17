@@ -19,19 +19,23 @@ class CentroidNeuralNetwork(BasalModel):
                  epsilon: float = 2e-3):
         super().__init__(seed=seed)
         self.max_clusters = max_clusters
-        self.epsilon = epsilon
+        self.epsilon: float = epsilon
+        self.num_dims: int = 0
 
         if initial_clusters is not None:
             self.centroids = initial_clusters
         else:
             self.centroids = None
         self.previous_labels = None
+        self.volume = None
         self.num_seen_samples: int = 0
+
 
         self._label_tracker = {}
         self._centroid_tracker = {}
 
         self._is_fitted = False
+        self.skip_standardize=False
 
         self.metrics = {k: 0.0 for k in range(2, max_clusters)}
 
@@ -140,6 +144,7 @@ class CentroidNeuralNetwork(BasalModel):
             self.init_standardize(org_x_data)
             x_data = self.standardize(org_x_data)
 
+        self.num_dims = np.ndim(x_data)
         num_samples, num_features = x_data.shape
 
         # overwrite any prior labels -- set all to -1 (no cluster)
@@ -318,9 +323,15 @@ class CentroidNeuralNetwork(BasalModel):
 
         """
         # take the mean distance of the closest-K points to centroid (KNN)
-        knn = np.partition(distances, k_radius, axis=0)[:k_radius, :]
+        kth_distance = np.partition(distances, k_radius, axis=0)[k_radius, :]
+        print(kth_distance.shape, kth_distance)
+        radius = 1.67 * kth_distance
 
-        return 1.0 / (np.mean(knn, axis=0) + EPSILON)
+        # project it out via IQR - N-Dimensional sphere to represent volume
+        self.volume = 0.5 * (np.pi ** (self.num_dims-1)) * (radius**self.num_dims)
+        point_count = np.sum((distances <= radius), axis=0)
+
+        return point_count / self.volume
 
     def predict(self, x_data: NDArray, skip_standardize: bool = False,) -> tuple[int, NDArray, NDArray]:
         """
