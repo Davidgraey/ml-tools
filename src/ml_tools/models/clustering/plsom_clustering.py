@@ -455,7 +455,7 @@ class PLSOM(BasalModel):
 if __name__ == "__main__":
     # Example usage
     from ml_tools.generators import RandomDatasetGenerator
-    from ml_tools.models.clustering.cluster_metrics import homogeneity
+    from ml_tools.models.clustering.cluster_metrics import *
 
     feature_dim = 2
     gen = RandomDatasetGenerator(random_seed=123)
@@ -463,8 +463,8 @@ if __name__ == "__main__":
         task='clustering',
         num_samples=1500,
         num_features=feature_dim,
-        num_clusters=4,
-        noise_scale=0.22
+        num_clusters=6,
+        noise_scale=0.4
     )
     plot_clusters(x_clust, y_clust,  meta["centroids"])
 
@@ -497,3 +497,12 @@ if __name__ == "__main__":
         print("Predictions:", predictions[:20])
         print("Truth:", y_clust[:20])
         print(homogeneity(predictions, y_clust))
+
+
+        print(f"silhouette score (1 is best): {silhouette_score(x_clust, predictions)}")
+        print(f"CH index (high): {calinski_harabasz_index(x_clust, predictions)}")
+        print(f"DB index score (low): {davies_bouldin_index(x_clust, predictions)}")
+
+
+        print(f"homogenity: {homogeneity(y_clust, predictions)}")
+        print(f"Mutual Information: {mutual_information_score(y_clust, predictions)}")

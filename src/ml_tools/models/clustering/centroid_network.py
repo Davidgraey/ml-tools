@@ -323,8 +323,9 @@ class CentroidNeuralNetwork(BasalModel):
 
         """
         # take the mean distance of the closest-K points to centroid (KNN)
-        kth_distance = np.partition(distances, k_radius, axis=0)[k_radius, :]
-        print(kth_distance.shape, kth_distance)
+        kth_distance = np.mean(
+            np.partition(distances, k_radius, axis=0)[:k_radius, :],
+            axis=0)
         radius = 1.67 * kth_distance
 
         # project it out via IQR - N-Dimensional sphere to represent volume
@@ -424,13 +425,13 @@ class CentroidNeuralNetwork(BasalModel):
 if __name__ == "__main__":
     import time
     from ml_tools.generators import RandomDatasetGenerator
-    from ml_tools.models.clustering.cluster_metrics import homogeneity
+    from ml_tools.models.clustering.cluster_metrics import *
 
     gen = RandomDatasetGenerator(random_seed=42)
     X, y, meta = gen.generate(task="clustering",
                               num_samples=2000,
                               num_features=2,
-                              noise_scale=0.22,
+                              noise_scale=0.4,
                               num_clusters=8,
                               verbose=True
                               )
@@ -448,7 +449,14 @@ if __name__ == "__main__":
     clust_count, opt_centroids, opt_labels = cnn.get_optimal()
     plot_clusters(X, opt_labels, opt_centroids)
 
-    print(f"homogenity score vs labels: {homogeneity(y, opt_labels)}")
+
+    print(f"silhouette score (1 is best): {silhouette_score(X, opt_labels)}")
+    print(f"CH index (high): {calinski_harabasz_index(X, opt_labels)}")
+    print(f"DB index score (low): {davies_bouldin_index(X, opt_labels)}")
+
+
+    print(f"homogenity: {homogeneity(y, opt_labels)}")
+    print(f"Mutual Information: {mutual_information_score(y, opt_labels)}")
 
     # for eps in np.arange(2, 5):
     #     st = time.time()
