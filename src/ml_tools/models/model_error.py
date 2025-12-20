@@ -4,12 +4,17 @@ ERROR FUNCTIONS all done in Numpy--
 import numpy as np
 from numpy.typing import NDArray
 from enum import Enum
-from ml_tools.models.plsom_utils import cosine_distance
+from typing import Optional
+from ml_tools.models.constants import ClassificationTask, determine_classification_task
+from ml_tools.models.clustering.plsom_utils import cosine_distance
+
+
 
 class Reductions(Enum):
     MEAN = 'mean'
     SUM = 'sum'
     NONE = None
+
 
 def difference(x: NDArray, y: NDArray, axis: int = 0, reduction: Reductions=None) -> NDArray:
     """
@@ -101,3 +106,24 @@ def cosine_error(x: NDArray, y: NDArray, axis: int = 0, reduction: Reductions=No
     elif reduction == 'sum':
         return np.sum(cos)
     return cos
+
+
+def mse(prediction: NDArray, targets: NDArray, task: Optional[ClassificationTask]) -> float|NDArray:
+    """
+    MEAN SQUARED ERRORS FOR REGRESSION MODELS
+    Parameters
+    ----------
+    prediction : numpy array of predictions (outputs)
+    targets : True or Target values - dimensionally match prediction
+
+    Returns
+    -------
+    evaluation of error / loss
+    """
+    # constant adjusted loss to make derivative clearner
+    return 0.5 * np.mean((prediction - targets) ** 2)
+
+
+# TODO: move to dedicated funcs
+def mse_derivative(prediction, targets, task: Optional[ClassificationTask]) -> float|NDArray:
+    return (prediction - targets)

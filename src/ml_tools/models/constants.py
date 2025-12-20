@@ -16,6 +16,7 @@ class ClassificationTask(Enum):
     MULTINOMIAL = "multinomial"
     MULTILABEL = "multilabel"
 
+
 def determine_classification_task(targets: NDArray) -> ClassificationTask:
     """
     Takes one-hot targets

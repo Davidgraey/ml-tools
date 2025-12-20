@@ -8,7 +8,7 @@ from typing import Optional
 # Local Files
 import ml_tools.models.clustering.plsom_utils as plsom_utils
 from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork
-from ml_tools.models.clustering.cluster_visuals import plot_clusters
+from ml_tools.visuals.cluster_visuals import plot_clusters
 from ml_tools.models.constants import EPSILON
 from ml_tools.types import BasalModel
 from ml_tools.models.clustering import log
@@ -470,7 +470,7 @@ if __name__ == "__main__":
 
     max_clusters = 10
 
-    for dim in [10, 20]:
+    for dim in [10]:
         num_steps = dim * 5
         st = time.time()
 

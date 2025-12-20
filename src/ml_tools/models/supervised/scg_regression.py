@@ -13,83 +13,13 @@ from ml_tools.models.constants import EPSILON, SIGMA_ZERO, LAMBDA_MAX, LAMBDA_MI
 from ml_tools.generators.data_generators import to_onehot, to_int_classes, RandomDatasetGenerator
 from typing import Optional
 from ml_tools.models.constants import ClassificationTask, determine_classification_task
+from ml_tools.models.model_error import mse, mse_derivative
+from ml_tools.models.model_loss import cross_entropy, cross_entropy_derivative
 from ml_tools.models.supervised import log
+from ml_tools.types import BasalModel
 
 
-# TODO: move to dedicated funcs
-def mse(prediction: NDArray, targets: NDArray, task: Optional[ClassificationTask]) -> float|NDArray:
-    """
-    MEAN SQUARED ERRORS (L2) FOR REGRESSION MODELS
-    Parameters
-    ----------
-    prediction : numpy array of predictions (outputs)
-    targets : True or Target values - dimensionally match prediction
-
-    Returns
-    -------
-    evaluation of error / loss
-    """
-    # constant adjusted loss to make derivative clearner
-    return 0.5 * np.mean((prediction - targets) ** 2)
-
-
-# TODO: move to dedicated funcs
-def mse_derivative(prediction, targets, task: Optional[ClassificationTask]) -> float|NDArray:
-    return (prediction - targets)
-
-
-# TODO: move to dedicated funcs
-def cross_entropy(logits: NDArray,
-                  targets: NDArray,
-                  task: ClassificationTask) -> float|NDArray:
-    """
-    CROSS ENTROPY - stabalized versions to accept logit values
-    Assumes that targets are one-hot encoded vector [0, 0, 1, 0]
-    Parameters
-    ----------
-    logits : numpy.ndarray  the forward-pass logit values
-    targets : numpy.ndarray   Assumes that targets are one-hot encoded vector [0, 0, 1, 0]Assumes that targets are one-hot encoded vector [0, 0, 1, 0]
-    task : ClassificationTask enum
-
-    Returns
-    -------
-    numpy.float64
-    """
-    #  multilabel, multinomial classification with logits ------
-    if task == ClassificationTask.MULTILABEL:
-        log_sum_exp = np.log(1 + np.exp(logits))
-        loss = log_sum_exp - targets * logits
-
-    #  categorical cross-entropy with stabilization -- using log-softmax of the logits -------
-    elif task == ClassificationTask.MULTINOMIAL:
-        # shift our values (0-ceiling) for numeric stability
-        shifted_logits = logits - np.max(logits, axis=-1, keepdims=True)
-        # log-sum-exp for numerical stability
-        log_sum_exp = np.log(np.sum(np.exp(shifted_logits), axis=-1))
-        # targets becomes a mask to select the true class logit
-        # class_logits = shifted_logits[targets.astype(bool)]
-        # loss = -class_logits + log_sum_exp
-        cls = np.argmax(targets, axis=-1)
-        correct = shifted_logits[np.arange(logits.shape[0]), cls]
-        loss = -correct + log_sum_exp
-
-    # Binary cross-entropy -- logit stabilizing for neg and positive --------
-    elif task == ClassificationTask.BINARY:
-        loss = np.maximum(0, logits) - (targets * logits) + np.log(1 + np.exp(-np.abs(logits)))
-
-    return np.mean(loss)
-
-
-# TODO: move to dedicated funcs
-def cross_entropy_derivative(prediction: NDArray,
-                             targets: NDArray,
-                             task: Optional[ClassificationTask]) -> NDArray | float:
-    """ BACKPROP TRICKS for sigmoid / softmax: combine"""
-    sample_count = targets.shape[0]
-    return (prediction - targets)  / sample_count
-
-
-class GradientDescent:
+class GradientDescent(BasalModel):
     def __init__(self,
                  task: str|ClassificationTask = "regression",
                  divisi: int = 3,
@@ -107,6 +37,7 @@ class GradientDescent:
         reg_alpha : float balance between lasso L1 (0.0) ridge L2 (1.0)
         use_elastic_reg : bool enable elastic regularization
         """
+        super().__init__(seed=41)
         self.RNG = np.random.default_rng(42)
         self.full_init = False
         self.early_termination = early_termination
@@ -346,9 +277,9 @@ class GradientDescent:
             alpha = phi / delta
 
             vector_new = vector + alpha * grad
-            loss_old = self._calculate_loss(x_data, y_data)
+            loss_old = self.calculate_loss(x_data, y_data)
             self.weights = vector_new.copy().reshape(self._weight_shape)
-            loss_new = self._calculate_loss(x_data, y_data)
+            loss_new = self.calculate_loss(x_data, y_data)
 
             comparison = 2 * delta * (loss_old - loss_new) / (phi ** 2)
 
@@ -416,7 +347,7 @@ class GradientDescent:
             xs = xs[shuffler]
             ys = ys[shuffler]
 
-            loss = self._calculate_loss(xs, ys)
+            loss = self.calculate_loss(xs, ys)
             # deepcopy - so we can exploit the SCG steps
             W = copy.deepcopy(self.weights)
 
@@ -439,7 +370,7 @@ class GradientDescent:
                 continue
             if self.early_termination:
                 loss_delta = (np.array(errors[-min(i, 5):]) - epoch_loss)
-                loss_new = np.mean(self._calculate_loss(xs, ys))
+                loss_new = np.mean(self.calculate_loss(xs, ys))
                 if (np.mean(loss_delta) < 0.01) or ((epoch_loss - loss_new) >= 0):
                     self.divisi += 1
 
@@ -454,9 +385,17 @@ class GradientDescent:
                     break
 
         r_squared = self._calculate_r_square(self.predict(x_data), y_data)
-        log.info("fitted r_squared: ", r_squared)
-        log.info(f"divisi: {self.divisi} ")
+        log.info(f"fitted r_squared: {r_squared}")
+        log.info(f"divisi {self.divisi} ")
         return errors
+
+    def fit_predict(self,
+                    x_data: NDArray,
+                    y_data: NDArray,
+                    iterations: int = 100,
+                    add_constant: bool = True ):
+        _error = self.fit(x_data, y_data, iterations, add_constant)
+        return self.predict(x_data)
 
     def forward(self, x_data: NDArray, has_bias_present=True) -> NDArray:
         """
@@ -494,7 +433,7 @@ class GradientDescent:
 
         return gradient, prediction
 
-    def _calculate_loss(self, xs: NDArray, ys: NDArray) -> float:
+    def calculate_loss(self, xs: NDArray, ys: NDArray) -> float:
         """ calculate loss for current weights and inputs """
         logits = self.forward(xs)
         if self.use_elastic_reg:

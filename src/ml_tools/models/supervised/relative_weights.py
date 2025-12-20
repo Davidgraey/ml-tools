@@ -116,7 +116,7 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool=True) -> dict:
         unstd_beta = grad_model.weights[1:]
 
 
-    log.info('Link y^ to y:', grad_model.weights)
+    log.info(f"Link y^ to y: {grad_model.weights}")
 
     r2 = np.abs(grad_model.r_square)
     # r2_adj = grad_model.adjusted_r_square
@@ -165,7 +165,8 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool=True) -> dict:
 
 
 if __name__ == "__main__":
-    from data_generators import RandomDatasetGenerator, to_onehot
+    from ml_tools.generators.data_generators import RandomDatasetGenerator, to_onehot
+
 
     num_samples = 2000
     num_features = 8
@@ -339,4 +340,11 @@ if __name__ == "__main__":
 
     plt.legend(["data_beta", "RWA"])
     plt.tight_layout()
+    plt.show()
+
+    plt.figure()
+    to_plot = coef / np.max(coef)
+    plt.barh(range(len(to_plot)), np.abs(to_plot), alpha=0.75, color="blue")
+    to_plot = log_res['norm_rwa'][:, class_idx]
+    plt.barh(range(len(to_plot)), np.mean(to_plot, axis=-1),  alpha=0.5, color="orange")
     plt.show()
