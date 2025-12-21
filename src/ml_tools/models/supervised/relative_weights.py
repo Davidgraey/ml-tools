@@ -169,7 +169,7 @@ if __name__ == "__main__":
 
     num_samples = 2000
     num_features = 8
-    NOISE = 0.05
+    NOISE = 0.33
     N_steps = 100
 
     gen = RandomDatasetGenerator(random_seed=123)
@@ -215,15 +215,15 @@ if __name__ == "__main__":
     print("accuracy: ", np.sum(pred == y) / num_samples)
     print(y.shape, pred.shape, )
     plt.figure()
-    plt.subplot(1, 2, 1)
-    plt.title("pred v target")
-    spread = list(range(len(x)))
-    diff = np.abs(y - pred)
-    noise = np.random.uniform(0.5, 1, size=num_samples)
-    diff = ((diff * noise) / num_classes * num_samples)
-    for idx in range(num_samples):
-        sign = np.random.choice([-1, 1])
-        plt.scatter(spread[idx], (spread[idx] + sign * diff[idx]), alpha=0.5, color="blue")
+    # plt.subplot(1, 2, 1)
+    # plt.title("pred v target")
+    # spread = list(range(len(x)))
+    # diff = np.abs(y - pred)
+    # noise = np.random.uniform(0.5, 1, size=num_samples)
+    # diff = ((diff * noise) / num_classes * num_samples)
+    # for idx in range(num_samples):
+    #     sign = np.random.choice([-1, 1])
+    #     plt.scatter(spread[idx], (spread[idx] + sign * diff[idx]), alpha=0.5, color="blue")
     plt.subplot(1, 2, 2)
     plt.title("Classificaiton RWA")
     to_plot = coef / np.max(coef)
@@ -308,20 +308,20 @@ if __name__ == "__main__":
     print("accuracy: ", np.sum(pred == y) / (num_samples * num_classes))
     print(y.shape, pred.shape, )
 
-    plt.figure()
+    # plt.figure()
     # to_plot = np.sum(log_res['sign_norm_rwa'], axis=-1)
     # plt.subplot(1, 2, 1)
-    plt.title("pred v target")
-    spread = list(range(len(x)))
-    diff = np.abs(y - pred)
-    noise = np.random.uniform(0.5, 1, size=(num_samples, num_classes))
-    diff = ((diff * noise) / num_classes * num_samples)
-    for class_idx in range(num_classes):
-        for idx in range(num_samples):
-            sign = np.random.choice([-1, 1])
-            plt.scatter(spread[idx], (spread[idx] + sign * diff[idx, class_idx]), alpha=0.05)
-    # plt.scatter(spread, spread, alpha=0.2, color="orange")
-    plt.show()
+    # plt.title("pred v target")
+    # spread = list(range(len(x)))
+    # diff = np.abs(y - pred)
+    # noise = np.random.uniform(0.5, 1, size=(num_samples, num_classes))
+    # diff = ((diff * noise) / num_classes * num_samples)
+    # for class_idx in range(num_classes):
+    #     for idx in range(num_samples):
+    #         sign = np.random.choice([-1, 1])
+    #         plt.scatter(spread[idx], (spread[idx] + sign * diff[idx, class_idx]), alpha=0.05)
+    # # plt.scatter(spread, spread, alpha=0.2, color="orange")
+    # plt.show()
 
     plt.figure()
     plt.title("Weights & Betas - multilabel class")
@@ -341,9 +341,4 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show()
 
-    plt.figure()
-    to_plot = coef / np.max(coef)
-    plt.barh(range(len(to_plot)), np.abs(to_plot), alpha=0.75, color="blue")
-    to_plot = log_res['norm_rwa'][:, class_idx]
-    plt.barh(range(len(to_plot)), np.mean(to_plot, axis=-1),  alpha=0.5, color="orange")
-    plt.show()
+

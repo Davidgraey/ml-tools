@@ -15,7 +15,7 @@ from typing import Optional
 from ml_tools.models.constants import ClassificationTask, determine_classification_task
 from ml_tools.models.model_error import mse, mse_derivative
 from ml_tools.models.model_loss import cross_entropy, cross_entropy_derivative
-from ml_models.models.supervised.activations import (
+from ml_tools.models.supervised.activations import (
     softmax_activation,
     sigmoid_activation,
     linear_activation

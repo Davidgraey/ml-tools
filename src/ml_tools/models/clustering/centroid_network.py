@@ -4,6 +4,7 @@ import copy
 from numpy.typing import NDArray
 from scipy.spatial.distance import cdist, pdist
 from ml_tools.visuals.cluster_visuals import plot_clusters
+from ml_tools.models.clustering.cluster_metrics import silhouette_score
 from ml_tools.types import BasalModel
 from ml_tools.models.clustering import log
 
