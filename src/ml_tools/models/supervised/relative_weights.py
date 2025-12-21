@@ -1,10 +1,12 @@
-# https://www.researchgate.net/publication/247721163_Determining_the_Relative_Importance_of_Predictors_in_Logistic_Regression_An_Extension_of_Relative_Weight_Analysis
-# https://arxiv.org/pdf/2106.14095.pdf
+'''
+Heuristic Method for Estimating the Relative Weight of Predictor Variables in Multiple Regression
+https://www.researchgate.net/publication
+/247721163_Determining_the_Relative_Importance_of_Predictors_in_Logistic_Regression_An_Extension_of_Relative_Weight_Analysis
+https://arxiv.org/pdf/2106.14095.pdf
 
-# Relative Weight Analysis returns "importance scores" whose sum equals to
-# the overall R2 of a model; it’s normalized form allows us to say
-# “Feature _X _accounts for _Z% _of variance in target variable Y.
-
+Relative Weight Analysis returns "importance scores" whose sum equals tothe overall R2 of a model; it’s normalized form allows us to say
+“Feature _X _accounts for _Z% _of variance in target variable Y.
+'''
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
@@ -60,9 +62,6 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool=True) -> dict:
     print(f"targeting {task}")
     # standardize our raw design matrix
     d = ss.zscore(x)
-
-    # d = standardize_data(x, axis=0)
-
 
     # q is already transposed in linalg.svd --
     #  U, s, Vh = svd(A, lapack_driver='gesvd')

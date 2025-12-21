@@ -15,6 +15,11 @@ from typing import Optional
 from ml_tools.models.constants import ClassificationTask, determine_classification_task
 from ml_tools.models.model_error import mse, mse_derivative
 from ml_tools.models.model_loss import cross_entropy, cross_entropy_derivative
+from ml_models.models.supervised.activations import (
+    softmax_activation,
+    sigmoid_activation,
+    linear_activation
+)
 from ml_tools.models.supervised import log
 from ml_tools.types import BasalModel
 
@@ -50,22 +55,22 @@ class GradientDescent(BasalModel):
 
         self.task: ClassificationTask = task
         if task == "regression":
-            self.func = {"activation": self.linear_activation,
+            self.func = {"activation": linear_activation,
                          "loss": mse,
                          "loss_derivative": mse_derivative}
 
         elif task == ClassificationTask.BINARY:
-            self.func = {"activation": self.sigmoid_activation,
+            self.func = {"activation": sigmoid_activation,
                          "loss": cross_entropy,
                          "loss_derivative": cross_entropy_derivative}
 
         elif task == ClassificationTask.MULTINOMIAL:
-            self.func = {"activation": self.softmax_activation,
+            self.func = {"activation": softmax_activation,
                          "loss": cross_entropy,
                          "loss_derivative": cross_entropy_derivative}
 
         elif task == ClassificationTask.MULTILABEL:
-            self.func = {"activation": self.sigmoid_activation,
+            self.func = {"activation": sigmoid_activation,
                          "loss": cross_entropy,
                          "loss_derivative": cross_entropy_derivative}
         else:
@@ -123,37 +128,6 @@ class GradientDescent(BasalModel):
             self.y_means = np.mean(y_data, axis=0)
             self.y_stds = np.std(y_data, axis=0)
 
-    # TODO: move outside the class
-    @staticmethod
-    def sigmoid_activation(x_array: NDArray) -> NDArray:
-        """ Numerically stable version of sigmoid """
-        result = np.empty_like(x_array)
-
-        # Handle positive x
-        positive_mask = x_array >= 0
-        result[positive_mask] = 1 / (1 + np.exp(-x_array[positive_mask]))
-
-        # Handle negative x
-        negative_mask = x_array < 0
-        exp_x = np.exp(x_array[negative_mask])
-        result[negative_mask] = exp_x / (1 + exp_x)
-
-        return result
-
-    # TODO: move outside the class
-    @staticmethod
-    def softmax_activation(x_array: NDArray) -> NDArray:
-        """ softmaxin' it """
-        exps = np.exp(x_array - np.max(x_array, axis=-1, keepdims=True))
-        return exps / np.sum(exps, axis=-1, keepdims=True)
-
-    # TODO: move outside the class
-    @staticmethod
-    def linear_activation(x_array: NDArray) -> NDArray:
-        """ linear forward - for regression """
-        return x_array
-
-    # TODO: move outside the class
     def _add_intercept(self, data_array: NDArray):
         """ insert an intercept at 0th index """
         return np.insert(data_array, 0, 1, -1)
