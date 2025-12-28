@@ -17,6 +17,12 @@ class ClassificationTask(Enum):
     MULTILABEL = "multilabel"
 
 
+class Reductions(Enum):
+    MEAN = 'mean'
+    SUM = 'sum'
+    NONE = None
+
+
 def determine_classification_task(targets: NDArray) -> ClassificationTask:
     """
     Takes one-hot targets

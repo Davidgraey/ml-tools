@@ -15,7 +15,8 @@
 data encoding and processing pipelines to supervised learning and clustering.
 
 The focus of this repository is:
-- **Classical ML algorithms implemented from first principles**
+- **Classic and alternative ML algorithms implemented with a unified 
+  interface**
 - **Numerical stability and performance**
 - **Novel extensions and original research contributions**
 
@@ -26,11 +27,11 @@ All algorithms are implemented in **NumPy** and **SciPy**, with minimal external
 
 ### 🔹 Encoding and Embedding Creation
 `src/ml_tools/encoders/*`
-#### Categorical variable pipeline
-#### Chronological variable (cyclical and absolute) pipeline
-#### Numeric (normalized and raw) pipeline
-#### Trainable Fourier Embedding pipeline
-#### Trainable Text embedding pipeline
+- Categorical variable pipeline
+- Chronological variable (cyclical and absolute) pipeline
+- Numeric (normalized and raw) pipeline
+- Trainable Fourier Embedding pipeline
+- Trainable Text embedding pipeline
 
 ### 🔹 Toy Dataset Generation
 `src/ml_tools/generators/*`
@@ -38,7 +39,7 @@ All algorithms are implemented in **NumPy** and **SciPy**, with minimal external
 ### 🔹 Supervised Learning
 `src/ml_tools/models/supervised/*`
 #### Scaled Conjugate Gradient (SCG)
-- SCG regression & classification  
+- SCG for gradient descent applied to regression and logistic regression 
   *(Møller); (Anderson)*
 - SCG regression with **Elastic Net regularization** *(novel)*
 - SCG classification:
@@ -56,7 +57,7 @@ All algorithms are implemented in **NumPy** and **SciPy**, with minimal external
 #### Self-Organizing Maps
 - Self Organizing Maps, Parameterless Self-Organizing Maps - PLSOM  
   *(Kohonen); (Berglund & Sitte)*
-  - Clustering and dimensionality reduction without manual tuning
+  - Clustering and dimensionality reduction without hyperparameter adjustment
 
 
 #### Centroid Neural Networks (CENTNN)

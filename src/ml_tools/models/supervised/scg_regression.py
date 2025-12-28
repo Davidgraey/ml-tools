@@ -13,9 +13,8 @@ from ml_tools.models.constants import EPSILON, SIGMA_ZERO, LAMBDA_MAX, LAMBDA_MI
 from ml_tools.generators.data_generators import to_onehot, to_int_classes, RandomDatasetGenerator
 from typing import Optional
 from ml_tools.models.constants import ClassificationTask, determine_classification_task
-from ml_tools.models.model_error import mse, mse_derivative
-from ml_tools.models.model_loss import cross_entropy, cross_entropy_derivative
-from ml_tools.models.supervised.activations import (
+from ml_tools.models.model_loss import cross_entropy, cross_entropy_derivative, mse, mse_derivative
+from ml_tools.models.activations import (
     softmax_activation,
     sigmoid_activation,
     linear_activation
@@ -42,8 +41,7 @@ class GradientDescent(BasalModel):
         reg_alpha : float balance between lasso L1 (0.0) ridge L2 (1.0)
         use_elastic_reg : bool enable elastic regularization
         """
-        super().__init__(seed=41)
-        self.RNG = np.random.default_rng(42)
+        super().__init__(seed=42)
         self.full_init = False
         self.early_termination = early_termination
 
@@ -415,7 +413,7 @@ class GradientDescent(BasalModel):
         else:
             regularization_loss = 0
 
-        return np.mean(self.func["loss"](logits, ys, task=self.task)) + regularization_loss
+        return self.func["loss"](prediction=logits, targets=ys, task=self.task, reduction="mean") + regularization_loss
 
     def predict(self, x_data: NDArray) -> NDArray:
         """ forward pass, with final activation in place and the unstandardization (if we have a regression task)"""
