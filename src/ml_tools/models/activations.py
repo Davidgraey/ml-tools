@@ -1,8 +1,9 @@
 import numpy as np
 from numpy.typing import NDArray
 
+
 def sigmoid_activation(x_array: NDArray) -> NDArray:
-    """ Numerically stable version of sigmoid """
+    """Numerically stable version of sigmoid"""
     result = np.empty_like(x_array)
 
     # Handle positive x
@@ -18,11 +19,11 @@ def sigmoid_activation(x_array: NDArray) -> NDArray:
 
 
 def softmax_activation(x_array: NDArray) -> NDArray:
-    """ softmaxin' it """
+    """softmaxin' it"""
     exps = np.exp(x_array - np.max(x_array, axis=-1, keepdims=True))
     return exps / np.sum(exps, axis=-1, keepdims=True)
 
 
 def linear_activation(x_array: NDArray) -> NDArray:
-    """ linear forward - for regression """
+    """linear forward - for regression"""
     return x_array

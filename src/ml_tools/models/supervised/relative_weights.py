@@ -1,4 +1,4 @@
-'''
+"""
 Heuristic Method for Estimating the Relative Weight of Predictor Variables in Multiple Regression
 https://www.researchgate.net/publication
 /247721163_Determining_the_Relative_Importance_of_Predictors_in_Logistic_Regression_An_Extension_of_Relative_Weight_Analysis
@@ -6,15 +6,19 @@ https://arxiv.org/pdf/2106.14095.pdf
 
 Relative Weight Analysis returns "importance scores" whose sum equals tothe overall R2 of a model; it’s normalized form allows us to say
 “Feature _X _accounts for _Z% _of variance in target variable Y.
-'''
+"""
+
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 import scipy.stats as ss
 from ml_tools.models.supervised import log
 from ml_tools.models.supervised.scg_regression import GradientDescent
-from ml_tools.models.constants import ClassificationTask, EPSILON, determine_classification_task
-from ml_tools.models.supervised import log
+from ml_tools.models.constants import (
+    ClassificationTask,
+    EPSILON,
+    determine_classification_task,
+)
 
 
 def standardize_data(design_matrix: NDArray, axis=0):
@@ -34,7 +38,7 @@ def standardize_data(design_matrix: NDArray, axis=0):
     return (design_matrix - array_mean) / array_std
 
 
-def relative_weights(x: NDArray, y: NDArray, logistic: bool=True) -> dict:
+def relative_weights(x: NDArray, y: NDArray, logistic: bool = True) -> dict:
     """
     # Extension of RWA to logistic regressions:
     https://www.researchgate.net/publication/247721163_Determining_the_Relative_Importance_of_Predictors_in_Logistic_Regression_An_Extension_of_Relative_Weight_Analysis
@@ -72,48 +76,93 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool=True) -> dict:
 
     # Classification ----
     if task == ClassificationTask.BINARY:
-        logit_model = GradientDescent(task=ClassificationTask.BINARY, use_elastic_reg=False)
-        logit_model.fit(x_data=x, y_data=y.reshape(num_samples, -1), iterations=25, add_constant=True)
+        logit_model = GradientDescent(
+            task=ClassificationTask.BINARY, use_elastic_reg=False
+        )
+        logit_model.fit(
+            x_data=x,
+            y_data=y.reshape(num_samples, -1),
+            iterations=25,
+            add_constant=True,
+        )
         logits = logit_model.forward(x, has_bias_present=False)
         predict = logit_model.predict(x)
 
         # Regress the predicted log‐odds on Z to get bZ (OLS or standard linear regression in papers)
-        grad_model = GradientDescent(task=ClassificationTask.BINARY, use_elastic_reg=False)
-        grad_model.fit(x_data=z_std, y_data=y.reshape(num_samples, -1), iterations=25, add_constant=True)
+        grad_model = GradientDescent(
+            task=ClassificationTask.BINARY, use_elastic_reg=False
+        )
+        grad_model.fit(
+            x_data=z_std,
+            y_data=y.reshape(num_samples, -1),
+            iterations=25,
+            add_constant=True,
+        )
         unstd_beta = grad_model.weights[1:]
 
     elif task == ClassificationTask.MULTINOMIAL:
-        logit_model = GradientDescent(task=ClassificationTask.MULTINOMIAL, use_elastic_reg=False)
-        logit_model.fit(x_data=x, y_data=y.reshape(num_samples, -1), iterations=25, add_constant=True)
+        logit_model = GradientDescent(
+            task=ClassificationTask.MULTINOMIAL, use_elastic_reg=False
+        )
+        logit_model.fit(
+            x_data=x,
+            y_data=y.reshape(num_samples, -1),
+            iterations=25,
+            add_constant=True,
+        )
         logits = logit_model.forward(x, has_bias_present=False)
         predict = logit_model.predict(x)
 
         # Regress the predicted log‐odds on Z to get bZ (OLS or standard linear regression in papers)
-        grad_model = GradientDescent(task=ClassificationTask.MULTINOMIAL, use_elastic_reg=False)
-        grad_model.fit(x_data=z_std, y_data=y.reshape(num_samples, -1), iterations=25, add_constant=True)
+        grad_model = GradientDescent(
+            task=ClassificationTask.MULTINOMIAL, use_elastic_reg=False
+        )
+        grad_model.fit(
+            x_data=z_std,
+            y_data=y.reshape(num_samples, -1),
+            iterations=25,
+            add_constant=True,
+        )
         unstd_beta = grad_model.weights[1:]
 
     elif task == ClassificationTask.MULTILABEL:
-        logit_model = GradientDescent(task=ClassificationTask.MULTILABEL, use_elastic_reg=False)
-        logit_model.fit(x_data=x, y_data=y.reshape(num_samples, -1), iterations=25, add_constant=True)
+        logit_model = GradientDescent(
+            task=ClassificationTask.MULTILABEL, use_elastic_reg=False
+        )
+        logit_model.fit(
+            x_data=x,
+            y_data=y.reshape(num_samples, -1),
+            iterations=25,
+            add_constant=True,
+        )
         logits = logit_model.forward(x, has_bias_present=False)
         predict = logit_model.predict(x)
 
         # Regress the predicted log‐odds on Z to get bZ (OLS or standard linear regression in papers)
-        grad_model = GradientDescent(task=ClassificationTask.MULTILABEL, use_elastic_reg=False)
-        grad_model.fit(x_data=z_std, y_data=y.reshape(num_samples, -1), iterations=25, add_constant=True)
+        grad_model = GradientDescent(
+            task=ClassificationTask.MULTILABEL, use_elastic_reg=False
+        )
+        grad_model.fit(
+            x_data=z_std,
+            y_data=y.reshape(num_samples, -1),
+            iterations=25,
+            add_constant=True,
+        )
         unstd_beta = grad_model.weights[1:]
-
 
     # Regression ----
     else:
         # Regress Y on Z to get bZ (OLS or standard linear regression in papers)
         # np.linalg.lstsq()
         grad_model = GradientDescent(task="regression", use_elastic_reg=False)
-        grad_model.fit(x_data=z_std, y_data=y.reshape(num_samples, -1), iterations=100, add_constant=True)
+        grad_model.fit(
+            x_data=z_std,
+            y_data=y.reshape(num_samples, -1),
+            iterations=100,
+            add_constant=True,
+        )
         predict = grad_model.predict(x)
         unstd_beta = grad_model.weights[1:]
-
 
     log.info(f"Link y^ to y: {grad_model.weights}")
 
@@ -141,7 +190,7 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool=True) -> dict:
     # back-project our coefficients into x-space
     # beta_projected = lambda_star @ beta
 
-    relative_w = (lambda_star ** 2) @ (beta ** 2)
+    relative_w = (lambda_star**2) @ (beta**2)
 
     # epsilon - our relative weight value
     # relative_w = lambda_star ** 2 @ beta ** 2
@@ -154,18 +203,18 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool=True) -> dict:
     normalized_weights = (relative_w - _min) / (_max - _min + EPSILON)
     # logging.info(f'rwa completed')
 
-    return {'rwa': signs * relative_w,
-            'norm_rwa': normalized_weights,
-            'sign_norm_rwa': normalized_weights * signs,
-            'betas': beta,
-            'r2': r2,
-            'model_prediction': predict,
-            }
+    return {
+        "rwa": signs * relative_w,
+        "norm_rwa": normalized_weights,
+        "sign_norm_rwa": normalized_weights * signs,
+        "betas": beta,
+        "r2": r2,
+        "model_prediction": predict,
+    }
 
 
 if __name__ == "__main__":
     from ml_tools.generators.data_generators import RandomDatasetGenerator, to_onehot
-
 
     num_samples = 2000
     num_features = 8
@@ -175,45 +224,54 @@ if __name__ == "__main__":
     gen = RandomDatasetGenerator(random_seed=123)
     # ========= regression dataset ========
 
-    x, y, meta = gen.generate(task="regression",
-                              num_samples=num_samples,
-                              num_features=num_features,
-                              noise_scale=NOISE)
+    x, y, meta = gen.generate(
+        task="regression",
+        num_samples=num_samples,
+        num_features=num_features,
+        noise_scale=NOISE,
+    )
     coef = np.abs(meta["weights"])
     lin_res = relative_weights(x, y, logistic=False)
 
     plt.figure()
     plt.subplot(1, 2, 1)
     plt.title("pred v target")
-    plt.scatter(lin_res['model_prediction'], y)
+    plt.scatter(lin_res["model_prediction"], y)
     plt.subplot(1, 2, 2)
     plt.title("regression RWA")
     to_plot = (coef - np.min(coef)) / (np.max(coef) - np.min(coef) + EPSILON)
     plt.barh(range(len(to_plot)), to_plot, alpha=0.75, color="blue")
-    to_plot = lin_res['sign_norm_rwa'].ravel() / np.max(lin_res['sign_norm_rwa'].ravel())
+    to_plot = lin_res["sign_norm_rwa"].ravel() / np.max(
+        lin_res["sign_norm_rwa"].ravel()
+    )
     plt.barh(range(len(to_plot)), to_plot, alpha=0.75, color="orange")
     plt.legend(["data_beta", "RWA"])
     plt.show()
 
     # ========= classificaiton dataset ========
     num_classes = 2
-    x, y, meta = gen.generate(task="binary",
-                              num_samples=num_samples,
-                              num_classes=num_classes,
-                              num_features=num_features,
-                              noise_scale=NOISE)
+    x, y, meta = gen.generate(
+        task="binary",
+        num_samples=num_samples,
+        num_classes=num_classes,
+        num_features=num_features,
+        noise_scale=NOISE,
+    )
 
     coef = np.abs(meta["weights"])
     _y = to_onehot(y)
     print(_y.shape)
     log_res = relative_weights(x, _y, logistic=True)
 
-    pred = log_res['model_prediction']
+    pred = log_res["model_prediction"]
     pred = np.argmax(pred, axis=-1)
     print("correct: ", np.sum(pred == y))
     print("wrong: ", np.sum(pred != y))
     print("accuracy: ", np.sum(pred == y) / num_samples)
-    print(y.shape, pred.shape, )
+    print(
+        y.shape,
+        pred.shape,
+    )
     plt.figure()
     # plt.subplot(1, 2, 1)
     # plt.title("pred v target")
@@ -229,7 +287,7 @@ if __name__ == "__main__":
     to_plot = coef / np.max(coef)
     plt.barh(range(len(to_plot)), to_plot, alpha=0.75, color="blue")
 
-    to_plot = np.sum(log_res['norm_rwa'], axis=-1)
+    to_plot = np.sum(log_res["norm_rwa"], axis=-1)
     plt.barh(range(len(to_plot)), to_plot, alpha=0.5, color="orange")
     plt.legend(["data_beta", "RWA"])
     plt.tight_layout()
@@ -237,23 +295,28 @@ if __name__ == "__main__":
 
     # ========= multinomial dataset ========
     num_classes = 6
-    x, y, meta = gen.generate(task="multiclass",
-                              num_samples=num_samples,
-                              num_classes=num_classes,
-                              num_features=num_features,
-                              noise_scale=NOISE)
+    x, y, meta = gen.generate(
+        task="multiclass",
+        num_samples=num_samples,
+        num_classes=num_classes,
+        num_features=num_features,
+        noise_scale=NOISE,
+    )
 
     coef = np.abs(meta["weights"])
     _y = to_onehot(y)
     print(_y.shape)
     log_res = relative_weights(x, _y, logistic=True)
 
-    pred = log_res['model_prediction']
+    pred = log_res["model_prediction"]
     pred = np.argmax(pred, axis=-1)
     print("correct: ", np.sum(pred == y))
     print("wrong: ", np.sum(pred != y))
     print("accuracy: ", np.sum(pred == y) / num_samples)
-    print(y.shape, pred.shape, )
+    print(
+        y.shape,
+        pred.shape,
+    )
 
     plt.figure()
     # to_plot = np.sum(log_res['sign_norm_rwa'], axis=-1)
@@ -262,10 +325,12 @@ if __name__ == "__main__":
     spread = list(range(len(x)))
     diff = np.abs(y - pred)
     noise = np.random.uniform(0.5, 1, size=num_samples)
-    diff = ((diff * noise) / num_classes * num_samples)
+    diff = (diff * noise) / num_classes * num_samples
     for idx in range(num_samples):
         sign = np.random.choice([-1, 1])
-        plt.scatter(spread[idx], (spread[idx] + sign*diff[idx]), alpha=0.1, color="blue")
+        plt.scatter(
+            spread[idx], (spread[idx] + sign * diff[idx]), alpha=0.1, color="blue"
+        )
     # plt.scatter(spread, spread, alpha=0.2, color="orange")
     plt.show()
 
@@ -275,12 +340,12 @@ if __name__ == "__main__":
     rows = 3
     cols = int(np.ceil(num_classes / rows))
     for class_idx in range(num_classes):
-        plt.subplot(rows, cols, class_idx+ 1)
+        plt.subplot(rows, cols, class_idx + 1)
         plt.title(f"class {class_idx}")
         to_plot = coef / np.max(coef)
         plt.barh(range(len(to_plot)), np.abs(to_plot), alpha=0.75, color="blue")
 
-        to_plot = log_res['norm_rwa'][:, class_idx]
+        to_plot = log_res["norm_rwa"][:, class_idx]
         plt.barh(range(len(to_plot)), to_plot, alpha=0.5, color="orange")
 
     plt.legend(["data_beta", "RWA"])
@@ -289,11 +354,13 @@ if __name__ == "__main__":
 
     # ========= Multiclass, Multilabel dataset ========
     num_classes = 5
-    x, y, meta = gen.generate(task="multilabel",
-                              num_samples=num_samples,
-                              num_classes=num_classes,
-                              num_features=num_features,
-                              noise_scale=NOISE)
+    x, y, meta = gen.generate(
+        task="multilabel",
+        num_samples=num_samples,
+        num_classes=num_classes,
+        num_features=num_features,
+        noise_scale=NOISE,
+    )
 
     coef = np.abs(meta["weights"])
     # y is already one-hot since it's multilabel.
@@ -301,12 +368,15 @@ if __name__ == "__main__":
     print(_y.shape)
     log_res = relative_weights(x, _y, logistic=True)
 
-    pred = log_res['model_prediction'].round()
+    pred = log_res["model_prediction"].round()
 
     print("correct: ", np.sum(pred == y))
     print("wrong: ", np.sum(pred != y))
     print("accuracy: ", np.sum(pred == y) / (num_samples * num_classes))
-    print(y.shape, pred.shape, )
+    print(
+        y.shape,
+        pred.shape,
+    )
 
     # plt.figure()
     # to_plot = np.sum(log_res['sign_norm_rwa'], axis=-1)
@@ -334,11 +404,9 @@ if __name__ == "__main__":
         to_plot = coef / np.max(coef)
         plt.barh(range(len(to_plot)), np.abs(to_plot), alpha=0.75, color="blue")
 
-        to_plot = log_res['norm_rwa'][:, class_idx]
-        plt.barh(range(len(to_plot)), to_plot,  alpha=0.5, color="orange")
+        to_plot = log_res["norm_rwa"][:, class_idx]
+        plt.barh(range(len(to_plot)), to_plot, alpha=0.5, color="orange")
 
     plt.legend(["data_beta", "RWA"])
     plt.tight_layout()
     plt.show()
-
-

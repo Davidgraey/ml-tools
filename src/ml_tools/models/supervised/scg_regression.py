@@ -1,36 +1,44 @@
-'''
+"""
 Regression: Gradient Descent with Scaled Conjugate Gradient
 SCG lets us avoid hyperparameter optimization step; makes it much more 'plug n play'
 Scaled Conjugate Gradient adapted from implementation by Prof Charles
 Anderson, CSU
 
 Including regularization via elasticnet to extend usability a bit
-'''
+"""
+
 import numpy as np
 import copy
 from numpy.typing import NDArray
 from ml_tools.models.constants import EPSILON, SIGMA_ZERO, LAMBDA_MAX, LAMBDA_MIN
-from ml_tools.generators.data_generators import to_onehot, to_int_classes, RandomDatasetGenerator
+from ml_tools.generators.data_generators import to_onehot, RandomDatasetGenerator
 from typing import Optional
-from ml_tools.models.constants import ClassificationTask, determine_classification_task
-from ml_tools.models.model_loss import cross_entropy, cross_entropy_derivative, mse, mse_derivative
+from ml_tools.models.constants import ClassificationTask
+from ml_tools.models.model_loss import (
+    cross_entropy,
+    cross_entropy_derivative,
+    mse,
+    mse_derivative,
+)
 from ml_tools.models.activations import (
     softmax_activation,
     sigmoid_activation,
-    linear_activation
+    linear_activation,
 )
 from ml_tools.models.supervised import log
 from ml_tools.types import BasalModel
 
 
 class GradientDescent(BasalModel):
-    def __init__(self,
-                 task: str|ClassificationTask = "regression",
-                 divisi: int = 3,
-                 reg_lambda: float = 0.1,
-                 reg_alpha: float = 0.5,
-                 use_elastic_reg: bool = False,
-                 early_termination: bool = True):
+    def __init__(
+        self,
+        task: str | ClassificationTask = "regression",
+        divisi: int = 3,
+        reg_lambda: float = 0.1,
+        reg_alpha: float = 0.5,
+        use_elastic_reg: bool = False,
+        early_termination: bool = True,
+    ):
         """
 
         Parameters
@@ -48,33 +56,45 @@ class GradientDescent(BasalModel):
         # hyperparameters for elasticnet regularization
         self.divisi = divisi
         self.use_elastic_reg = use_elastic_reg
-        self.reg_lambda: float = reg_lambda # overall regularization strength
-        self.reg_alpha: float = reg_alpha  # balance between lasso L1 (0.0) ridge L2 (1.0)
+        self.reg_lambda: float = reg_lambda  # overall regularization strength
+        self.reg_alpha: float = (
+            reg_alpha  # balance between lasso L1 (0.0) ridge L2 (1.0)
+        )
 
         self.task: ClassificationTask = task
         if task == "regression":
-            self.func = {"activation": linear_activation,
-                         "loss": mse,
-                         "loss_derivative": mse_derivative}
+            self.func = {
+                "activation": linear_activation,
+                "loss": mse,
+                "loss_derivative": mse_derivative,
+            }
 
         elif task == ClassificationTask.BINARY:
-            self.func = {"activation": sigmoid_activation,
-                         "loss": cross_entropy,
-                         "loss_derivative": cross_entropy_derivative}
+            self.func = {
+                "activation": sigmoid_activation,
+                "loss": cross_entropy,
+                "loss_derivative": cross_entropy_derivative,
+            }
 
         elif task == ClassificationTask.MULTINOMIAL:
-            self.func = {"activation": softmax_activation,
-                         "loss": cross_entropy,
-                         "loss_derivative": cross_entropy_derivative}
+            self.func = {
+                "activation": softmax_activation,
+                "loss": cross_entropy,
+                "loss_derivative": cross_entropy_derivative,
+            }
 
         elif task == ClassificationTask.MULTILABEL:
-            self.func = {"activation": sigmoid_activation,
-                         "loss": cross_entropy,
-                         "loss_derivative": cross_entropy_derivative}
+            self.func = {
+                "activation": sigmoid_activation,
+                "loss": cross_entropy,
+                "loss_derivative": cross_entropy_derivative,
+            }
         else:
-            raise ValueError(f"task must be one of regression, binary, multinomial, multilabel; got {task}")
+            raise ValueError(
+                f"task must be one of regression, binary, multinomial, multilabel; got {task}"
+            )
 
-    def init_weights(self,  n_outputs: int = 1) -> None:
+    def init_weights(self, n_outputs: int = 1) -> None:
         """
         Initalize the beta values (coefficients / weights) using Kaiming mechanism
         Parameters
@@ -89,7 +109,7 @@ class GradientDescent(BasalModel):
         ws = self.RNG.normal(
             loc=0.0,
             scale=np.sqrt(2 / self.input_dimension),
-            size=(self.input_dimension + 1, n_outputs)
+            size=(self.input_dimension + 1, n_outputs),
         )
 
         # add zero for has_bias_presentbias / intercept value
@@ -97,28 +117,22 @@ class GradientDescent(BasalModel):
         # log.info(f'kaiming init built {ws.shape} coefficients')
         self.weights = ws
 
-    def standardize(self,
-                    data_array: NDArray,
-                    mean: NDArray,
-                    stds: NDArray
-                    ) -> NDArray:
-        """ standardize our data to 0 mean 1 std"""
+    def standardize(self, data_array: NDArray, mean: NDArray, stds: NDArray) -> NDArray:
+        """standardize our data to 0 mean 1 std"""
         assert data_array.shape[-1] == mean.shape[0]
 
         return (data_array - mean) / (stds + EPSILON)
 
-    def unstandardize(self,
-                      data_array: NDArray,
-                      mean: NDArray,
-                      stds: NDArray
-                      ) -> NDArray:
-        """ reverse the standardize process - restore the original data space """
+    def unstandardize(
+        self, data_array: NDArray, mean: NDArray, stds: NDArray
+    ) -> NDArray:
+        """reverse the standardize process - restore the original data space"""
         assert data_array.shape[-1] == mean.shape[0]
 
         return (stds - EPSILON) * data_array + mean
 
     def init_standardize(self, x_data: NDArray, y_data: Optional[NDArray]) -> None:
-        """ update the tracking means and standards """
+        """update the tracking means and standards"""
         self.x_means = np.mean(x_data, axis=0)
         self.x_stds = np.std(x_data, axis=0)
 
@@ -127,7 +141,7 @@ class GradientDescent(BasalModel):
             self.y_stds = np.std(y_data, axis=0)
 
     def _add_intercept(self, data_array: NDArray):
-        """ insert an intercept at 0th index """
+        """insert an intercept at 0th index"""
         return np.insert(data_array, 0, 1, -1)
 
     def log_likelihood(self, prediction: NDArray, targets: NDArray) -> NDArray | float:
@@ -148,14 +162,17 @@ class GradientDescent(BasalModel):
         elif self.task in (ClassificationTask.BINARY, ClassificationTask.MULTILABEL):
             llh = np.mean(
                 np.sum(
-                    targets * np.log(_p) + (1 - targets) * np.log(1 - prediction + EPSILON),
-                    axis=-1
+                    targets * np.log(_p)
+                    + (1 - targets) * np.log(1 - prediction + EPSILON),
+                    axis=-1,
                 )
             )
         return llh
 
-    def _calculate_pseudo_r_squared(self, prediction: NDArray, targets: NDArray) -> tuple[float, float]:
-        """ doing McFadden's R-squared for classificaiton """
+    def _calculate_pseudo_r_squared(
+        self, prediction: NDArray, targets: NDArray
+    ) -> tuple[float, float]:
+        """doing McFadden's R-squared for classificaiton"""
         # LLH of the model
         log_likelihood = self.log_likelihood(prediction, targets)
 
@@ -171,27 +188,30 @@ class GradientDescent(BasalModel):
 
         return self.r_square, self.adjusted_r_square
 
-    def _calculate_r_square(self, prediction: NDArray, targets: NDArray) -> tuple[float, float]:
+    def _calculate_r_square(
+        self, prediction: NDArray, targets: NDArray
+    ) -> tuple[float, float]:
         if self.task == "regression":
             self.residuals = prediction - targets
-            residual_sum_squares = np.sum(self.residuals ** 2)
+            residual_sum_squares = np.sum(self.residuals**2)
             total_sum_squares = np.sum((targets - np.mean(targets)) ** 2)
             self.r_square = 1 - (residual_sum_squares / total_sum_squares)
-            self.adjusted_r_square = 1- (
+            self.adjusted_r_square = 1 - (
                 ((1 - self.r_square) * (self.num_samples - 1))
-                / (self.num_samples - self.input_dimension - 1))
+                / (self.num_samples - self.input_dimension - 1)
+            )
 
         # ------- classification----- using mcfadden's R2 and no adjusted mechanism
         else:
-            self.r_square, self.adjusted_r_square = self._calculate_pseudo_r_squared(prediction, targets)
+            self.r_square, self.adjusted_r_square = self._calculate_pseudo_r_squared(
+                prediction, targets
+            )
 
         return self.r_square, self.adjusted_r_square
 
-    def scaled_conjugate_gradient(self,
-                                  x_data: NDArray,
-                                  y_data: NDArray,
-                                  iterations: int
-                                  ) -> NDArray:
+    def scaled_conjugate_gradient(
+        self, x_data: NDArray, y_data: NDArray, iterations: int
+    ) -> NDArray:
         """
         This is the SCG multi-step search; 2nd order derivatives lead us to a step that is less sensitive to local
         minima.  However, it's expensive to compute, and can overfit/converge too quickly; so we alternate between SCG
@@ -253,7 +273,7 @@ class GradientDescent(BasalModel):
             self.weights = vector_new.copy().reshape(self._weight_shape)
             loss_new = self.calculate_loss(x_data, y_data)
 
-            comparison = 2 * delta * (loss_old - loss_new) / (phi ** 2)
+            comparison = 2 * delta * (loss_old - loss_new) / (phi**2)
 
             if comparison >= 0:
                 # break condition?
@@ -281,13 +301,13 @@ class GradientDescent(BasalModel):
 
         return vector_new.reshape(self._weight_shape)
 
-    def fit(self,
-            x_data: NDArray,
-            y_data: NDArray,
-            iterations: int = 100,
-            add_constant: bool = True
-            ):
-
+    def fit(
+        self,
+        x_data: NDArray,
+        y_data: NDArray,
+        iterations: int = 100,
+        add_constant: bool = True,
+    ):
         self.num_samples = x_data.shape[0]
         self.num_outputs = y_data.shape[-1]
 
@@ -333,7 +353,7 @@ class GradientDescent(BasalModel):
             else:
                 # standard gradient descent approach ---------
                 delta_ws, prediction = self._calculate_gradients(xs, ys)
-                self.weights = W - (delta_ws * (0.001/self.divisi))
+                self.weights = W - (delta_ws * (0.001 / self.divisi))
 
             epoch_loss = np.mean(loss)
             errors.append(epoch_loss)
@@ -341,12 +361,12 @@ class GradientDescent(BasalModel):
             if i <= 5:
                 continue
             if self.early_termination:
-                loss_delta = (np.array(errors[-min(i, 5):]) - epoch_loss)
+                loss_delta = np.array(errors[-min(i, 5) :]) - epoch_loss
                 loss_new = np.mean(self.calculate_loss(xs, ys))
                 if (np.mean(loss_delta) < 0.01) or ((epoch_loss - loss_new) >= 0):
                     self.divisi += 1
 
-                if (np.sum(loss_delta < 0) > 10):
+                if np.sum(loss_delta < 0) > 10:
                     print(f"early termination at {i} with error {epoch_loss}")
                     log.info(f"early termination at {i} with error {epoch_loss}")
                     break
@@ -361,11 +381,13 @@ class GradientDescent(BasalModel):
         log.info(f"divisi {self.divisi} ")
         return errors
 
-    def fit_predict(self,
-                    x_data: NDArray,
-                    y_data: NDArray,
-                    iterations: int = 100,
-                    add_constant: bool = True ):
+    def fit_predict(
+        self,
+        x_data: NDArray,
+        y_data: NDArray,
+        iterations: int = 100,
+        add_constant: bool = True,
+    ):
         _error = self.fit(x_data, y_data, iterations, add_constant)
         return self.predict(x_data)
 
@@ -391,73 +413,79 @@ class GradientDescent(BasalModel):
 
         return logit
 
-    def _calculate_gradients(self, x_data: NDArray, y_data: NDArray) -> tuple[NDArray, NDArray]:
-        """ calculate gradients for weight updates"""
+    def _calculate_gradients(
+        self, x_data: NDArray, y_data: NDArray
+    ) -> tuple[NDArray, NDArray]:
+        """calculate gradients for weight updates"""
         logits = self.forward(x_data)
         prediction = self.func["activation"](logits)
-        delta_grad = self.func["loss_derivative"](targets=y_data, prediction=prediction, task=self.task)
+        delta_grad = self.func["loss_derivative"](
+            targets=y_data, prediction=prediction, task=self.task
+        )
 
         if self.use_elastic_reg:
             reg_gradient = self.elasticnet_grad()
-            gradient = ((x_data.T @ (delta_grad)) + reg_gradient)
+            gradient = (x_data.T @ (delta_grad)) + reg_gradient
         else:
-            gradient = (x_data.T @ (delta_grad))
+            gradient = x_data.T @ (delta_grad)
 
         return gradient, prediction
 
     def calculate_loss(self, xs: NDArray, ys: NDArray) -> float:
-        """ calculate loss for current weights and inputs """
+        """calculate loss for current weights and inputs"""
         logits = self.forward(xs)
         if self.use_elastic_reg:
             regularization_loss = self.elasticnet_loss()
         else:
             regularization_loss = 0
 
-        return self.func["loss"](prediction=logits, targets=ys, task=self.task, reduction="mean") + regularization_loss
+        return (
+            self.func["loss"](
+                prediction=logits, targets=ys, task=self.task, reduction="mean"
+            )
+            + regularization_loss
+        )
 
     def predict(self, x_data: NDArray) -> NDArray:
-        """ forward pass, with final activation in place and the unstandardization (if we have a regression task)"""
+        """forward pass, with final activation in place and the unstandardization (if we have a regression task)"""
         _x = self.standardize(x_data, self.x_means, self.x_stds)
         prediction = self.forward(_x, has_bias_present=False)
 
         if self.task == "regression":
-            prediction =  self.unstandardize(prediction, self.y_means, self.y_stds)
+            prediction = self.unstandardize(prediction, self.y_means, self.y_stds)
         else:
-            prediction =  prediction
+            prediction = prediction
 
         return self.func["activation"](prediction)
 
     def elasticnet_loss(self) -> NDArray:
-        """ implementing elasticnet factor on loss """
+        """implementing elasticnet factor on loss"""
         lasso_penalty = np.sum(np.abs(self.weights))
-        ridge_penalty = np.sum(self.weights ** 2)
-        reg_loss = (
-            self.reg_lambda * (
-            (self.reg_alpha * lasso_penalty)
-            + ((1 - self.reg_alpha) * ridge_penalty)
-            )
+        ridge_penalty = np.sum(self.weights**2)
+        reg_loss = self.reg_lambda * (
+            (self.reg_alpha * lasso_penalty) + ((1 - self.reg_alpha) * ridge_penalty)
         )
         return reg_loss
 
     def elasticnet_grad(self) -> NDArray:
-        """ implementing elasticnet factor on gradients """
+        """implementing elasticnet factor on gradients"""
         reg_grad = self.reg_lambda * (
             (self.reg_alpha * np.sign(self.weights))
-            + ((1 - self.reg_alpha) * 2*self.weights)
+            + ((1 - self.reg_alpha) * 2 * self.weights)
         )
         return reg_grad
 
     def get_residuals(self):
-        """ get the residuals from the last fit """
+        """get the residuals from the last fit"""
         return self.residuals
 
     def get_weights(self):
-        """ return a copy of the weights """
+        """return a copy of the weights"""
         self._weight_shape = self.weights.shape
         return copy.deepcopy(self.weights)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
     num_samples = 2000
@@ -468,24 +496,22 @@ if __name__ == '__main__':
     # ============================ REGRESSION ==============================
     print("============ REGRESSION ============")
     generator = RandomDatasetGenerator(random_seed=44)
-    x, y, meta = generator.generate(task="regression",
-                                    num_samples=num_samples,
-                                    num_features=num_features,
-                                    noise_scale=NOISE
-                                    )
+    x, y, meta = generator.generate(
+        task="regression",
+        num_samples=num_samples,
+        num_features=num_features,
+        noise_scale=NOISE,
+    )
     coef = meta["weights"]
     ws = []
     for reg in [False, True]:
-        model = GradientDescent(task='regression',
-                                use_elastic_reg=reg,
-                                early_termination=True)
+        model = GradientDescent(
+            task="regression", use_elastic_reg=reg, early_termination=True
+        )
         print(x.shape, y.shape)
-        errors = model.fit(x_data=x,
-                           y_data=y.reshape(-1, 1),
-                           iterations=N_steps)
+        errors = model.fit(x_data=x, y_data=y.reshape(-1, 1), iterations=N_steps)
         print(model.use_elastic_reg)
         print("R2: ", model.r_square, model.adjusted_r_square)
-
 
         plt.title("regression loss")
         plt.subplot(2, 1, 1)
@@ -499,17 +525,17 @@ if __name__ == '__main__':
         plt.figure(figsize=(7, 10))
         plt.title(f"regression info for {reg}")
         ax1 = plt.subplot(2, 3, 1, label="ys")
-        plt.plot(y[:], 'r')
+        plt.plot(y[:], "r")
         ax1.set_title("targets")
 
         ax2 = plt.subplot(2, 3, 2, label="both")
         ax2.set_title("pred/targets")
-        plt.plot(y, alpha=0.8, c='r')
-        plt.plot(pred, alpha=0.8, c='b')
+        plt.plot(y, alpha=0.8, c="r")
+        plt.plot(pred, alpha=0.8, c="b")
 
         ax3 = plt.subplot(2, 3, 3, label="prediction")
         ax3.set_title("prediction")
-        plt.plot(pred[:], 'b')
+        plt.plot(pred[:], "b")
 
         ax4 = plt.subplot(2, 3, 4)
         ax4.set_title("Target coefficients")
@@ -518,7 +544,13 @@ if __name__ == '__main__':
         plt.scatter(_xs, _coef, label="ceoffs")
         ax5 = plt.subplot(2, 3, 5)
         ax5.set_title("coeff - Weights DIFF")
-        plt.plot(_xs, np.abs(_coef - model.weights.squeeze()), label="diff", alpha=0.66, c="r")
+        plt.plot(
+            _xs,
+            np.abs(_coef - model.weights.squeeze()),
+            label="diff",
+            alpha=0.66,
+            c="r",
+        )
         plt.scatter(_xs, _coef.T, label="T Betas", alpha=0.66, c="y")
         plt.scatter(_xs, model.weights.squeeze(), label="T Betas", alpha=0.66, c="b")
 
@@ -530,20 +562,19 @@ if __name__ == '__main__':
 
     # ============================ CLASSIFICATION ==============================
     print("============ BINARY CLASSIFICATION ============")
-    x, y, meta = generator.generate(task="binary",
-                                    num_samples=num_samples,
-                                    num_features=num_features,
-                                    num_classes=2,
-                                    noise_scale=NOISE
-                                    )
+    x, y, meta = generator.generate(
+        task="binary",
+        num_samples=num_samples,
+        num_features=num_features,
+        num_classes=2,
+        noise_scale=NOISE,
+    )
 
-    model = GradientDescent(task=ClassificationTask.BINARY,
-                            use_elastic_reg=False,
-                            early_termination=True)
+    model = GradientDescent(
+        task=ClassificationTask.BINARY, use_elastic_reg=False, early_termination=True
+    )
     _y = to_onehot(y)
-    errors = model.fit(x_data=x,
-                       y_data=_y,
-                       iterations=N_steps)
+    errors = model.fit(x_data=x, y_data=_y, iterations=N_steps)
 
     coef = meta["weights"]
     plt.title("binary classification loss")
@@ -564,18 +595,18 @@ if __name__ == '__main__':
 
     plt.figure(figsize=(7, 10))
     _xs = np.arange(num_samples)
-    plt.title(f"Model details for binary classification")
+    plt.title("Model details for binary classification")
     # to_int_classes
     ax1 = plt.subplot(2, 3, 1, label="targets")
     plt.scatter(_xs, y, c="r")
     ax1.set_title("targets")
     ax2 = plt.subplot(2, 3, 2, label="both")
     ax2.set_title("pred/targets")
-    plt.scatter(_xs, y, alpha=0.66, c='r')
-    plt.scatter(_xs, pred, alpha=0.33, c='b')
+    plt.scatter(_xs, y, alpha=0.66, c="r")
+    plt.scatter(_xs, pred, alpha=0.33, c="b")
     ax3 = plt.subplot(2, 3, 3, label="prediction")
     ax3.set_title("prediction")
-    plt.scatter(_xs, pred[:], c='b')
+    plt.scatter(_xs, pred[:], c="b")
     ax4 = plt.subplot(2, 3, 4)
     ax4.set_title("Target coefficients")
     _xs = np.arange(num_features + 1)
@@ -593,23 +624,23 @@ if __name__ == '__main__':
 
     plt.show()
 
-
     # ======================= multinomial CLASSIFICATION ===========================
     print("============ MULTINOMIAL CLASSIFICATION ============")
-    x, y, meta = generator.generate(task="multiclass",
-                                    num_samples=num_samples,
-                                    num_features=num_features,
-                                    num_classes=6,
-                                    noise_scale=NOISE,
-                                    )
+    x, y, meta = generator.generate(
+        task="multiclass",
+        num_samples=num_samples,
+        num_features=num_features,
+        num_classes=6,
+        noise_scale=NOISE,
+    )
 
-    model = GradientDescent(task=ClassificationTask.MULTINOMIAL,
-                            use_elastic_reg=False,
-                            early_termination=False)
+    model = GradientDescent(
+        task=ClassificationTask.MULTINOMIAL,
+        use_elastic_reg=False,
+        early_termination=False,
+    )
     _y = to_onehot(y)
-    errors = model.fit(x_data=x,
-                       y_data=_y,
-                       iterations=N_steps)
+    errors = model.fit(x_data=x, y_data=_y, iterations=N_steps)
 
     coef = meta["weights"]
     plt.title("multinomial classification loss")
@@ -632,18 +663,18 @@ if __name__ == '__main__':
 
     plt.figure(figsize=(7, 10))
     _xs = np.arange(num_samples)
-    plt.title(f"Model details for multinomial classification")
+    plt.title("Model details for multinomial classification")
     # to_int_classes
     ax1 = plt.subplot(2, 3, 1, label="ys")
     plt.scatter(_xs, y, c="r")
     ax1.set_title("targets")
     ax2 = plt.subplot(2, 3, 2, label="both")
     ax2.set_title("pred/targets")
-    plt.scatter(_xs, y, alpha=0.66, c='r')
-    plt.scatter(_xs, pred, alpha=0.33, c='b')
+    plt.scatter(_xs, y, alpha=0.66, c="r")
+    plt.scatter(_xs, pred, alpha=0.33, c="b")
     ax3 = plt.subplot(2, 3, 3, label="prediction")
     ax3.set_title("prediction")
-    plt.scatter(_xs, pred, c='b')
+    plt.scatter(_xs, pred, c="b")
     ax4 = plt.subplot(2, 3, 4)
     ax4.set_title("Target coefficients")
     _xs = np.arange(num_features + 1)
@@ -662,26 +693,25 @@ if __name__ == '__main__':
 
     plt.show()
 
-
     # ============================ MULTILABEL CLASSIFICATION ==============================
     print("============ MULTILABEL CLASSIFICATION ============")
     num_classes = 5
-    x, y, meta = generator.generate(task="multilabel",
-                                    num_samples=num_samples,
-                                    num_features=num_features,
-                                    num_classes=num_classes,
-                                    noise_scale=NOISE
-                                    )
+    x, y, meta = generator.generate(
+        task="multilabel",
+        num_samples=num_samples,
+        num_features=num_features,
+        num_classes=num_classes,
+        noise_scale=NOISE,
+    )
 
-    model = GradientDescent(task=ClassificationTask.MULTILABEL,
-                            use_elastic_reg=False,
-                            early_termination=True)
+    model = GradientDescent(
+        task=ClassificationTask.MULTILABEL,
+        use_elastic_reg=False,
+        early_termination=True,
+    )
 
     print(x.shape, y.shape)
-    errors = model.fit(x_data=x,
-                       y_data=y,
-                       iterations=N_steps
-                       )
+    errors = model.fit(x_data=x, y_data=y, iterations=N_steps)
 
     coef = meta["weights"]
     plt.title("multilabel classification loss")
@@ -695,13 +725,13 @@ if __name__ == '__main__':
     pred = np.where(pred > 0.5, 1, 0)
     print("correct: ", np.sum(pred == y))
     print("wrong: ", np.sum(pred != y))
-    print("accuracy: ", np.sum(pred == y) / (num_samples*num_classes))
+    print("accuracy: ", np.sum(pred == y) / (num_samples * num_classes))
     print("R2: ", model.r_square, model.adjusted_r_square)
 
     plt.figure(figsize=(7, 10))
     _xs = np.tile(np.arange(num_samples), num_classes).reshape(num_samples, -1)
 
-    plt.title(f"Model details for multinomial, multilabel classification")
+    plt.title("Model details for multinomial, multilabel classification")
     # to_int_classes
     plotable_y = y * np.arange(0, num_classes)
     plotable_pred = pred * np.arange(0, num_classes)
@@ -710,11 +740,11 @@ if __name__ == '__main__':
     ax1.set_title("targets")
     ax2 = plt.subplot(2, 3, 2, label="both")
     ax2.set_title("pred/targets")
-    plt.scatter(_xs, plotable_y, alpha=0.66, c='r')
-    plt.scatter(_xs, plotable_pred, alpha=0.33, c='b')
+    plt.scatter(_xs, plotable_y, alpha=0.66, c="r")
+    plt.scatter(_xs, plotable_pred, alpha=0.33, c="b")
     ax3 = plt.subplot(2, 3, 3, label="prediction")
     ax3.set_title("prediction")
-    plt.scatter(_xs, plotable_pred, c='b')
+    plt.scatter(_xs, plotable_pred, c="b")
     ax4 = plt.subplot(2, 3, 4)
     ax4.set_title("Target coefficients")
     _xs = np.arange(num_features + 1)

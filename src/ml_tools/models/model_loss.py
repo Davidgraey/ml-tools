@@ -1,13 +1,12 @@
-'''
+"""
 ERROR and LOSS FUNCTIONS all done in Numpy--
-'''
+"""
+
 import numpy as np
 from numpy.typing import NDArray
-from enum import Enum
 from typing import Optional
-from ml_tools.models.constants import ClassificationTask, Reductions, determine_classification_task
-from ml_tools.models.clustering.plsom_utils import cosine_distance
-import copy
+from ml_tools.models.constants import ClassificationTask, Reductions
+from ml_tools.models.distances import cosine_distance
 
 
 loss_dictionary, derivative_dictionary = {}, {}
@@ -17,11 +16,13 @@ derivative = lambda f: derivative_dictionary.setdefault(f.__name__, f)
 
 
 @loss_func
-def difference(prediction: NDArray,
-               targets: NDArray,
-               axis: int = 0,
-               reduction: Optional[Reductions]=None,
-               task: Optional[ClassificationTask]=None) -> NDArray:
+def difference(
+    prediction: NDArray,
+    targets: NDArray,
+    axis: int = 0,
+    reduction: Optional[Reductions] = None,
+    task: Optional[ClassificationTask] = None,
+) -> NDArray:
     """
     Calculate the difference between prediction and targets; with reduction
 
@@ -37,19 +38,21 @@ def difference(prediction: NDArray,
     array of transformed values as numpy array, with the same shape as prediction input
     """
     diff = np.abs(targets - prediction)
-    if reduction == 'mean':
+    if reduction == "mean":
         return np.mean(diff, axis=axis)
-    elif reduction == 'sum':
+    elif reduction == "sum":
         return np.sum(diff, axis=axis)
     return diff
 
 
 @loss_func
-def mse(prediction: NDArray,
-        targets: NDArray,
-        axis: int = 0,
-        reduction: Optional[Reductions] = None,
-        task: Optional[ClassificationTask] = None) -> (float|NDArray):
+def mse(
+    prediction: NDArray,
+    targets: NDArray,
+    axis: int = 0,
+    reduction: Optional[Reductions] = None,
+    task: Optional[ClassificationTask] = None,
+) -> float | NDArray:
     """
     MEAN SQUARED ERRORS FOR REGRESSION MODELS
     Parameters
@@ -66,11 +69,13 @@ def mse(prediction: NDArray,
 
 
 @loss_func
-def rmse(prediction: NDArray,
-         targets: NDArray,
-         axis: int = 0,
-         reduction: Optional[Reductions] = None,
-         task: Optional[ClassificationTask] = None) -> NDArray:
+def rmse(
+    prediction: NDArray,
+    targets: NDArray,
+    axis: int = 0,
+    reduction: Optional[Reductions] = None,
+    task: Optional[ClassificationTask] = None,
+) -> NDArray:
     """
     Calculate the root-mean-square of the data -
 
@@ -86,15 +91,21 @@ def rmse(prediction: NDArray,
     array of transformed values as numpy array, with the same shape as prediction input
     """
     rmse = np.sqrt(np.mean((targets - prediction) ** 2, axis=axis))
-    if reduction == 'mean':
+    if reduction == "mean":
         return np.mean(rmse)
-    elif reduction == 'sum':
+    elif reduction == "sum":
         return np.sum(rmse)
     return rmse
 
+
 @loss_func
-def sse(prediction: NDArray, targets: NDArray, axis: int = 0, reduction: Optional[Reductions]=None, task: Optional[
-    ClassificationTask]=None) -> NDArray:
+def sse(
+    prediction: NDArray,
+    targets: NDArray,
+    axis: int = 0,
+    reduction: Optional[Reductions] = None,
+    task: Optional[ClassificationTask] = None,
+) -> NDArray:
     """
     Calculate the sum of squared errors
 
@@ -110,18 +121,21 @@ def sse(prediction: NDArray, targets: NDArray, axis: int = 0, reduction: Optiona
     array of transformed values as numpy array, with the same shape as prediction input
     """
     rmse = np.sum((targets - prediction) ** 2, axis=axis)
-    if reduction == 'mean':
+    if reduction == "mean":
         return np.mean(rmse)
-    elif reduction == 'sum':
+    elif reduction == "sum":
         return np.sum(rmse)
     return rmse
 
 
 @loss_func
-def mae(prediction: NDArray,
-        targets: NDArray, axis: int = 0,
-        reduction: Optional[Reductions]=None,
-        task: Optional[ClassificationTask]=None) -> NDArray:
+def mae(
+    prediction: NDArray,
+    targets: NDArray,
+    axis: int = 0,
+    reduction: Optional[Reductions] = None,
+    task: Optional[ClassificationTask] = None,
+) -> NDArray:
     """
     Calculate the mean-absolute-error of the data -
 
@@ -137,15 +151,21 @@ def mae(prediction: NDArray,
     array of transformed values as numpy array, with the same shape as prediction input
     """
     mae = np.mean(np.abs((targets - prediction), axis=axis))
-    if reduction == 'mean':
+    if reduction == "mean":
         return np.mean(mae)
-    elif reduction == 'sum':
+    elif reduction == "sum":
         return np.sum(mae)
     return mae
 
+
 @loss_func
-def cosine_error(prediction: NDArray, targets: NDArray, axis: int = 0, reduction: Optional[Reductions]=None, task: Optional[
-    ClassificationTask]=None) -> NDArray:
+def cosine_error(
+    prediction: NDArray,
+    targets: NDArray,
+    axis: int = 0,
+    reduction: Optional[Reductions] = None,
+    task: Optional[ClassificationTask] = None,
+) -> NDArray:
     """
     squared error for cosine distance loss
 
@@ -161,18 +181,20 @@ def cosine_error(prediction: NDArray, targets: NDArray, axis: int = 0, reduction
     array of transformed values as numpy array, with the same shape as prediction input
     """
     cos = cosine_distance(prediction, targets)
-    if reduction == 'mean':
+    if reduction == "mean":
         return np.mean(cos)
-    elif reduction == 'sum':
+    elif reduction == "sum":
         return np.sum(cos)
     return cos
 
 
 @loss_func
-def cross_entropy(prediction: NDArray,
-                  targets: NDArray,
-                  reduction: Optional[Reductions]=None,
-                  task: Optional[ClassificationTask]=None) -> float|NDArray:
+def cross_entropy(
+    prediction: NDArray,
+    targets: NDArray,
+    reduction: Optional[Reductions] = None,
+    task: Optional[ClassificationTask] = None,
+) -> float | NDArray:
     """
     CROSS ENTROPY - stabalized versions to accept logit values
     Assumes that targets are one-hot encoded vector [0, 0, 1, 0]
@@ -207,14 +229,19 @@ def cross_entropy(prediction: NDArray,
 
     # Binary cross-entropy -- logit stabilizing for neg and positive --------
     elif task == ClassificationTask.BINARY:
-        loss = np.maximum(0, prediction) - (targets * prediction) + np.log(1 + np.exp(-np.abs(prediction)))
+        loss = (
+            np.maximum(0, prediction)
+            - (targets * prediction)
+            + np.log(1 + np.exp(-np.abs(prediction)))
+        )
 
     return np.mean(loss)
 
-#------------------------------------------------------------------
+
+# ------------------------------------------------------------------
 @derivative
-def mse_derivative(prediction, targets, **kwargs) -> float|NDArray:
-    return (prediction - targets)
+def mse_derivative(prediction, targets, **kwargs) -> float | NDArray:
+    return prediction - targets
 
 
 @derivative
@@ -228,9 +255,9 @@ def rmse_derivative(prediction: NDArray, targets: NDArray) -> NDArray:
 
 
 @derivative
-def cross_entropy_derivative(prediction: NDArray,
-                             targets: NDArray,
-                            **kwargs) -> NDArray | float:
-    """ BACKPROP TRICKS for sigmoid / softmax: combine"""
+def cross_entropy_derivative(
+    prediction: NDArray, targets: NDArray, **kwargs
+) -> NDArray | float:
+    """BACKPROP TRICKS for sigmoid / softmax: combine"""
     sample_count = targets.shape[0]
-    return (prediction - targets)  / sample_count
+    return (prediction - targets) / sample_count

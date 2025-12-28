@@ -8,7 +8,7 @@ EPSILON = 1e-15
 FLOAT_TOLERANCE = 1e-30
 SIGMA_ZERO = 1e-6
 LAMBDA_MAX = 1e24
-LAMBDA_MIN =  1e-20
+LAMBDA_MIN = 1e-20
 
 
 class ClassificationTask(Enum):
@@ -18,8 +18,8 @@ class ClassificationTask(Enum):
 
 
 class Reductions(Enum):
-    MEAN = 'mean'
-    SUM = 'sum'
+    MEAN = "mean"
+    SUM = "sum"
     NONE = None
 
 
@@ -53,4 +53,3 @@ def determine_classification_task(targets: NDArray) -> ClassificationTask:
         task = ClassificationTask("multilabel")
 
     return task
-
