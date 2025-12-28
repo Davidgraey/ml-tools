@@ -6,18 +6,17 @@ import numpy as np
 from numpy.typing import NDArray
 from typing import Optional
 
-# Local Files
-import ml_tools.models.distances as plsom_distance
+import ml_tools.models.distances as distances
 from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork
 from ml_tools.visuals.cluster_visuals import plot_clusters
 from ml_tools.types import BasalModel
 
 
 DISTANCE_DICT = {
-    "euclidean": plsom_distance.euclidian_distance,
-    "manhattan": plsom_distance.manhattan_distance,
-    "hamming": plsom_distance.hamming_distance,
-    "cosine": plsom_distance.cosine_distance,
+    "euclidean": distances.euclidian_distance,
+    "manhattan": distances.manhattan_distance,
+    "hamming": distances.hamming_distance,
+    "cosine": distances.cosine_distance,
 }
 
 
@@ -156,11 +155,8 @@ class PLSOM(BasalModel):
 
         return _x
 
-    def fit_iterative(
-            self,
-            x: NDArray,
-            num_iterations: int,
-            verbose: Optional[bool] = None
+    def fit(
+        self, x: NDArray, num_iterations: int, verbose: Optional[bool] = None
     ) -> None:
         # initalize our paramters, weights and standaridzaion trackers
         _x = self.initalize_params(x)
@@ -171,7 +167,7 @@ class PLSOM(BasalModel):
             self.THETAMAX = (
                 self.THETAMAX * 0.98
                 if self.THETAMAX > self.THETAMIN
-                else self.THETAMIN + 0.1
+                else self.THETAMIN + 1
             )
 
             bmu_i, bmu_dist = self.calc_bmu(_x[0])
@@ -205,67 +201,6 @@ class PLSOM(BasalModel):
 
             self.q_error_trace.append(np.mean(error_trace))
             self.epsilon_trace.append(np.mean(epsilon_trace))
-
-        if self.verbose or verbose:
-            self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
-            plt.plot(self.q_error_trace)
-            plt.plot(self.epsilon_trace)
-            plt.legend(["q_error", "epsilon"])
-            plt.show()
-
-    def fit(
-            self,
-            x: NDArray,
-            num_iterations: int,
-            verbose: Optional[bool] = None
-    ) -> None:
-        # initalize our paramters, weights and standaridzaion trackers
-        _x = self.initalize_params(x)
-
-        for step in range(num_iterations):
-            self.RNG.shuffle(_x)
-            # Decay our maximum value of THETA slightly - To  keep the full grid from being pulled back and forth by outliers
-            self.THETAMAX = (
-                self.THETAMAX * 0.98
-                if self.THETAMAX > self.THETAMIN
-                else self.THETAMIN + 0.1
-            )
-
-            self.previous_step_r = np.full(shape=(_x.shape[0], 1), fill_value=0.1)
-
-            error_trace = []
-            epsilon_trace = []
-
-            # for sample_i in range(1, _x.shape[0]):
-            _xs = _x
-
-            bmu_i, sample_distances = self.calc_bmu(_xs)
-            bmu_distances = np.take_along_axis(sample_distances, bmu_i[:, np.newaxis], axis=-1)
-
-            # calculate the magnitude of update (epsilon), theta and neighborhood size
-            epsilon = self.calc_epsilon(bmu_distances)
-            theta = self.calc_theta(epsilon)
-            neighborhood = self.calc_neighborhood(theta, bmu_i)
-
-            # neighborhood is shape (n_samples, n_neurons)
-            # let's try some array broadcasting and see if we can speed things up
-            weight_update = epsilon[:, None] * (
-                neighborhood[:, :, None] * (_xs[:, np.newaxis, :] - self.weights)
-            )
-
-            # sum updates along axis?
-            # shape is 1500, 2
-            self.weights += np.mean(weight_update, axis=0)
-            self.hit_map[bmu_i] += 1
-
-            # if (self.verbose or verbose) and (sample_i % 10 == 0):
-            #     self.plot_neighborhood(epsilon * (neighborhood.reshape(self.n_neurons, -1)))
-
-            self.q_error_trace.append(np.mean(sample_distances))
-            self.epsilon_trace.append(np.mean(epsilon))
-
-            if self.verbose or verbose:
-                self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
 
         if self.verbose or verbose:
             self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
@@ -319,7 +254,7 @@ class PLSOM(BasalModel):
         single-value theta for use in neighborhood
         """
         # Using the PLSOM epsilon scale
-        theta = np.maximum(self.THETAMAX * epsilon, self.THETAMIN)
+        theta = max(self.THETAMAX * epsilon, self.THETAMIN)
 
         return theta
 
@@ -559,7 +494,7 @@ if __name__ == "__main__":
     max_clusters = 10
 
     for dim in [10]:
-        num_steps = dim * 10
+        num_steps = dim * 5
         st = time.time()
 
         som = PLSOM(

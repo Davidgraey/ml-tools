@@ -35,8 +35,8 @@ def euclidian_distance(x: NDArray, y: NDArray) -> NDArray:
     :return:
     """
     x, y = preformat_expected_shapes(x, y)
-    # return np.sqrt(np.sum((x - y) ** 2, axis=-1))  # + EPSILON
-    return cdist(x, y, metric='euclidean')
+    return np.sqrt(np.sum((x - y) ** 2, axis=-1))  # + EPSILON
+    # return cdist(x, y, metric='euclidean')
 
 
 def norm_euclidian_distance(x: NDArray, y: NDArray) -> NDArray:
