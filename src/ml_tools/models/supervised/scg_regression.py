@@ -21,9 +21,9 @@ from ml_tools.models.model_loss import (
     mse_derivative,
 )
 from ml_tools.models.activations import (
-    softmax_activation,
-    sigmoid_activation,
-    linear_activation,
+    softmax,
+    sigmoid,
+    linear,
 )
 from ml_tools.models.supervised import log
 from ml_tools.types import BasalModel
@@ -64,28 +64,28 @@ class GradientDescent(BasalModel):
         self.task: ClassificationTask = task
         if task == "regression":
             self.func = {
-                "activation": linear_activation,
+                "activation": linear,
                 "loss": mse,
                 "loss_derivative": mse_derivative,
             }
 
         elif task == ClassificationTask.BINARY:
             self.func = {
-                "activation": sigmoid_activation,
+                "activation": sigmoid,
                 "loss": cross_entropy,
                 "loss_derivative": cross_entropy_derivative,
             }
 
         elif task == ClassificationTask.MULTINOMIAL:
             self.func = {
-                "activation": softmax_activation,
+                "activation": softmax,
                 "loss": cross_entropy,
                 "loss_derivative": cross_entropy_derivative,
             }
 
         elif task == ClassificationTask.MULTILABEL:
             self.func = {
-                "activation": sigmoid_activation,
+                "activation": sigmoid,
                 "loss": cross_entropy,
                 "loss_derivative": cross_entropy_derivative,
             }
@@ -159,6 +159,7 @@ class GradientDescent(BasalModel):
         _p = np.clip(prediction, EPSILON, 1 - EPSILON)
         if self.task == ClassificationTask.MULTINOMIAL:
             llh = np.mean(np.sum(targets * np.log(_p), axis=-1))
+
         elif self.task in (ClassificationTask.BINARY, ClassificationTask.MULTILABEL):
             llh = np.mean(
                 np.sum(
@@ -637,7 +638,7 @@ if __name__ == "__main__":
     model = GradientDescent(
         task=ClassificationTask.MULTINOMIAL,
         use_elastic_reg=False,
-        early_termination=False,
+        early_termination=True,
     )
     _y = to_onehot(y)
     errors = model.fit(x_data=x, y_data=_y, iterations=N_steps)
