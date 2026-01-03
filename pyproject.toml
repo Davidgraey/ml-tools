@@ -23,6 +23,7 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 gui=["matplotlib.pyplot"]
+audio=["librosa", "wave"]
 
 
 [project.urls]
