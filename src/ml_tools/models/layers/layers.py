@@ -3,6 +3,7 @@ import ml_tools.models.activations as activations
 import copy
 from numpy.typing import NDArray
 from abc import ABC, abstractmethod
+from enum import Enum
 
 EPSILON = 1e-14
 # TODO: set the global float depth --
@@ -350,6 +351,48 @@ class EmbeddingLayer(Layer):
     def weights(self) -> NDArray:
         """alias"""
         return self.projection
+
+
+
+class WindowDimension(Enum):
+    this = "this"
+
+def FourierLayer(Layer):
+    #  https://ieeexplore.ieee.org/document/9616294
+    def __init__(self,
+                 ni: int,
+                 no: int,
+                 window_count: int,
+                 sequence_length: int,
+                 hidden_dim: int
+                 ):
+        super().__init__()
+        self.ni = ni
+        self.no = no
+
+        self.positional_weights = self.RNG.uniform(size=(sequence_length))
+        self.frequency_weights = self.RNG.uniform(size=(hidden_dim))
+
+        # W_time = np.exp(1j * theta_time)
+        # W_freq = np.exp(1j * theta_freq)
+
+    def forward(self, x_data: NDArray):
+        x_freq = np.fft.fft2(x_data, axes=(-2, -1)).real
+        # scale, constrain or norm?
+
+        spectral_weight = self.positional_weights[None, :, None] * self.frequency_weights[None, None, :]
+
+        reweighted = x_freq * spectral_weight
+
+        # x_out = np.fft.ifft2(reweighted, axes=(-2, -1)).real
+
+        # return normed(x_data + x_out)
+
+        # x = x @ W_linear
+
+    def backward(incoming_grad):
+        df_fft = np.fft.ifft(incoming_grad).real
+
 
 
 if __name__ == "__main__":

@@ -77,3 +77,56 @@ def preformat_expected_shapes(x: NDArray, y: NDArray) -> tuple[NDArray, NDArray]
     assert x_prime.shape[-1] == y_prime.shape[-1]
 
     return x_prime, y_prime
+
+
+def rolling_windows_nd(data: NDArray,
+                       window_size: int,
+                       num_overlap: int = 0,
+                       axis: int = 0,
+                       ) -> NDArray:
+    """
+    Given a data array, create overlapping, "rolling" windows using numpy stride tricks
+    If we provide some data that is (num_samples, sequence, embedding), such as text data
+    eg (20, 90, 64)
+    and window the 1st axis (sequence) with a window size = 10, and overlap = 2
+    We end with the same data, but with expanded dimensions:
+    (20, 11, 10, 64), or (num_samples, num_windows, window_size, embedding_size)
+    Parameters
+    ----------
+    data : data array, of at least 2 dimensions
+    window : the size (int) of the window
+    axis : the target dimension to tile / roll our windows over.  The specified dimension will be expanded into NxM
+        dimensions, where Nis the number of windows, and M is the window size.
+    num_overlap : the number of indices to overlap each window
+
+    Returns
+    -------
+
+    """
+    data_shape = data.shape
+    target_length = data_shape[axis]
+
+    if num_overlap > window_size:
+        print('rollingWindows: num_overlap > window, so setting to window-1')
+        num_overlap = window_size - 1 # shift by one
+
+    shift_length = window_size - num_overlap
+    num_windows = np.ceil((target_length - window_size + 1) / shift_length).astype(int)
+
+    new_shape = np.insert(
+        np.delete(data_shape, axis),
+        axis,
+        values=[num_windows, window_size]
+    )
+    # new shape - (batch, window_count, window_size, latent_space)
+
+    # strides = data.strides[:-1] + (data.strides[-1] * num_Shift, data.strides[-1])
+    _leading = data.strides[:axis]
+    target = [data.strides[axis] * shift_length, data.strides[axis]]  # expanded to 2D
+    _trail = data.strides[axis+1:]
+
+    strides = (*_leading, *target, *_trail)
+
+    windowed_indices = np.lib.stride_tricks.as_strided(data, shape=new_shape, strides=strides)
+
+    return windowed_indices
