@@ -190,52 +190,40 @@ class FullyConnectedLayer(Layer):
 class DropoutLayer(Layer):
     """Hinton style Dropout layer with scaling outputs"""
 
-    def __init__(self, ni, no, dropout_prob=0.5):
+    def __init__(self, dropout_prob=0.5):
         super().__init__()
         assert (dropout_prob > 0.0) and (dropout_prob < 1.0)
-        self.ni = ni
-        self.no = no
-        self.shape = [self.ni, self.no]
         self.dropout_prob: float = dropout_prob
         self.keep_prob: float = 1 - dropout_prob
 
-        self.generate_dropout()
+        self.mask = None
+        self.input = None
+        self.output = None
 
-        self.input = [0]
-        self.output = [0]
-
-    def generate_dropout(self) -> None:
-        """here, weights"""
-        self.weights = (
-            self.RNG.binomial([np.ones((self.ni, self.no))], self.keep_prob)
-            / self.keep_prob
-        ).squeeze()
-        # TODO: yes, this could loop infinitely. come back to this.
-        if self.weights.sum() == 0.0:
-            self.generate_dropout()
-
-    def set_dropout_value(self, value):
-        self.dropout_prob = value
-        return
+    # def set_dropout_value(self, value):
+    #     self.dropout_prob = value
+    #     return
 
     def forward(
         self, incoming_x: NDArray, training_now: bool = True, forced_activation=False
     ):
         self.input = incoming_x.copy()
         if training_now:
-            self.generate_dropout()
-            self.output = incoming_x @ self.weights
+            self.mask = (
+                self.RNG.binomial(1, self.keep_prob, size=x.shape)
+                / self.keep_prob
+            )
+            return x * self.mask
 
         else:
             self.output = self.input
 
         return self.output
 
-    def backward(self, incoming_grad):
-        incoming_grad *= self.weights
-        incoming_grad = self.input.T * incoming_grad
-
-        self.gradient = incoming_grad
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        if self.mask is None:
+            return incoming_grad
+        return incoming_grad * self.mask
 
         return self.gradient
 
@@ -246,8 +234,8 @@ class DropoutLayer(Layer):
         """
         resets values tracked during training to zero - an inplace func
         """
-        self.input = np.empty(shape=(1, 1))
-        self.output = np.empty(shape=(1, 1))
+        self.input = None
+        self.mask = None
         self.gradient = np.empty(shape=(1, 1))
 
     def __str__(self):
@@ -260,123 +248,62 @@ class DropoutLayer(Layer):
 # numpy-ml ref:
 # https://github.com/ddbourgin/numpy-ml/blob/master/numpy_ml/neural_nets/layers/layers.py#L1634-L1803
 class NormalizeLayer(Layer):
-    def __init__(self, ni: int, shift_scale: bool = False):
+    def __init__(self, ni: int, shift_scale: bool = True, eps: float = 1e-5):
         super().__init__()
         self.ni = ni
         self.shift_scale = shift_scale
+        self.eps = eps
 
-        self.num_samples = 0
-        # TODO: allow setting dtypes
-        self.running_mean = np.empty(shape=(1, ni))
-        self.running_stds = np.empty(shape=(1, ni))
-
-        if self.shift_scale:
-            self.shift_beta = np.zeros(shape=(1, ni))
-            self.scale_gamma = np.ones(shape=(1, ni))
+        if shift_scale:
+            self.scale_gamma = np.ones((1, ni))
+            self.shift_beta = np.zeros((1, ni))
         else:
-            self.shift_beta = None
-            self.scale_gamma = None
+            self.gamma = None
+            self.beta = None
+
+        # cached for backward
+        self.x_norm = None
+        self.std = None
 
     def forward(self, incoming_x: NDArray) -> NDArray:
-        self.input = incoming_x.copy()
+        self.input = incoming_x
         num_samples, _ = incoming_x.shape
 
-        # TODO: update if > 2D
-        _mean = np.mean(incoming_x, axis=0)
-        _stds = np.std(incoming_x, axis=0)
+        _mean = np.mean(incoming_x,  axis=-1, keepdims=True)
+        self.std = np.std(incoming_x,  axis=-1, keepdims=True)
+        self.x_norm = (x - _mean) / self.std
 
-        new_total = self.num_samples + num_samples
-        w_old = self.num_samples / new_total
-        w_new = num_samples / new_total
+        if self.shift_scale == True:
+            return self.scale_gamma * (self.x_norm) + self.shift_beta
 
-        # weight this batch's mean / stds and the prior by their sample size
-        self._mu = (w_old * self.running_mean) + (w_new * _mean)
-        self._theta = (w_old * self.running_stds) + (w_new * _stds)
-        self._n = new_total
-
-        self.x_norm = (incoming_x - self._mu) / (self._theta + EPSILON)
-
-        if self.shift_scale is None:
-            self.output = self.x_norm
-        else:
-            self.output = self.scale_gamma * (self.x_norm) + self.shift_beta
-
-        return self.output
+        return self.x_norm
 
     def update_weight(self, delta_beta: NDArray, delta_gamma: NDArray) -> None:
-        # persist the means, stds, and update the samples seen
-        self.running_mean = self._mu
-        self.running_stds = self._theta
-        self.num_samples = self._n
-
         # update the shift & scale values based on gradient contributions
         self.scale_gamma += delta_gamma
         self.shift_beta += delta_beta
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        delta_beta = np.sum(incoming_grad, axis=0)
-        delta_gamma = np.sum(incoming_grad * self.x_norm, axis=0)
+        if self.shift_scale:
+            self.grad_beta = np.sum(incoming_grad, axis=0)
+            self.grad_gamma = np.sum(incoming_grad * self.x_norm, axis=0)
+            z = incoming_grad * self.gamma
+        else:
+            z = incoming_grad
 
-        delta_norm = incoming_grad * self.scale_gamma
 
-        grad_contribution = (
-            self.ni * delta_norm
-            - np.sum(delta_norm, axis=0, keepdims=True)  # stepped back through mean
-            - self.x_norm * np.sum(delta_norm * self.x_norm, axis=0, keepdims=True)
-        ) / (self.ni * self.running_stds + +EPSILON)
+        gradient = (1.0 / self.std) * (
+                z
+                - np.mean(z, axis=-1)
+                - self.x_norm * np.mean(z * self.x_norm, axis=-1)
+        )
 
-        # update trainable parameters -- shift & scale / beta and gamma
-        # self.update_weight(delta_beta, delta_gamma)
-
-        return grad_contribution
+        return gradient
 
     def purge(self):
         self.input = np.empty(shape=(1, 1))
         self.output = np.empty(shape=(1, 1))
         self.gradient = np.empty(shape=(1, 1))
-
-
-class EmbeddingLayer(Layer):
-    def __init__(
-        self, ni: int, cardinality: int, embedding_dim: int, trainable: bool = True
-    ):
-        super().__init__()
-        self.ni: int = ni
-        self.cardinality: int = cardinality
-        self.embedding_dim: int = embedding_dim
-
-        self.projection = self.RNG.uniform(size=(cardinality, embedding_dim))
-        self.gradient = np.zeros_like(self.projection)
-
-    def forward(self, incoming_x: NDArray) -> NDArray:
-        if incoming_x.dtype != np.int:
-            _x = incoming_x.astype(int)
-
-        assert _x.dtype == np.int_
-        self.input = _x.copy()
-
-        # straight indexing
-        outs = self.projection[_x]
-        self.output = outs
-
-        return outs
-
-    def backward(self, incoming_grad: NDArray) -> NDArray:
-        self.gradient = np.zeros_like(self.projection)
-
-        # inplace operation - "assign" the gradients to their input variable
-        np.add.at(self.gradient, self.input, incoming_grad)
-
-        # self.update_weight(self.gradient)
-        return self.input
-
-    def update_weight(self, value: NDArray) -> None:
-        self.projection += value
-
-    @property
-    def weights(self) -> NDArray:
-        """alias"""
-        return self.projection
 
 
 class FrequencyFFT(Layer):
@@ -430,6 +357,55 @@ class FrequencyFFT(Layer):
         pass
 
 
+# ====== ==================================================================
+# TODO: WIP below
+
+
+class EmbeddingLayer(Layer):
+    def __init__(
+        self, ni: int, cardinality: int, embedding_dim: int, trainable: bool = True
+    ):
+        super().__init__()
+        self.ni: int = ni
+        self.cardinality: int = cardinality
+        self.embedding_dim: int = embedding_dim
+
+        self.projection = self.RNG.uniform(size=(cardinality, embedding_dim))
+        self.gradient = np.zeros_like(self.projection)
+
+    def forward(self, incoming_x: NDArray) -> NDArray:
+        if incoming_x.dtype != np.int:
+            _x = incoming_x.astype(int)
+
+        assert _x.dtype == np.int_
+        self.input = _x.copy()
+
+        # straight indexing
+        outs = self.projection[_x]
+        self.output = outs
+
+        return outs
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        self.gradient = np.zeros_like(self.projection)
+
+        # inplace operation - "assign" the gradients to their input variable
+        np.add.at(self.gradient, self.input, incoming_grad)
+
+        # self.update_weight(self.gradient)
+        return self.input
+
+    def update_weight(self, value: NDArray) -> None:
+        self.projection += value
+
+    @property
+    def weights(self) -> NDArray:
+        """alias"""
+        return self.projection
+
+
+
+
 class FourierLayer1D(Layer):
     #  https://ieeexplore.ieee.org/document/9616294
     def __init__(
@@ -470,8 +446,8 @@ if __name__ == "__main__":
     norm = NormalizeLayer(ni=3, shift_scale=True)
     assert norm(x).shape == (5, 3)
 
-    dp = DropoutLayer(ni=5, no=3, dropout_prob=0.25)
-    assert dp(x, training_now=True) == (5, 3)
+    dp = DropoutLayer(dropout_prob=0.25)
+    assert dp(x, training_now=True).shape == (5, 3)
     fc.forward(x)
 
     assert fc(dp(norm(x))).shape == (5, 1)
