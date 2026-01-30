@@ -122,13 +122,17 @@ def relu_leaky(x: NDArray, alpha=0.1) -> NDArray:
 
 
 @derivative
-def sigmoid_derivative(gradient: NDArray, x: Optional[NDArray]) -> NDArray:
+def sigmoid_derivative(gradient: NDArray, x: Optional[NDArray]=None) -> NDArray:
     """**********ARGUMENTS**********
     :param x: incoming values in numpy array
     **********RETURNS**********
     :return: evaluation (single val for input_sample (row) of x)
     """
-    return gradient * (1 - gradient)
+    stabalized = np.where(gradient >= 0,
+                   1 / (1 + np.exp(-gradient)),
+                   np.exp(gradient) / (1 + np.exp(gradient)))
+
+    return stabalized * (1 - stabalized)
 
 
 @derivative
