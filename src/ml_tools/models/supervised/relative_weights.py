@@ -13,29 +13,13 @@ import numpy as np
 from numpy.typing import NDArray
 import scipy.stats as ss
 from ml_tools.models.supervised import log
+from ml_tools.utilities import standardize_data
 from ml_tools.models.supervised.scg_regression import GradientDescent
 from ml_tools.models.constants import (
     ClassificationTask,
     EPSILON,
     determine_classification_task,
 )
-
-
-def standardize_data(design_matrix: NDArray, axis=0):
-    """
-    zero tge mean and variance = 1 along axis
-    Parameters
-    ----------
-    design_matrix :
-    axis :
-
-    Returns
-    -------
-
-    """
-    array_mean = np.mean(design_matrix, axis=axis)
-    array_std = np.std(design_matrix, axis=axis)
-    return (design_matrix - array_mean) / array_std
 
 
 def relative_weights(x: NDArray, y: NDArray, logistic: bool = True) -> dict:

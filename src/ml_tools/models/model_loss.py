@@ -3,6 +3,7 @@ ERROR and LOSS FUNCTIONS all done in Numpy--
 """
 
 import numpy as np
+from abc import ABC, abstractmethod
 from numpy.typing import NDArray
 from typing import Optional
 from ml_tools.models.constants import ClassificationTask, Reductions
@@ -15,6 +16,202 @@ loss_func = lambda f: loss_dictionary.setdefault(f.__name__, f)
 derivative = lambda f: derivative_dictionary.setdefault(f.__name__, f)
 
 
+class Loss(ABC):
+    def __init__(self):
+        self.targets = None
+        self.prediction = None
+
+    @abstractmethod
+    def forward(self, prediction: NDArray, targets: NDArray) -> float | NDArray:
+        pass
+
+    @abstractmethod
+    def backward(self) -> NDArray:
+        """
+        Returns dL / d(y_pred)
+        """
+        pass
+
+    def __call__(self, predictions: NDArray, targets: NDArray) -> float | NDArray:
+         return self.forward(predictions, targets)
+
+
+class DifferenceLoss(Loss):
+    def forward(self, prediction, targets):
+        self.prediction = prediction
+        self.targets = targets
+        return np.abs(targets - prediction)
+
+    def backward(self):
+        return np.sign(self.prediction - self.targets)
+
+
+class MSELoss(Loss):
+    def forward(self, prediction, targets):
+        self.prediction = prediction
+        self.targets = targets
+        diff = prediction - targets
+        return 0.5 * np.mean(diff**2)
+
+    def backward(self):
+        return self.prediction - self.targets
+
+
+class RMSELoss(Loss):
+    def forward(self, prediction, targets):
+        self.prediction = prediction
+        self.targets = targets
+        diff = prediction - targets
+        self.rmse = np.sqrt(np.mean(diff ** 2))
+        return self.rmse
+
+    def backward(self):
+        diff = self.prediction - self.targets
+        N = diff.size
+        return diff / (N * (self.rmse + EPSILON))
+
+
+    class SSELoss(Loss):
+        def forward(self, prediction, targets):
+            self.prediction = prediction
+            self.targets = targets
+            return np.sum((prediction - targets) ** 2)
+
+        def backward(self):
+            return 2 * (self.prediction - self.targets)
+
+
+class MAELoss(Loss):
+    def forward(self, prediction, targets):
+        self.prediction = prediction
+        self.targets = targets
+        return np.mean(np.abs(prediction - targets))
+
+    def backward(self):
+        diff = self.prediction - self.targets
+        return np.sign(diff) / diff.size
+
+
+class CosineLoss(Loss):
+    def forward(self, prediction, targets):
+        self.prediction = prediction
+        self.targets = targets
+
+        dot = np.sum(prediction * targets, axis=-1)
+        norm_p = np.linalg.norm(prediction, axis=-1)
+        norm_t = np.linalg.norm(targets, axis=-1)
+
+        self.cos = dot / (norm_p * norm_t + 1e-8)
+        return np.mean(1 - self.cos)
+
+    def backward(self):
+        p = self.prediction
+        t = self.targets
+
+        norm_p = np.linalg.norm(p, axis=-1, keepdims=True)
+        norm_t = np.linalg.norm(t, axis=-1, keepdims=True)
+
+        grad = (
+            p * np.sum(p * t, axis=-1, keepdims=True) / (norm_p**3 * norm_t)
+            - t / (norm_p * norm_t)
+        )
+        return grad / p.shape[0]
+
+
+class CrossEntropyLoss(Loss):
+    def __init__(self, task):
+        super().__init__()
+        self.task = task
+
+    def forward(self, prediction, targets):
+        self.prediction = prediction
+        self.targets = targets
+
+        if self.task == ClassificationTask.MULTINOMIAL:
+            shifted = prediction - np.max(prediction, axis=-1, keepdims=True)
+            log_sum_exp = np.log(np.sum(np.exp(shifted), axis=-1))
+            cls = np.argmax(targets, axis=-1)
+            correct = shifted[np.arange(prediction.shape[0]), cls]
+            loss = -correct + log_sum_exp
+
+        elif self.task == ClassificationTask.BINARY:
+            loss = (
+                np.maximum(0, prediction)
+                - targets * prediction
+                + np.log(1 + np.exp(-np.abs(prediction)))
+            )
+
+        elif self.task == ClassificationTask.MULTILABEL:
+            log_sum_exp = np.log(1 + np.exp(prediction))
+            loss = log_sum_exp - targets * prediction
+
+        return np.mean(loss)
+
+    def backward(self):
+        sample_count = self.targets.shape[0]
+        return (self.prediction - self.targets) / sample_count
+
+    def __call__(self, predictions: NDArray, targets: NDArray):
+         return self.forward(predictions, targets)
+
+
+class MultiHeadLoss(Loss):
+    """
+    h  = fc1.forward(x)
+
+    y1_hat = fc2.forward(h)
+    y2_hat = fc3.forward(h)
+
+    L = loss.forward(
+        preds=[y1_hat, y2_hat],
+        targets=[y1, y2]
+    )
+    # BACKPROPIGATION =========
+    # loss --> heads
+    g_y1, g_y2 = loss.backward()
+
+    # heads --> shared
+    g_h1 = fc2.backward(g_y1)
+    g_h2 = fc3.backward(g_y2)
+
+    # merge aka sum gradients from both heads
+    g_h = g_h1 + g_h2
+
+    # input
+    fc1.backward(g_h)
+    """
+    def __init__(self, losses: list[Loss], weights=None):
+        super().__init__()
+        self.losses = losses
+        # if we're reweighting the losses:
+        self.weights = weights or [1.0] * len(losses)
+
+    def forward(self, predictions: NDArray, targets):
+        self.predictions = predictions
+        self.targets = targets
+
+        total = 0.0
+        self.last_losses = []
+
+        for w, loss, yhat, y in zip(self.weights, self.losses, predictions, targets):
+            L = loss.forward(yhat, y)
+            self.last_losses.append(L)
+            total += w * L
+
+        return total
+
+    def backward(self):
+        grads = []
+
+        for w, loss in zip(self.weights, self.losses):
+            grads.append(w * loss.backward())
+
+        return grads
+
+    def __call__(self, predictions: NDArray, targets: NDArray):
+         return self.forward(predictions, targets)
+
+# TODO: retire the functions in favor of OOP version
 @loss_func
 def difference(
     prediction: NDArray,

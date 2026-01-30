@@ -1,5 +1,5 @@
 """
-Utility functions for __package__
+Utility functions for ml_tools package --- helpers, etc.
 """
 
 import time
@@ -8,6 +8,24 @@ from numpy.typing import NDArray
 from typing import Optional, Callable
 from datetime import datetime, timedelta
 from functools import lru_cache, wraps
+
+
+def standardize_data(design_matrix: NDArray, axis=0):
+    """
+    zero tge mean and variance = 1 along axis
+    Parameters
+    ----------
+    design_matrix :
+    axis :
+
+    Returns
+    -------
+
+    """
+    array_mean = np.mean(design_matrix, axis=axis)
+    array_std = np.std(design_matrix, axis=axis)
+
+    return (design_matrix - array_mean) / array_std
 
 
 # -------------- Decorators  --------------

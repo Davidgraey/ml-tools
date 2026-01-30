@@ -37,9 +37,9 @@ class GenConfig:
     noise_scale: float = 0.5
     num_classes: int = 3  # for multinomial / multilabel
     num_clusters: int = 3  # for clustering
-    ensure_label: bool = True  # for multilabel: ensure at least one
+    ensure_label: bool = True  # for multilabel: ensure at least one sample for a class
     onehot: bool = False  # for classification
-    verbose: bool = True
+    verbose: bool = True # for stupid extra prints everywhere
 
 
 class RandomDatasetGenerator:
@@ -89,44 +89,44 @@ class RandomDatasetGenerator:
         task: Literal["regression", "binary", "multiclass", "multilabel", "clustering"],
         **kwargs,
     ):
-        cfg = GenConfig(**kwargs)
+        config = GenConfig(**kwargs)
         task = task.lower()
         if task == "regression":
-            return self._regression(cfg)
+            return self._regression(config)
         if task == "binary":
-            return self._binary(cfg)
+            return self._binary(config)
         if task == "multiclass":
-            return self._multiclass(cfg)
+            return self._multiclass(config)
         if task == "multilabel":
-            return self._multilabel(cfg)
+            return self._multilabel(config)
         if task == "clustering":
-            return self._clustering(cfg)
+            return self._clustering(config)
         raise ValueError(f"Unknown task: {task}")
 
     # --------------- Task Implementations ---------------
 
-    def _regression(self, cfg: GenConfig):
-        X = self._features(cfg.num_samples, cfg.num_features, mode="uniform")
-        w = self.rng.normal(0, 1, size=cfg.num_features)
+    def _regression(self, config: GenConfig):
+        X = self._features(config.num_samples, config.num_features, mode="uniform")
+        w = self.rng.normal(0, 1, size=config.num_features)
         b = self.rng.normal()
-        noise = self.rng.normal(0, cfg.noise_scale, size=cfg.num_samples)
+        noise = self.rng.normal(0, config.noise_scale, size=config.num_samples)
         y = X @ w + b + noise
         X, y = self._shuffle(X, y)
         meta = dict(weights=w, bias=b, y_min=y.min(), y_max=y.max(), y_mean=y.mean())
-        if cfg.verbose:
+        if config.verbose:
             print(f"Regression: X{X.shape}, y range=({y.min():.2f},{y.max():.2f})")
         return X, y, meta
 
-    def _binary(self, cfg: GenConfig):
-        X = self._features(cfg.num_samples, cfg.num_features)
-        w = self.rng.normal(0, 1, size=cfg.num_features)
+    def _binary(self, config: GenConfig):
+        X = self._features(config.num_samples, config.num_features)
+        w = self.rng.normal(0, 1, size=config.num_features)
         b = self.rng.normal()
         logits = self._linear_scores(X, w, b) + self.rng.normal(
-            0, cfg.noise_scale, cfg.num_samples
+            0, config.noise_scale, config.num_samples
         )
         probs = self._sigmoid(logits)
         y = (probs >= 0.5).astype(int)
-        if cfg.onehot:
+        if config.onehot:
             y_out = to_onehot(y, 2)
         else:
             y_out = y
@@ -137,20 +137,20 @@ class RandomDatasetGenerator:
             mean_prob=probs.mean(),
             class_counts=np.bincount(y, minlength=2),
         )
-        if cfg.verbose:
+        if config.verbose:
             print(f"Binary: X{X.shape}, counts={meta['class_counts']}")
         return X, y_out, meta
 
-    def _multiclass(self, cfg: GenConfig, enforce_balance: bool = True):
-        k = cfg.num_classes
-        n = cfg.num_samples
+    def _multiclass(self, config: GenConfig, enforce_balance: bool = True):
+        k = config.num_classes
+        n = config.num_samples
         counts = self._split_counts(n, k)
         Y = np.concatenate([np.full(c, cls, dtype=int) for cls, c in enumerate(counts)])
         self.rng.shuffle(Y)
 
         # 2
-        X = self._features(n, cfg.num_features)
-        W = self.rng.normal(0, 1, size=(cfg.num_features, k))
+        X = self._features(n, config.num_features)
+        W = self.rng.normal(0, 1, size=(config.num_features, k))
         b = self.rng.normal(0, 1, size=k)
         scores = self._linear_scores(X, W, b)
 
@@ -172,22 +172,22 @@ class RandomDatasetGenerator:
             balanced=enforce_balance,
             margin=margin,
         )
-        if cfg.verbose:
+        if config.verbose:
             print(f"Multiclass: X{X.shape}, counts={final_counts}")
         return X, y_out, meta
 
-    def _multilabel(self, cfg: GenConfig):
-        k = cfg.num_classes
-        X = self._features(cfg.num_samples, cfg.num_features)
-        W = self.rng.normal(0, 1, size=(cfg.num_features, k))
+    def _multilabel(self, config: GenConfig):
+        k = config.num_classes
+        X = self._features(config.num_samples, config.num_features)
+        W = self.rng.normal(0, 1, size=(config.num_features, k))
         b = self.rng.normal(0, 1, size=k)
         logits = self._linear_scores(X, W, b) + self.rng.normal(
-            0, cfg.noise_scale, size=(cfg.num_samples, k)
+            0, config.noise_scale, size=(config.num_samples, k)
         )
         probs = self._sigmoid(logits)
 
         Y = (probs >= 0.5).astype(int)
-        if cfg.ensure_label:
+        if config.ensure_label:
             empty = Y.sum(axis=1) == 0
             if empty.any():
                 # force the argmax label if empty
@@ -196,21 +196,21 @@ class RandomDatasetGenerator:
         X, Y = self._shuffle(X, Y)
 
         meta = dict(weights=W, bias=b, label_frequencies=Y.sum(axis=0))
-        if cfg.verbose:
+        if config.verbose:
             print(
                 f"Multilabel: X{X.shape}, per-label counts={meta['label_frequencies']}"
             )
         return X, Y, meta
 
-    def _clustering(self, cfg: GenConfig):
-        k = cfg.num_clusters
-        counts = self._split_counts(cfg.num_samples, k)
-        centroids = self.rng.uniform(-3, 3, size=(k, cfg.num_features))
+    def _clustering(self, config: GenConfig):
+        k = config.num_clusters
+        counts = self._split_counts(config.num_samples, k)
+        centroids = self.rng.uniform(-3, 3, size=(k, config.num_features))
         clusters = []
         labels = []
         for i, c in enumerate(counts):
             block = centroids[i] + self.rng.normal(
-                0, cfg.noise_scale, size=(c, cfg.num_features)
+                0, config.noise_scale, size=(c, config.num_features)
             )
             clusters.append(block)
             labels.append(np.full(c, i, dtype=int))
@@ -218,7 +218,7 @@ class RandomDatasetGenerator:
         y = np.concatenate(labels)
         X, y = self._shuffle(X, y)
         meta = dict(centroids=centroids, cluster_sizes=counts)
-        if cfg.verbose:
+        if config.verbose:
             print(f"Clustering: X{X.shape}, sizes={counts}")
         return X, y, meta
 
