@@ -121,6 +121,8 @@ def relu_leaky(x: NDArray, alpha=0.1) -> NDArray:
     return np.where(x > 0, x, alpha * x)
 
 
+# ===================== and their derivatives ======================
+
 @derivative
 def sigmoid_derivative(gradient: NDArray, x: Optional[NDArray]=None) -> NDArray:
     """**********ARGUMENTS**********

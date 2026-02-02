@@ -73,6 +73,11 @@ All algorithms are implemented in **NumPy** and **SciPy**, with minimal external
 APIs may change as methods are refined and extended.
 
 ---
+## Authos and Contributors
+- "David Graey", "graeyband@gmail.com"
+- "Dr Charles Anderson", "Chuck.Anderson@colostate.edu"
+
+---
 ## References
 
 Primary academic references are cited inline.  

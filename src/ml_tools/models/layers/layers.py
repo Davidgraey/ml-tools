@@ -1,11 +1,8 @@
 import numpy as np
 import ml_tools.models.activations as activations
-from ml_tools.models.model_loss import rmse_derivative
 from numpy.typing import NDArray
 from abc import ABC, abstractmethod
 from typing import Optional, Callable
-
-# Availability
 
 
 EPSILON = 1e-14
@@ -54,12 +51,26 @@ class Layer(ABC):
     def backward(self, x: NDArray) -> NDArray:
         pass
 
-    @abstractmethod
-    def update_weight(self):
+    def get_weights(self) -> NDArray:
+        pass
+
+    def get_gradients(self) -> dict[str, NDArray]:
         pass
 
     @abstractmethod
-    def purge(self):
+    def update_weights(self, **kwargs) -> None:
+        pass
+
+    @abstractmethod
+    def purge(self) -> None:
+        pass
+
+    @abstractmethod
+    def zero_gradients(self) -> None:
+        pass
+
+    @property
+    def num_parameters(self) -> int:
         pass
 
     def __call__(self, *args, **kwargs):
@@ -158,15 +169,21 @@ class FullyConnectedLayer(Layer):
 
         return delta @ self.weights.T
 
-    def update_weight(self, weights_delta: NDArray, bias_delta: NDArray) -> None:
-        """**********ARGUMENTS**********
-        :param value: variable to update this layer's weights by with - this will already have Learning rate,
-        depreication or momentum / other calculations addressed in the upper level.
+    def update_weights(self, gradient_bias: NDArray, gradient_weights: NDArray) -> None:
         """
-        self.weights -= weights_delta
-        self.bias -= bias_delta
+        values passed in are the update to apply to this this layer's weights - this will already have learning rate,
+        depreication or momentum / other calculations addressed in the upper level.
+        Parameters
+        ----------
+        bias_delta : Bias gradient
+        weights_delta : Weights gradient
 
-        pass
+        Returns
+        -------
+
+        """
+        self.bias -= gradient_bias
+        self.weights -= gradient_weights
 
     def purge(self) -> None:
         """
@@ -177,6 +194,23 @@ class FullyConnectedLayer(Layer):
         self.z = None
         self.gradient_weights = None
         self.gradient_bias = None
+
+    def get_weights(self):
+        return np.concatenate([self.bias, self.weights.ravel()])
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        return {
+            "gradient_bias": self.gradient_bias,
+            "gradient_weights": self.gradient_weights,
+        }
+
+    def zero_gradients(self) -> None:
+        self.gradient_weights = np.zeros_like(self.weights)
+        self.gradient_bias = np.zeros_like(self.bias)
+
+    @property
+    def num_parameters(self) -> int:
+        return  self.bias.size + self.weights.size
 
     def __str__(self):
         return f"Layer of {self.activation}, shaped {self.shape} -- output is {self.is_output}"
@@ -200,20 +234,16 @@ class DropoutLayer(Layer):
         self.input = None
         self.output = None
 
-    # def set_dropout_value(self, value):
-    #     self.dropout_prob = value
-    #     return
-
     def forward(
-        self, incoming_x: NDArray, training_now: bool = True, forced_activation=False
+        self, incoming_x: NDArray, training_now: bool = True
     ):
-        self.input = incoming_x.copy()
+        self.input = incoming_x
         if training_now:
             self.mask = (
-                self.RNG.binomial(1, self.keep_prob, size=x.shape)
+                self.RNG.binomial(1, self.keep_prob, size=incoming_x.shape)
                 / self.keep_prob
             )
-            return x * self.mask
+            return incoming_x * self.mask
 
         else:
             self.output = self.input
@@ -225,9 +255,7 @@ class DropoutLayer(Layer):
             return incoming_grad
         return incoming_grad * self.mask
 
-        return self.gradient
-
-    def update_weight(self) -> None:
+    def update_weights(self) -> None:
         pass
 
     def purge(self) -> None:
@@ -238,11 +266,24 @@ class DropoutLayer(Layer):
         self.mask = None
         self.gradient = np.empty(shape=(1, 1))
 
+    def get_weights(self):
+        return None
+
+    def get_gradients(self)  -> dict[str, NDArray]:
+        return {}
+
+    @property
+    def num_parameters(self) -> int:
+        return 0
+
+    def zero_gradients(self) -> None:
+        pass
+
     def __str__(self):
-        return f"Layer of Hinton Dropout currently at {self.dropout_prob}, shaped {self.shape}"
+        return f"Layer of Hinton Dropout currently at {self.dropout_prob}, shaped {self.mask.shape}"
 
     def __repr__(self):
-        return f"{self.shape}, using Hinton Dropout"
+        return f"{self.mask.shape} dropout using Hinton Dropout"
 
 
 # numpy-ml ref:
@@ -271,31 +312,32 @@ class NormalizeLayer(Layer):
 
         _mean = np.mean(incoming_x,  axis=-1, keepdims=True)
         self.std = np.std(incoming_x,  axis=-1, keepdims=True)
-        self.x_norm = (x - _mean) / self.std
+        self.x_norm = (incoming_x - _mean) / self.std
 
         if self.shift_scale == True:
             return self.scale_gamma * (self.x_norm) + self.shift_beta
 
         return self.x_norm
 
-    def update_weight(self, delta_beta: NDArray, delta_gamma: NDArray) -> None:
+    def update_weights(self, gradient_beta: Optional[NDArray] = None, gradient_gamma: Optional[NDArray] = None) -> None:
         # update the shift & scale values based on gradient contributions
-        self.scale_gamma += delta_gamma
-        self.shift_beta += delta_beta
+        if self.shift_scale == True:
+            self.shift_beta += gradient_beta
+            self.scale_gamma += gradient_gamma
+        else:
+            pass
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        if self.shift_scale:
-            self.grad_beta = np.sum(incoming_grad, axis=0)
-            self.grad_gamma = np.sum(incoming_grad * self.x_norm, axis=0)
-            z = incoming_grad * self.gamma
+        if self.shift_scale == True:
+            self.gradient_beta = np.sum(incoming_grad, axis=0)
+            self.gradient_gamma = np.sum(incoming_grad * self.x_norm, axis=0)
+            z = incoming_grad * self.scale_gamma
         else:
             z = incoming_grad
 
 
         gradient = (1.0 / self.std) * (
-                z
-                - np.mean(z, axis=-1)
-                - self.x_norm * np.mean(z * self.x_norm, axis=-1)
+                z - np.mean(z, axis=-1, keepdims=True) - self.x_norm * np.mean(z * self.x_norm, axis=-1,  keepdims=True)
         )
 
         return gradient
@@ -304,6 +346,26 @@ class NormalizeLayer(Layer):
         self.input = np.empty(shape=(1, 1))
         self.output = np.empty(shape=(1, 1))
         self.gradient = np.empty(shape=(1, 1))
+
+    def get_weights(self) -> tuple[NDArray]:
+        return (self.beta, self.gamma)
+
+    def get_gradients(self) -> dict[str, NDArray] | None:
+        if self.shift_scale == True:
+            return {
+                "gradient_beta": self.gradient_beta,
+                "gradient_gamma": self.gradient_gamma,
+            }
+        else:
+            return {}
+
+    @property
+    def num_parameters(self) -> int:
+        return self.beta.size + self.gamma.size
+
+    def zero_gradients(self) -> None:
+        self.gradient_beta = np.zeros_like(self.shift_beta)
+        self.gradient_gamma = np.zeros_like(self.scale_gamma)
 
 
 class FrequencyFFT(Layer):
@@ -343,18 +405,27 @@ class FrequencyFFT(Layer):
         return self.output.copy()
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        self.gradient = np.fft.irfft(incoming_grad, axis=-1).real.copy()
-
-        self.update_weight(self.gradient)
-        return self.gradient
+        return np.fft.irfft(incoming_grad, axis=-1).real.copy()
 
     def purge(self) -> None:
         self.input = np.empty(shape=(1, 1))
         self.output = np.empty(shape=(1, 1))
-        self.gradient = np.empty(shape=(1, 1))
 
-    def update_weight(self, *args):
+    def get_weights(self):
+        return None
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        return {}
+
+    def zero_gradients(self) -> None:
         pass
+
+    def update_weights(self, **kwargs) -> None:
+        pass
+
+    @property
+    def num_parameters(self) -> int:
+        return 0
 
 
 # ====== ==================================================================
@@ -392,10 +463,10 @@ class EmbeddingLayer(Layer):
         # inplace operation - "assign" the gradients to their input variable
         np.add.at(self.gradient, self.input, incoming_grad)
 
-        # self.update_weight(self.gradient)
+        # self.update_weights(self.gradient)
         return self.input
 
-    def update_weight(self, value: NDArray) -> None:
+    def update_weights(self, value: NDArray) -> None:
         self.projection += value
 
     @property
@@ -433,7 +504,7 @@ class FourierLayer1D(Layer):
 
         self.gradient = np.fft.ifft(complex_delta, axis=self.axis).real
 
-        self.update_weights()
+        self.update_weigupdate_weighthts()
 
 
 if __name__ == "__main__":
@@ -452,21 +523,42 @@ if __name__ == "__main__":
 
     assert fc(dp(norm(x))).shape == (5, 1)
 
-    def train():
-        from ml_tools.models.model_loss import MSELoss
-        LR = 0.002
-        fc = FullyConnectedLayer(ni=3, no=1, activation_type="linear")
-        lossfc = MSELoss()
-        all_losses = []
-        y_regression = y_regression.reshape(-1, 1)
-        for _ in range(100):
-            output = fc.forward(x_regression)
-            loss = lossfc(output, y_regression)
-            all_losses.append(loss)
-            grad_output = lossfc.backward()
+    ## working example -- train--- -- MOVE TO TESTS!
+    from ml_tools.models.model_loss import MSELoss
+    from ml_tools.models.optimizers import SGD
+    from ml_tools.generators import RandomDatasetGenerator
+    import matplotlib.pyplot as plt
 
-            x_backprop = fc.backward(grad_output)
+    r = RandomDatasetGenerator()
+    x_regression, y_regression, meta = r.generate(task="regression", num_samples=1500, num_features=3, noise_scale=1.5)
+    fc = FullyConnectedLayer(ni=3, no=10, activation_type="relu")
+    nc1 = NormalizeLayer(ni=10, shift_scale=True)
+    dp = DropoutLayer(dropout_prob=0.25)
+    fc2 = FullyConnectedLayer(ni=10, no=10, activation_type="linear", is_output=False)
+    nc2 = NormalizeLayer(ni=10, shift_scale=False)
+    fc3 = FullyConnectedLayer(ni=10, no=10, activation_type="relu", is_output=False)
+    fc4 = FullyConnectedLayer(ni=10, no=10, activation_type="sigmoid", is_output=False)
+    fc5 = FullyConnectedLayer(ni=10, no=10, activation_type="relu_leaky", is_output=False)
+    fc6 = FullyConnectedLayer(ni=10, no=1, activation_type="tanh", is_output=True)
+    lossfc = MSELoss()
+    optimizer = SGD(0.0001)
+    all_losses = []
+    y_regression = y_regression.reshape(-1, 1)
+    nnet_layers = [fc, nc1, dp, fc2, nc2, fc3, fc4, fc5, fc6]
 
-            fc.update_weight(LR * fc.gradient_weights, LR * fc.gradient_bias)
+    for _ in range(20):
+        output = x_regression.copy()
+        for layer in nnet_layers:
+            output = layer.forward(output)
+            print(f"forward pass: {layer} outs shaped {output.shape}")
 
+        loss = lossfc(output, y_regression)
+        all_losses.append(loss)
+        grad_output = lossfc.backward()
 
+        for layer in nnet_layers[::-1]:
+            grad_output = layer.backward(grad_output)
+            print(f"Backwards pass: {layer} gradients shaped {grad_output.shape}")
+        optimizer.step(layers=nnet_layers)
+    plt.plot(all_losses)
+    plt.show()

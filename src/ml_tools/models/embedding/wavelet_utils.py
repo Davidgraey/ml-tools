@@ -1,12 +1,146 @@
-from scipy.signal import upfirdn
+import scipy.signal as sig
 from ml_tools.models.layers.layers import Layer
 import numpy as np
-
+from matplotlib.pyplot as plt
 '''
 https://arxiv.org/abs/2504.08801
 https://github.com/thqiu0419/MLWNet
 '''
 
+
+def morletLength(Fs, f, width):
+    """ len = morletLength(Fs, f, width) """
+    dt = 1.0 / Fs
+    sf = f / width
+    st = 1.0 / (2 * np.pi * sf)
+    return int((3.5 * st - -3.5 * st) / dt)
+
+def energyvec(f, s, Fs, width):
+    """
+    function [y, phase] <- energyvec(f, s, Fs, width)
+    function y <- energyvec(f, s, Fs, width)
+
+    Return a vector containing the energy as a
+    function of time for frequency f. The energy
+    is calculated using Morlet''s wavelets.
+    s : signal
+    Fs: sampling frequency
+    width : width of Morlet wavelet (><- 5 suggested).
+    """
+
+    dt = 1.0 / Fs
+    sf = f / float(width)
+    st = 1.0 / (2 * np.pi * sf)
+
+    t = np.arange(-3.5 * st, 3.5 * st, step=dt)
+    m = morlet(f, t, width)
+    # yconv = np.convolve(s, m, mode="same")
+    yconv = sig.fftconvolve(s, m, mode='same')
+
+    lengthMorlet = len(m)
+    firsthalf = int(lengthMorlet / 2.0 + 0.5)
+    secondhalf = lengthMorlet - firsthalf
+
+    padtotal = len(s) - len(yconv)
+    padfront = int(padtotal / 2.0 + 0.5)
+    padback = padtotal - padfront
+    yconvNoBoundary = yconv
+    y = np.abs(yconvNoBoundary) ** 2
+    phase = np.angle(yconvNoBoundary, deg=True)
+    return y, phase
+
+
+def cwt(eeg, Fs, freqs, width, channelNames=None, graphics=False):
+    if freqs.min() == 0:
+        print("cwt: Frequencies must be greater than 0.")
+        return None, None
+    nChannels, nSamples = eeg.shape
+    if not channelNames and graphics:
+        channelNames = ["Channel {:2d}".format(i) for i in range(nChannels)]
+
+    nFreqs = len(freqs)
+    tfrep = np.zeros((nChannels, nFreqs, nSamples))
+    tfrepPhase = np.zeros((nChannels, nFreqs, nSamples))
+
+    for ch in range(nChannels):
+        print("channel", ch, " freq ", end="")
+        for freqi in range(nFreqs):
+            print(freqs[freqi], " ", end="")
+            mag, phase = energyvec(freqs[freqi], eeg[ch, :], Fs, width)
+            tfrepPhase[ch, freqi, :] = phase
+            tfrep[ch, freqi, :] = mag
+        print()
+
+    return tfrep, tfrepPhase
+
+######################################################################
+
+
+def morlet(f, t, width):
+    """
+    function y <- morlet(f, t, width)
+    Morlet''s wavelet for frequency f and time t.
+    The wavelet will be normalized so the total energy is 1.
+    width defines the width of the wavelet.
+    A value ><- 5 is suggested.
+
+    Ref: Tallon-Baudry et al., J. Neurosci. 15, 722-734 (1997), page 724
+
+    Ole Jensen, August 1998
+    """
+    sf = f / float(width)
+    st = 1.0 / (2 * np.pi * sf)
+    A = 1.0 / np.sqrt(st * np.sqrt(2 * np.pi))
+    y = A * np.exp(-(t**2) / (2 * st**2)) * np.exp(1j * 2 * np.pi * f * t)
+    return y
+
+
+import time
+width = 75
+maxFreq = 20
+freqs = np.arange(0.5, maxFreq, 0.5) # makes same freqs used in stft above
+start = time.time()
+tfrep, tfrepPhase = cwt(data[:, 1:].T,  75,  freqs,  width)
+elapsed_time = time.time() - start
+print(f'CWT time: {elapsed_time} seconds')
+
+plt.figure(figsize=(10, 10))
+plt.subplot(5, 1, 1)
+plt.plot(data[:, 1:])
+plt.axis('tight')
+
+plt.subplot(5, 1, 2)
+plt.plot(data[:, 0])
+plt.text(5000, 8, '1-Rest, 2-Coloring, 3-Legos, 4-Wii Tennis, 5-Boxing, 6-0.75, 7-1.25 m/s, 8-1.75, 9-2.25 m/s, 10-stairs')
+plt.axis('tight')
+
+nSensors = data.shape[1] - 1
+for i in range(nSensors):
+    plt.subplot(5, 1, i+3)
+    plt.imshow(np.log(tfrep[i, :, :]),
+               interpolation='nearest', origin='lower',
+               cmap=plt.cm.jet) #plt.cm.Reds)
+    plt.xlabel('Seconds')
+    plt.ylabel('Frequency in ' + ('$x$', '$y$', '$z$')[i])
+    tickstep = round(len(freqs) / 5)
+    plt.yticks(np.arange(len(freqs))[::tickstep],
+                   [str(i) for i in freqs[::tickstep]])
+    plt.axis('auto')
+    plt.axis('tight')
+
+
+tfrep.shap
+
+X = tfrep.reshape((3 * 39, -1)).T
+X.shape, T.shape, len(np.unique(T))
+
+
+
+
+
+# =======================================================================
+# =======================================================================
+# =======================================================================
 
 class WaveletEmbedding(Layer):
     """

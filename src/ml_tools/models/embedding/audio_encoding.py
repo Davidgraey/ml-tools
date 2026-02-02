@@ -1,6 +1,9 @@
 from scipy.io import wavfile
 import numpy as np
 from ml_tools.utilities import rolling_windows_nd, standardize_data
+from ml_tools.models.layers.operators import LatentStack
+from ml_tools.models.model_loss import MSELoss
+from ml_tools.models.optimizers import SGD
 from ml_tools.models.layers.layers import (
     FrequencyFFT,
     FullyConnectedLayer,
@@ -9,6 +12,39 @@ from ml_tools.models.layers.layers import (
 )
 from ml_tools.models.embedding.positional import RopeEmbedding
 import matplotlib.pyplot as plt
+
+# set some bounds -- the maximum length of a signal that our encoding network can process - this signal length is a
+# count of WINDOWS; not of samples. so 10 windows at 10 samples_per_window == 100 total samples.
+MAX_POSSIBLE_WINDOWS=5000
+
+
+def plot_waveform(data):
+    plt.figure(figsize=(10, 6))
+    plt.plot(data[:, :])
+    plt.axis("tight")
+    plt.show()
+
+def plot_fft_windows(data):
+    assert data.ndim == 2
+    plt.figure(figsize=(10,25))
+    for i, window in enumerate(data):
+        plt.subplot(10, 1, i+1)
+        plt.imshow(
+            np.log(window[:]),
+            interpolation="nearest",
+            origin="lower",
+            cmap=plt.cm.jet,
+        )  # plt.cm.Reds)
+        plt.xlabel("Seconds")
+        plt.ylabel("Frequency in " + ("$x$", "$y$", "$z$")[i])
+        tickstep = round(len(freqs) / 5)
+        plt.yticks(
+            np.arange(len(freqs))[::tickstep], [str(i) for i in freqs[::tickstep]]
+        )
+        plt.axis("auto")
+        plt.axis("tight")
+
+
 
 
 sample_rate, waveform = wavfile.read("/Users/davidanderson/Dropbox/CODE/tools/ml-tools/test.wav")
@@ -47,6 +83,73 @@ windowed_data = rolling_windows_nd(
 # window count, sample_steps
 num_windows, _samp = windowed_data.shape
 assert _samp == samples_per_window
+
+
+windowed_spectrogram = []
+window = np.hanning(samples_per_window)
+# junky workaround so we don't have to fancy-reindex.
+for i in range(num_windows):
+    start, end = i * samples_per_window, (i * samples_per_window + samples_per_window)
+    # junky workaround so we don't have to fancy-reindex.
+    if end > waveform_l.size:
+        break
+
+    kernel = waveform_l[start:end] * window
+
+    xs = np.fft.rfft(kernel)
+    magnitude = np.abs(xs)
+    windowed_spectrogram.append(magnitude)
+
+windowed_spectrogram = np.vstack(windowed_spectrogram)
+
+freqs = np.fft.rfftfreq(samples_per_window, d=1.0 / sample_rate)
+# magnitude = np.abs(windowed_data) / samples_per_window
+# square all except DC (0 idx and representing zero hertz) and Nyquist (-1 position)
+power_spectrogram = windowed_spectrogram.copy()
+power_spectrogram[:, 1:-1] = power_spectrogram[:, 1:-1] ** 2
+# square to power, log to decibels (log10?)
+windowed_decibel_spectrogram = np.log(power_spectrogram + 1e-12)
+
+time_axis = np.arange(windowed_decibel_spectrogram.shape[0])
+
+idx = 55
+plt.figure(figsize=(20,15))
+plt.title(f"window index{idx}")
+plt.subplot(3,1,1)
+plt.plot(freqs, windowed_spectrogram[idx, :])
+plt.xlabel("Frequency Hz")
+plt.ylabel("amplitude")
+plt.title("RFFT frequency spectrum")
+plt.grid(True)
+
+plt.subplot(3,1,2)
+plt.plot(freqs, power_spectrogram[idx, :])
+plt.xlabel("Frequency (Hz)")
+plt.ylabel("power")
+plt.title("RFFT Power Spectrum")
+
+plt.subplot(3,1,3)
+plt.semilogy(freqs, windowed_decibel_spectrogram[idx, :])
+plt.xlabel("Frequency (Hz)")
+plt.ylabel("amplitude (log)")
+plt.title("RFFT Log Spectrum")
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(15, 9))
+plt.pcolormesh(
+    time_axis,
+    freqs,
+    windowed_decibel_spectrogram.T,
+    shading="auto"
+)
+
+plt.xlabel("Time")
+plt.ylabel("Frequency")
+plt.title("Spectrogram (RFFT)")
+plt.colorbar(label="dB")
+plt.show()
+
 
 #  FFT will output a shape of n//2 + 1.
 real_positive_fft_shape = (samples_per_window // 2) + 1
@@ -94,7 +197,7 @@ print(f"forward pass is shaped: {_amp_f.shape} -> (num_windows, real_positive_ff
 # FREQUENCY -----------------------------------------------------------------
 # real positive only FFT: np rfft process -> final shape of FFT transform is  n//2 + 1.
 # transformed_data = np.fft.rfft(windowed_data, axis=-1)
-freq_fft_layer = FrequencyFFT(max_sequence_length=500, window_size=samples_per_window)
+freq_fft_layer = FrequencyFFT(max_sequence_length=MAX_POSSIBLE_WINDOWS, window_size=samples_per_window)
 freq_fc_layer = FullyConnectedLayer(
     ni=real_positive_fft_shape,
     no=LATENT_DIMENSION,
@@ -108,17 +211,15 @@ _fft = freq_fc_layer(
 # Feed Forward, built of 1-3 stacked layers?
 # Project down to LATENT_DIMENSION
 
-stacked = np.hstack((_amp_f, _fft))
+stacking_layer = LatentStack()
+
+stacked = stacking_layer(_amp_f, _fft)
 print(f"{stacked} shape")
-
-MAX_POSSIBLE_WINDOWS=5000
-
+stacking_layer.purge()
 # Rotary Positional embedding - (relative position and distances -------------
 rope_layer = RopeEmbedding(sequence_length=MAX_POSSIBLE_WINDOWS, embedding_dimension=2*LATENT_DIMENSION)
 encoded_fin = rope_layer(stacked)
-
 print(encoded_fin.shape)
-
 # Final Aggregation ----------------------------------------------------------
 # FINALLY, we will:
 #     1) stack FREQUENCY and AMPLITUDE
@@ -126,10 +227,11 @@ print(encoded_fin.shape)
 #     3) end of feature encoder -- then we pass into FEED FORWARD:
 #     4) ???? should we do a layer norm?
 
+EMBEDDING_DIM = 720
 
 # feed froward--
-FC_IN = 2*LATENT_DIMENSION
-dropout_a = DropoutLayer(ni=FC_IN, no=FC_IN)
+FC_IN = 2 * LATENT_DIMENSION
+dropout_a = DropoutLayer(dropout_prob=0.25)
 fc_a = FullyConnectedLayer(
     ni=FC_IN,
     no=1200,
@@ -144,24 +246,105 @@ fc_b = FullyConnectedLayer(
 )
 fc_c = FullyConnectedLayer(
     ni=900,
-    no=720,
+    no=EMBEDDING_DIM,
     activation_type="tanh",
     is_output=True
 )
-norm_a = NormalizeLayer(ni=720, shift_scale=True)
-dropout_b = DropoutLayer(ni=720, no=720)
+norm_a = NormalizeLayer(ni=EMBEDDING_DIM, shift_scale=True)
 
 
-# Pre-dropout ============================
-# FC layers   ============================
-# layer NORM  ============================
-# Dropout     ============================
 
-
-embedding = dropout_b(norm_a(fc_c(fc_b(fc_a(dropout_a(encoded_fin))))))
+embedding = norm_a(fc_c(fc_b(fc_a(dropout_a(encoded_fin)))))
 print(embedding.shape)
 # And Finally, we're at the latent space embedding ------------------------
 # NOW WE CAN SEND THE LATENT EMBEDDING INTO our Kernel FourierNetwork.
 
 # the feature encoding and Kernel FourierNetwork layers out into the model's embedding - latent space.
 # From here, we can decoder.
+
+
+
+# class decoder():
+#     def __init__()
+#         # our goal is to take our latent space and recreate our original data --
+# basically just reproject it up dimensionally to (num_windows, samples_per_window)
+decoder_dropout = DropoutLayer(dropout_prob=0.25)
+decoder_fc_a = FullyConnectedLayer(
+    ni=EMBEDDING_DIM * 2,
+    no=1600,
+    activation_type="swish",
+    is_output=False
+)
+decoder_fc_b = FullyConnectedLayer(
+    ni=1600,
+    no=samples_per_window,
+    activation_type="swish",
+    is_output=False
+)
+decoder_norm = NormalizeLayer(ni=samples_per_window, shift_scale=True)
+
+# rescaling layer
+decoder_fc_c = FullyConnectedLayer(
+    ni=samples_per_window,
+    no=samples_per_window,
+    activation_type="linear",
+    is_output=True
+)
+
+loss = MSELoss()
+optimizer = SGD(0.0001)
+
+# assert (decoder_output.shape == (num_windows, samples_per_window))
+# REBUILD windowed_data
+# reconstruction error = winodw_data - decoder output
+encoded_fin = rope_layer(stacked)
+
+amplitude_encoder = [amplitude_layer_a, amplitude_layer_b, amplitude_layer_c]
+fft_layer = [freq_fft_layer, freq_fc_layer]
+
+encoded_fin = rope_layer(stacked)
+# embedding feed-forward
+embedding_layers = [dropout_a, fc_a, fc_b, fc_c, norm_a]
+# decoder --> recreate
+decoder_layers = [decoder_dropout, decoder_fc_a, decoder_fc_b, decoder_norm, decoder_fc_c]
+
+
+
+
+# FORWARD --------------------------------
+# windowed_data
+x_amp = windowed_data.copy()
+for l in amplitude_encoder:
+    x_amp = l.forward(x_amp)
+    print(l, x_amp.shape)
+
+x_freq = windowed_data.copy()
+for l in fft_layer:
+    x_freq = l.forward(x_freq)
+    print(l, x_freq.shape)
+
+stacked = stacking_layer(x_amp, x_freq)
+encoded = rope_layer(stacked)
+print("encoded shape:", encoded.shape)
+
+# encoder ---->
+x_prime = encoded.copy()
+for l in decoder_layers:
+    x_prime = l.forward(x_prime)
+    print(l, x_prime.shape)
+
+_l = loss.forward(prediction = x_prime, targets=windowed_data)
+print(f"at this stage, we've output a model recreation of encoder-decoder process."
+      f" x_prime (model output) is {x_prime.shape} compared to the original {windowed_data.shape}")
+print(f"reconstruction loss is at {_l}")
+
+# backwards pass
+
+grad_output = loss.backward()
+
+all_losses = []
+# for layer in OUR_LAYERS[::-1]:
+#     grad_output = layer.backward(grad_output)
+#     print(f"Backwards pass: {layer} gradients shaped {grad_output.shape}")
+# optimizer.step(layers=nnet_layers)
+

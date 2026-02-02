@@ -65,7 +65,7 @@ class RopeEmbedding:
         self.output[:, 0::2] = y_even
         self.output[:, 1::2] = y_odd
 
-        return self.output
+        return input_data + self.output
 
     def backward(self, incoming_gradient):
         if incoming_gradient.ndim < 3:

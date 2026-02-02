@@ -8,7 +8,8 @@ dynamic = ["version"]
 name = "ml-tools"
 dynamic = ["version"]
 authors = [
-  {name = "David Graey", email = "graeyband@gmail.com" },
+    {name = "David Graey", email = "graeyband@gmail.com"},
+    {name = "Dr Charles Anderson", email = "Chuck.Anderson@colostate.edu"}
 ]
 dependencies = [
     "matplotlib",
