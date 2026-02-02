@@ -4,6 +4,7 @@ from ml_tools.utilities import rolling_windows_nd, standardize_data
 from ml_tools.models.layers.operators import LatentStack
 from ml_tools.models.model_loss import MSELoss
 from ml_tools.models.optimizers import SGD
+from ml_tools.models.neural_network import NeuralNetwork
 from ml_tools.models.layers.layers import (
     FrequencyFFT,
     FullyConnectedLayer,
@@ -183,15 +184,9 @@ amplitude_layer_c = FullyConnectedLayer(
     activation_type="tanh",
     is_output=True
 )
-
-_amp_f = amplitude_layer_c(
-    amplitude_layer_b.forward(
-        amplitude_layer_a.forward(
-            windowed_data
-        )
-    )
-)
-print(f"forward pass is shaped: {_amp_f.shape} -> (num_windows, real_positive_fft_shape)")
+amplitude_net = NeuralNetwork(layers=[amplitude_layer_a, amplitude_layer_b, amplitude_layer_c])
+print(f"forward amplitude pass is shaped: {amplitude_net.forward(windowed_data).shape} -> (num_windows, "
+      f"real_positive_fft_shape)")
 
 
 # FREQUENCY -----------------------------------------------------------------
@@ -204,29 +199,18 @@ freq_fc_layer = FullyConnectedLayer(
     activation_type="tanh",
     is_output=True
 )
-_fft = freq_fc_layer(
-    freq_fft_layer(windowed_data)
-)
 
+fft_net = NeuralNetwork(layers=[freq_fft_layer, freq_fc_layer])
+fft_net.forward(windowed_data).shape
+print(f"forward frequency pass is shaped: {fft_net.forward(windowed_data).shape} -> (num_windows, "
+      f"real_positive_fft_shape)")
 # Feed Forward, built of 1-3 stacked layers?
 # Project down to LATENT_DIMENSION
 
 stacking_layer = LatentStack()
 
-stacked = stacking_layer(_amp_f, _fft)
-print(f"{stacked} shape")
-stacking_layer.purge()
 # Rotary Positional embedding - (relative position and distances -------------
 rope_layer = RopeEmbedding(sequence_length=MAX_POSSIBLE_WINDOWS, embedding_dimension=2*LATENT_DIMENSION)
-encoded_fin = rope_layer(stacked)
-print(encoded_fin.shape)
-# Final Aggregation ----------------------------------------------------------
-# FINALLY, we will:
-#     1) stack FREQUENCY and AMPLITUDE
-#     2) ADD ROPE
-#     3) end of feature encoder -- then we pass into FEED FORWARD:
-#     4) ???? should we do a layer norm?
-
 EMBEDDING_DIM = 720
 
 # feed froward--
@@ -252,31 +236,22 @@ fc_c = FullyConnectedLayer(
 )
 norm_a = NormalizeLayer(ni=EMBEDDING_DIM, shift_scale=True)
 
+embedding_net = NeuralNetwork(layers=[dropout_a, fc_a, fc_b, fc_c, norm_a])
 
 
-embedding = norm_a(fc_c(fc_b(fc_a(dropout_a(encoded_fin)))))
-print(embedding.shape)
 # And Finally, we're at the latent space embedding ------------------------
 # NOW WE CAN SEND THE LATENT EMBEDDING INTO our Kernel FourierNetwork.
-
 # the feature encoding and Kernel FourierNetwork layers out into the model's embedding - latent space.
-# From here, we can decoder.
 
-
-
-# class decoder():
-#     def __init__()
-#         # our goal is to take our latent space and recreate our original data --
-# basically just reproject it up dimensionally to (num_windows, samples_per_window)
 decoder_dropout = DropoutLayer(dropout_prob=0.25)
 decoder_fc_a = FullyConnectedLayer(
-    ni=EMBEDDING_DIM * 2,
-    no=1600,
+    ni=EMBEDDING_DIM,
+    no=1200,
     activation_type="swish",
     is_output=False
 )
 decoder_fc_b = FullyConnectedLayer(
-    ni=1600,
+    ni=1200,
     no=samples_per_window,
     activation_type="swish",
     is_output=False
@@ -291,60 +266,37 @@ decoder_fc_c = FullyConnectedLayer(
     is_output=True
 )
 
+decoder = NeuralNetwork(layers=[decoder_dropout, decoder_fc_a, decoder_fc_b, decoder_norm, decoder_fc_c])
+
 loss = MSELoss()
 optimizer = SGD(0.0001)
 
 # assert (decoder_output.shape == (num_windows, samples_per_window))
 # REBUILD windowed_data
 # reconstruction error = winodw_data - decoder output
-encoded_fin = rope_layer(stacked)
 
-amplitude_encoder = [amplitude_layer_a, amplitude_layer_b, amplitude_layer_c]
-fft_layer = [freq_fft_layer, freq_fc_layer]
+# FORWARD PASS THROUGH THE NETWORK ----
+x_amp = amplitude_net.forward(windowed_data)
+x_freq = fft_net.forward(windowed_data)
+x_stacked = rope_layer(stacking_layer(x_amp, x_freq))
+encoded_fin = embedding_net.forward(x_stacked)
+x_prime = decoder.forward(encoded_fin)
 
-encoded_fin = rope_layer(stacked)
-# embedding feed-forward
-embedding_layers = [dropout_a, fc_a, fc_b, fc_c, norm_a]
-# decoder --> recreate
-decoder_layers = [decoder_dropout, decoder_fc_a, decoder_fc_b, decoder_norm, decoder_fc_c]
-
-
-
-
-# FORWARD --------------------------------
-# windowed_data
-x_amp = windowed_data.copy()
-for l in amplitude_encoder:
-    x_amp = l.forward(x_amp)
-    print(l, x_amp.shape)
-
-x_freq = windowed_data.copy()
-for l in fft_layer:
-    x_freq = l.forward(x_freq)
-    print(l, x_freq.shape)
-
-stacked = stacking_layer(x_amp, x_freq)
-encoded = rope_layer(stacked)
-print("encoded shape:", encoded.shape)
-
-# encoder ---->
-x_prime = encoded.copy()
-for l in decoder_layers:
-    x_prime = l.forward(x_prime)
-    print(l, x_prime.shape)
-
+assert (x_prime.shape == (num_windows, samples_per_window))
 _l = loss.forward(prediction = x_prime, targets=windowed_data)
 print(f"at this stage, we've output a model recreation of encoder-decoder process."
       f" x_prime (model output) is {x_prime.shape} compared to the original {windowed_data.shape}")
 print(f"reconstruction loss is at {_l}")
 
 # backwards pass
+#
+# grad_output = loss.backward()
+# grad_output = decoder.backward(grad_output)
+# grad_output = rope_layer.backward(grad_output)
+# amp_grad, freq_grad = stacking_layer.backward(grad_output)
+# x_amp.backward(amp_grad)
+# fft_net.backward(freq_grad)
+#
+# optimizer.step()
 
-grad_output = loss.backward()
-
-all_losses = []
-# for layer in OUR_LAYERS[::-1]:
-#     grad_output = layer.backward(grad_output)
-#     print(f"Backwards pass: {layer} gradients shaped {grad_output.shape}")
-# optimizer.step(layers=nnet_layers)
-
+# all_losses = []
