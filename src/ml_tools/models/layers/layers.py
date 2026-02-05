@@ -7,7 +7,7 @@ from typing import Optional, Callable
 
 EPSILON = 1e-14
 # TODO: set the global float depth --
-GLOBAL_DTYPE = np.float16
+GLOBAL_DTYPE = np.float32
 
 
 # -------------    weight initilization functions    ---------------
@@ -159,7 +159,8 @@ class FullyConnectedLayer(Layer):
                 forced_activation
             ]
         # reshape to 2D in case (batch, sequence, hidden)
-        _x = self.input.reshape(-1, self.shape[-1])
+        # if self.input.ndim == 3:
+        #     _x = self.input.reshape(-1, self.shape[-1])
         _delta = incoming_grad.reshape(-1, incoming_grad.shape[-1])
 
         delta = incoming_grad * this_derivative(self.output, self.z)
@@ -182,6 +183,8 @@ class FullyConnectedLayer(Layer):
         -------
 
         """
+        # print("grad max:", np.max(np.abs(gradient_weights)), "grad bias:", np.max(np.abs(gradient_bias)))
+        # print("weight max:", np.max(np.abs(self.weights)), "bias max:", np.max(np.abs(self.bias)))
         self.bias -= gradient_bias
         self.weights -= gradient_weights
 
@@ -222,13 +225,14 @@ class FullyConnectedLayer(Layer):
 # TODO: FUTURE - add below layer types : As we add more layer types, we will have to change our cascade assembly
 # construction slightly to better differentiate type.
 class DropoutLayer(Layer):
-    """Hinton style Dropout layer with scaling outputs"""
+    """Hinton style or simple bool mask Dropout layer with scaling outputs"""
 
-    def __init__(self, dropout_prob=0.5):
+    def __init__(self, dropout_prob=0.5, use_rescale: bool = False):
         super().__init__()
         assert (dropout_prob > 0.0) and (dropout_prob < 1.0)
         self.dropout_prob: float = dropout_prob
         self.keep_prob: float = 1 - dropout_prob
+        self.do_hinton = use_rescale
 
         self.mask = None
         self.input = None
@@ -239,10 +243,14 @@ class DropoutLayer(Layer):
     ):
         self.input = incoming_x
         if training_now:
-            self.mask = (
-                self.RNG.binomial(1, self.keep_prob, size=incoming_x.shape)
-                / self.keep_prob
-            )
+            if self.do_hinton:
+                self.mask = (
+                    self.RNG.binomial(1, self.keep_prob, size=incoming_x.shape)
+                    / self.keep_prob
+                )
+            else:
+                self.mask = self.RNG.binomial(1, self.keep_prob, size=incoming_x.shape)
+
             return incoming_x * self.mask
 
         else:
@@ -280,10 +288,14 @@ class DropoutLayer(Layer):
         pass
 
     def __str__(self):
-        return f"Layer of Hinton Dropout currently at {self.dropout_prob}, shaped {self.mask.shape}"
+        if self.do_hinton:
+            method = "Hinton / rescalindg dropout"
+        else:
+            method = "bool dropout"
+        return f"Layer of {method} currently at {self.dropout_prob}"
 
     def __repr__(self):
-        return f"{self.mask.shape} dropout using Hinton Dropout"
+        return self.__str__()
 
 
 # numpy-ml ref:
@@ -296,8 +308,8 @@ class NormalizeLayer(Layer):
         self.eps = eps
 
         if shift_scale:
-            self.scale_gamma = np.ones((1, ni))
-            self.shift_beta = np.zeros((1, ni))
+            self.scale_gamma = np.ones((1, ni)) * .01
+            self.shift_beta = np.ones((1, ni)) * .01
         else:
             self.gamma = None
             self.beta = None
@@ -322,8 +334,8 @@ class NormalizeLayer(Layer):
     def update_weights(self, gradient_beta: Optional[NDArray] = None, gradient_gamma: Optional[NDArray] = None) -> None:
         # update the shift & scale values based on gradient contributions
         if self.shift_scale == True:
-            self.shift_beta += gradient_beta
-            self.scale_gamma += gradient_gamma
+            self.shift_beta -= gradient_beta
+            self.scale_gamma -= gradient_gamma
         else:
             pass
 
@@ -383,29 +395,29 @@ class FrequencyFFT(Layer):
         self.max_sequence_length: int = max_sequence_length
         self.window_size: int = window_size
 
-    def forward(self, windowed_data: NDArray) -> NDArray:
+    def forward(self, incoming_x: NDArray) -> NDArray:
         """
         Forward process for the FFT transform
         Parameters
         ----------
-        windowed_data : Numpy array of (number_of_windows, samples per window)
+        incoming_x : Numpy array of (number_of_windows, samples per window)
 
         Returns
         -------
         the FFT transform of windowed_data
         """
-        num_windows, samples = windowed_data.shape
+        num_windows, samples = incoming_x.shape
 
         assert num_windows <= self.max_sequence_length, f"Shapes don't match in {self}"
         assert samples <= self.window_size, f"Shapes don't match in {self}"
 
-        self.input = windowed_data.copy()
-        self.output = np.fft.rfft(windowed_data, axis=-1).real
+        self.input = incoming_x.copy()
+        self.output = np.fft.rfft(incoming_x, axis=-1, norm="ortho").real
 
         return self.output.copy()
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        return np.fft.irfft(incoming_grad, axis=-1).real.copy()
+        return np.fft.irfft(incoming_grad, axis=-1, norm="ortho").real
 
     def purge(self) -> None:
         self.input = np.empty(shape=(1, 1))
@@ -428,102 +440,145 @@ class FrequencyFFT(Layer):
         return 0
 
 
-# ====== ==================================================================
-# TODO: WIP below
-
-
-class EmbeddingLayer(Layer):
-    def __init__(
-        self, ni: int, cardinality: int, embedding_dim: int, trainable: bool = True
-    ):
+class FourierLayer(Layer):
+    #  https://ieeexplore.ieee.org/document/9616294
+    def __init__(self, use_2d:bool = True):
         super().__init__()
-        self.ni: int = ni
-        self.cardinality: int = cardinality
-        self.embedding_dim: int = embedding_dim
+        self.use_2d = use_2d
 
-        self.projection = self.RNG.uniform(size=(cardinality, embedding_dim))
-        self.gradient = np.zeros_like(self.projection)
+        if use_2d == True:
+            self.fft_axes = (-2, -1)
+        else:
+            self.fft_axes = -1
 
     def forward(self, incoming_x: NDArray) -> NDArray:
-        if incoming_x.dtype != np.int:
-            _x = incoming_x.astype(int)
+        """ incoming_x """
+        self.input = incoming_x
 
-        assert _x.dtype == np.int_
-        self.input = _x.copy()
+        if not self.use_2d:  # use FFT 1D
+            self.output = np.fft.fft(incoming_x, axis=self.fft_axes).real
 
-        # straight indexing
-        outs = self.projection[_x]
-        self.output = outs
+        elif self.use_2d:
+            self.output = np.fft.fft2(incoming_x, axes=self.fft_axes).real
 
-        return outs
+        return self.output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        self.gradient = np.zeros_like(self.projection)
+        _grad = incoming_grad.astype(np.complex128)
 
-        # inplace operation - "assign" the gradients to their input variable
-        np.add.at(self.gradient, self.input, incoming_grad)
+        if not self.use_2d:
+            _grad = np.fft.ifft(_grad, axis=self.fft_axes).real
+        elif self.use_2d:
+            _grad = np.fft.ifft2(_grad, axes=self.fft_axes).real
 
-        # self.update_weights(self.gradient)
-        return self.input
+        self.gradient = _grad.real
+        return self.gradient
 
-    def update_weights(self, value: NDArray) -> None:
-        self.projection += value
+    def purge(self) -> None:
+        self.input = np.empty(shape=(1, 1))
+        self.output = np.empty(shape=(1, 1))
+        self.gradient = np.empty(shape=(1,1))
+
+    def get_weights(self):
+        return None
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        return {} # TODO: return? self.gradient
+
+    def zero_gradients(self) -> None:
+        pass
+
+    def update_weights(self, **kwargs) -> None:
+        pass
 
     @property
-    def weights(self) -> NDArray:
-        """alias"""
-        return self.projection
+    def num_parameters(self) -> int:
+        return 0
 
 
 
+#
+#
+# # ====== ==================================================================
+# # TODO: WIP below
+#
+#
+# class EmbeddingLayer(Layer):
+#     def __init__(
+#         self, ni: int, cardinality: int, embedding_dim: int, trainable: bool = True
+#     ):
+#         super().__init__()
+#         self.ni: int = ni
+#         self.cardinality: int = cardinality
+#         self.embedding_dim: int = embedding_dim
+#
+#         self.projection = self.RNG.uniform(size=(cardinality, embedding_dim))
+#         self.gradient = np.zeros_like(self.projection)
+#
+#     def forward(self, incoming_x: NDArray) -> NDArray:
+#         if incoming_x.dtype != np.int:
+#             _x = incoming_x.astype(int)
+#
+#         assert _x.dtype == np.int_
+#         self.input = _x.copy()
+#
+#         # straight indexing
+#         outs = self.projection[_x]
+#         self.output = outs
+#
+#         return outs
+#
+#     def backward(self, incoming_grad: NDArray) -> NDArray:
+#         self.gradient = np.zeros_like(self.projection)
+#
+#         # inplace operation - "assign" the gradients to their input variable
+#         np.add.at(self.gradient, self.input, incoming_grad)
+#
+#         # self.update_weights(self.gradient)
+#         return self.input
+#
+#     def update_weights(self, value: NDArray) -> None:
+#         self.projection += value
+#
+#     @property
+#     def weights(self) -> NDArray:
+#         """alias"""
+#         return self.projection
+#
+#
+#
+#
+# class FourierLayer1D(Layer):
+#     #  https://ieeexplore.ieee.org/document/9616294
+#     def __init__(
+#         self, ni: int, no: int, window_count: int, sequence_length: int, hidden_dim: int
+#     ):
+#         super().__init__()
+#         self.ni = ni
+#         self.no = no
+#
+#         # self.positional_weights = self.RNG.uniform(size=(sequence_length))
+#         # self.frequency_weights = self.RNG.uniform(size=(hidden_dim))
+#
+#     def forward(self, x_data: NDArray):
+#         x_freq = np.fft.fft2(x_data, axes=(-2, -1)).real
+#         # scale, constrain or norm?
+#
+#         # x_out = np.fft.ifft2(reweighted, axes=(-2, -1)).real
+#
+#         # return normed(x_data + x_out)
+#
+#         # x = x @ W_linear
+#
+#     def backward(self, incoming_grad):
+#         complex_delta = incoming_grad.astype(np.complex128)
+#
+#         self.gradient = np.fft.ifft(complex_delta, axis=self.axis).real
+#
+#         self.update_weigupdate_weighthts()
 
-class FourierLayer1D(Layer):
-    #  https://ieeexplore.ieee.org/document/9616294
-    def __init__(
-        self, ni: int, no: int, window_count: int, sequence_length: int, hidden_dim: int
-    ):
-        super().__init__()
-        self.ni = ni
-        self.no = no
 
-        # self.positional_weights = self.RNG.uniform(size=(sequence_length))
-        # self.frequency_weights = self.RNG.uniform(size=(hidden_dim))
-
-    def forward(self, x_data: NDArray):
-        x_freq = np.fft.fft2(x_data, axes=(-2, -1)).real
-        # scale, constrain or norm?
-
-        # x_out = np.fft.ifft2(reweighted, axes=(-2, -1)).real
-
-        # return normed(x_data + x_out)
-
-        # x = x @ W_linear
-
-    def backward(self, incoming_grad):
-        complex_delta = incoming_grad.astype(np.complex128)
-
-        self.gradient = np.fft.ifft(complex_delta, axis=self.axis).real
-
-        self.update_weigupdate_weighthts()
-
-
-if __name__ == "__main__":
-    x = np.array([[1, 2, 3], [3, 5, 6], [7, 8, 9], [9, 8, 7], [100, 200, 300]])
-    # y = np.random.normal(loc=x)
-
-    fc = FullyConnectedLayer(ni=3, no=1, activation_type="linear", is_output=True)
-    assert fc(x).shape == (5, 1)
-
-    norm = NormalizeLayer(ni=3, shift_scale=True)
-    assert norm(x).shape == (5, 3)
-
-    dp = DropoutLayer(dropout_prob=0.25)
-    assert dp(x, training_now=True).shape == (5, 3)
-    fc.forward(x)
-
-    assert fc(dp(norm(x))).shape == (5, 1)
-
-    ## working example -- train--- -- MOVE TO TESTS!
+if __name__ == "__main__":    ## working example -- train--- -- MOVE TO TESTS!
     from ml_tools.models.model_loss import MSELoss
     from ml_tools.models.optimizers import SGD
     from ml_tools.generators import RandomDatasetGenerator
@@ -533,7 +588,7 @@ if __name__ == "__main__":
     x_regression, y_regression, meta = r.generate(task="regression", num_samples=1500, num_features=3, noise_scale=1.5)
     fc = FullyConnectedLayer(ni=3, no=10, activation_type="relu")
     nc1 = NormalizeLayer(ni=10, shift_scale=True)
-    dp = DropoutLayer(dropout_prob=0.25)
+    dp = DropoutLayer(dropout_prob=0.05)
     fc2 = FullyConnectedLayer(ni=10, no=10, activation_type="linear", is_output=False)
     nc2 = NormalizeLayer(ni=10, shift_scale=False)
     fc3 = FullyConnectedLayer(ni=10, no=10, activation_type="relu", is_output=False)
@@ -541,12 +596,12 @@ if __name__ == "__main__":
     fc5 = FullyConnectedLayer(ni=10, no=10, activation_type="relu_leaky", is_output=False)
     fc6 = FullyConnectedLayer(ni=10, no=1, activation_type="tanh", is_output=True)
     lossfc = MSELoss()
-    optimizer = SGD(0.0001)
+    optimizer = SGD(0.002)
     all_losses = []
     y_regression = y_regression.reshape(-1, 1)
     nnet_layers = [fc, nc1, dp, fc2, nc2, fc3, fc4, fc5, fc6]
 
-    for _ in range(20):
+    for _ in range(500):
         output = x_regression.copy()
         for layer in nnet_layers:
             output = layer.forward(output)

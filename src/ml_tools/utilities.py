@@ -5,7 +5,7 @@ Utility functions for ml_tools package --- helpers, etc.
 import time
 import numpy as np
 from numpy.typing import NDArray
-from typing import Optional, Callable
+from typing import Optional, Callable, Iterable
 from datetime import datetime, timedelta
 from functools import lru_cache, wraps
 
@@ -148,3 +148,15 @@ def rolling_windows_nd(data: NDArray,
     windowed_indices = np.lib.stride_tricks.as_strided(data, shape=new_shape, strides=strides)
 
     return windowed_indices
+
+def flatten_containers(container: Iterable):
+    flattened = []
+    for item in container:
+        if isinstance(item, list | tuple | set):
+            flattened.extend(flatten_containers(item))
+        elif isinstance(item, dict):
+            flatten_containers(list(item.values()))
+        else:  # string, float, int, array
+            flattened.append(item)
+
+    return flattened

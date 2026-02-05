@@ -1,7 +1,8 @@
 import numpy as np
 from numpy.typing import NDArray
+from ml_tools.models.layers.layers import Layer
 
-class RopeEmbedding:
+class RopeEmbedding(Layer):
     def __init__(self, sequence_length: int, embedding_dimension: int):
         """
         Constructing a decoupled, rotary positional embedding mechanism
@@ -54,31 +55,45 @@ class RopeEmbedding:
         self.input = input_data.copy()
         if input_data.ndim < 3:
             seq_len, embedding_dim = input_data.shape
+        else:
+            batch, seq_len, embedding_dim = input_data.shape
 
         assert seq_len <= self.sequence_length
         assert embedding_dim == self.embedding_dimension
 
-        y_even = input_data[:, 0::2] * self.pos_cosine[:seq_len] - input_data[:, 1::2] * self.pos_sine[:seq_len]
-        y_odd = input_data[:, 0::2] * self.pos_sine[:seq_len] + input_data[:, 1::2] * self.pos_cosine[:seq_len]
+        _sin = self.pos_sine[:seq_len]
+        _cos = self.pos_cosine[:seq_len]
+
+        y_even = input_data[:, 0::2] * _cos - input_data[:, 1::2] * _sin
+        y_odd = input_data[:, 0::2] * _sin + input_data[:, 1::2] * _cos
 
         self.output = np.zeros_like(input_data)
         self.output[:, 0::2] = y_even
         self.output[:, 1::2] = y_odd
 
-        return input_data + self.output
+        return self.output
 
     def backward(self, incoming_gradient):
+        # inverse the rotation --
         if incoming_gradient.ndim < 3:
             seq_len, embedding_dim = incoming_gradient.shape
-            even_position = incoming_gradient[:, 0::2]
-            odd_position = incoming_gradient[:, 1::2]
+            _sin = self.pos_sine[:seq_len, :]
+            _cos = self.pos_cosine[:seq_len, :]
+        else:
+            _, seq_len, embedding_dim = incoming_gradient.shape
+            _sin = self.pos_sine[None, :seq_len, :]
+            _cos = self.pos_cosine[None, :seq_len, :]
 
-        dx_even = even_position * self.pos_cosine[:seq_len] + odd_position * self.pos_sine[:seq_len]
-        dx_odd = -even_position * self.pos_sine[:seq_len] + odd_position * self.pos_cosine[:seq_len]
+        even_position = incoming_gradient[..., 0::2]
+        odd_position  = incoming_gradient[..., 1::2]
 
-        self.gradient = np.ones_like(incoming_gradient)
-        self.self.gradient[:, 0::2] = dx_even
-        self.self.gradient[:, 1::2] = dx_odd
+        dx_even = even_position * _cos + odd_position * _sin
+        dx_odd = -even_position * _sin + odd_position * _cos
+
+        # self.gradient = np.ones_like(incoming_gradient)
+        self.gradient = np.zeros_like(incoming_gradient)
+        self.gradient[:, 0::2] = dx_even
+        self.gradient[:, 1::2] = dx_odd
 
         return self.gradient
 
@@ -89,7 +104,7 @@ class RopeEmbedding:
         Some basic assumptions: Data in input data is structured:
         1) Dimensions are: (num_samples, sequence_length,embedding_dimension)
         2) both sequence_length and embedding dimension are the same as
-            those used to initalize this embedding object.
+            those used to initalize this class.
 
         Parameters
         ----------
@@ -112,3 +127,16 @@ class RopeEmbedding:
     @property
     def rope_array(self):
         return self._rope_array.copy()
+
+    def purge(self):
+        pass
+
+    def update_weights(self, **kwargs) -> None:
+        pass
+
+    def zero_gradients(self) -> None:
+        pass
+
+    def get_gradients(self)  -> dict[str, NDArray]:
+        return {"grad": self.gradient}
+

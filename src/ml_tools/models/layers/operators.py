@@ -16,7 +16,7 @@ class LatentStack(Layer):
         self.b_shape = array_b.shape
         assert self.a_shape[0] == self.b_shape[0]
 
-        self.shapes = (self.a_shape[-1], {self.b_shape[-1]})
+        self.shapes = (self.a_shape[-1], self.b_shape[-1])
 
         if array_a.ndim == 1:
             return np.hstack((array_a.ravel(), array_b.ravel()))
@@ -25,7 +25,7 @@ class LatentStack(Layer):
         elif array_a.ndim == 3:
             return np.dstack((array_a, array_b))
 
-    def backward(self, incoming_gradient: NDArray) -> list[NDArray, NDArray]:
+    def backward(self, incoming_gradient: NDArray) -> tuple[NDArray, NDArray]:
         """
         # apportion the gradients to their correct inputs ("slices")
         Parameters
@@ -36,14 +36,17 @@ class LatentStack(Layer):
         -------
         the "split" gradients -> ordered in the same fashion as the inputs to the forward pass kwards.
         """
-        splits = np.split(incoming_gradient, indices_or_sections=self.shapes, axis=-1)
+        a_dim, b_dim = self.shapes
 
-        return splits
+        grad_a = incoming_gradient[..., :a_dim]
+        grad_b = incoming_gradient[..., a_dim:a_dim + b_dim]
+
+        return grad_a, grad_b
 
     def purge(self):
         self.shapes, self.a_shape, self.b_shape = None, None, None
 
-    def update_weights(self) -> None:
+    def update_weights(self, **kwargs) -> None:
         pass
 
     def zero_gradients(self) -> None:

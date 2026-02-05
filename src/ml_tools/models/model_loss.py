@@ -48,13 +48,17 @@ class DifferenceLoss(Loss):
 
 class MSELoss(Loss):
     def forward(self, prediction, targets):
+        self.num_samples = prediction.shape[0]
         self.prediction = prediction
         self.targets = targets
         diff = prediction - targets
-        return 0.5 * np.mean(diff**2)
+        return np.mean(diff ** 2)
+        # return 0.5 * np.mean(diff ** 2)
 
     def backward(self):
-        return self.prediction - self.targets
+        _num = self.prediction.shape[0]
+        diff = self.prediction - self.targets
+        return (2 / self.num_samples) * diff
 
 
 class RMSELoss(Loss):

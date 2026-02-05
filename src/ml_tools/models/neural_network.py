@@ -25,6 +25,10 @@ class NeuralNetwork:
     def backward(self, incoming_gradient: NDArray):
         _grad = incoming_gradient.copy()
         for l_idx, layer_object in self.inverse_layers.items():
-            _grad = layer_object.forward(_grad)
+            _grad = layer_object.backward(_grad)
+            # try:
+            #     _grad = layer_object.backward(_grad)
+            # except:
+            #     print(f"error in backprob during {layer_object} -> incoming shape {_grad.shape}")
         return _grad
 

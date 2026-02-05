@@ -97,8 +97,8 @@ def tanh(x: NDArray) -> NDArray:
     **********RETURNS**********
     :return: evaluation (single val for input_sample (row) of x)
     """
-    # could be done with np.tanh(x) as well
-    return 2 / (1 + np.e ** (-2 * x)) - 1
+    # return 2 / (1 + np.e ** (-2 * x)) - 1
+    return np.tanh(x)
 
 
 @activation
@@ -168,7 +168,7 @@ def tanh_derivative(gradient: NDArray, x: Optional[NDArray]) -> NDArray:
     **********RETURNS**********
     :return: evaluation (single val for input_sample (row) of x)
     """
-    return 1 - gradient**2
+    return 1 - gradient ** 2
 
 
 @derivative
