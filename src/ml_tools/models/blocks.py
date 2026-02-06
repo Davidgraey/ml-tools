@@ -12,7 +12,7 @@ class FourierAttention(Layer):
     def __init__(self, ni: int, no: int, use_2d: bool = True):
         super().__init__()
         self.fftlayer = FourierLayer(use_2d)
-        self.norm_a = NormalizeLayer(ni=ni, shift_scale=True)
+        self.norm_a = NormalizeLayer(ni=ni, shift_scale=False)
         self.fc = FullyConnectedLayer(ni=ni, no=no, activation_type="relu")
         self.norm_b = NormalizeLayer(ni=no, shift_scale=True)
 

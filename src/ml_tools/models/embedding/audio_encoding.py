@@ -13,7 +13,6 @@ from ml_tools.models.layers.layers import (
 from ml_tools.models.blocks import FourierAttention
 from ml_tools.models.embedding.positional import RopeEmbedding
 import matplotlib.pyplot as plt
-from ml_tools.utilities import standardize_data
 
 # set some bounds -- the maximum length of a signal that our encoding network can process - this signal length is a
 # count of WINDOWS; not of samples. so 10 windows at 10 samples_per_window == 100 total samples.
@@ -92,7 +91,7 @@ assert _samp == samples_per_window
 
 
 windowed_spectrogram = []
-window = np.hanning(samples_per_window)
+window = np.blackman(samples_per_window)
 # junky workaround so we don't have to fancy-reindex.
 for i in range(num_windows):
     start, end = i * samples_per_window, (i * samples_per_window + samples_per_window)

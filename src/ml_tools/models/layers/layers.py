@@ -345,8 +345,9 @@ class NormalizeLayer(Layer):
             self.gradient_gamma = np.sum(incoming_grad * self.x_norm, axis=0)
             z = incoming_grad * self.scale_gamma
         else:
+            self.gradient_beta = np.empty(1)
+            self.gradient_gamma = np.empty(1)
             z = incoming_grad
-
 
         gradient = (1.0 / self.std) * (
                 z - np.mean(z, axis=-1, keepdims=True) - self.x_norm * np.mean(z * self.x_norm, axis=-1,  keepdims=True)
@@ -357,19 +358,17 @@ class NormalizeLayer(Layer):
     def purge(self):
         self.input = np.empty(shape=(1, 1))
         self.output = np.empty(shape=(1, 1))
-        self.gradient = np.empty(shape=(1, 1))
+        self.gradient_beta = np.empty(shape=(1, 1))
+        self.gradient_gamma = np.empty(shape=(1, 1))
 
     def get_weights(self) -> tuple[NDArray]:
         return (self.beta, self.gamma)
 
     def get_gradients(self) -> dict[str, NDArray] | None:
-        if self.shift_scale == True:
-            return {
-                "gradient_beta": self.gradient_beta,
-                "gradient_gamma": self.gradient_gamma,
-            }
-        else:
-            return {}
+        return {
+            "gradient_beta": self.gradient_beta,
+            "gradient_gamma": self.gradient_gamma,
+        }
 
     @property
     def num_parameters(self) -> int:
@@ -394,6 +393,7 @@ class FrequencyFFT(Layer):
         super().__init__()
         self.max_sequence_length: int = max_sequence_length
         self.window_size: int = window_size
+        self.window_kernel: NDArray = np.blackman(window_size)
 
     def forward(self, incoming_x: NDArray) -> NDArray:
         """
@@ -411,13 +411,16 @@ class FrequencyFFT(Layer):
         assert num_windows <= self.max_sequence_length, f"Shapes don't match in {self}"
         assert samples <= self.window_size, f"Shapes don't match in {self}"
 
-        self.input = incoming_x.copy()
-        self.output = np.fft.rfft(incoming_x, axis=-1, norm="ortho").real
+        # incoming_x = self.window_kernel * incoming_x
+        self.output = np.fft.rfft(incoming_x, axis=-1).real
 
         return self.output.copy()
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        return np.fft.irfft(incoming_grad, axis=-1, norm="ortho").real
+        incoming_grad = np.fft.irfft(incoming_grad, axis=-1).real
+
+        return incoming_grad
+        # return incoming_grad * self.window_kernel
 
     def purge(self) -> None:
         self.input = np.empty(shape=(1, 1))
@@ -587,10 +590,10 @@ if __name__ == "__main__":    ## working example -- train--- -- MOVE TO TESTS!
     r = RandomDatasetGenerator()
     x_regression, y_regression, meta = r.generate(task="regression", num_samples=1500, num_features=3, noise_scale=1.5)
     fc = FullyConnectedLayer(ni=3, no=10, activation_type="relu")
-    nc1 = NormalizeLayer(ni=10, shift_scale=True)
+    nc1 = NormalizeLayer(ni=10, shift_scale=False)
     dp = DropoutLayer(dropout_prob=0.05)
     fc2 = FullyConnectedLayer(ni=10, no=10, activation_type="linear", is_output=False)
-    nc2 = NormalizeLayer(ni=10, shift_scale=False)
+    nc2 = NormalizeLayer(ni=10, shift_scale=True)
     fc3 = FullyConnectedLayer(ni=10, no=10, activation_type="relu", is_output=False)
     fc4 = FullyConnectedLayer(ni=10, no=10, activation_type="sigmoid", is_output=False)
     fc5 = FullyConnectedLayer(ni=10, no=10, activation_type="relu_leaky", is_output=False)
