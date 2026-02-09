@@ -120,12 +120,18 @@ class FullyConnectedLayer(Layer):
         -------
         Dot Product of forward pass of incoming values
         """
-        assert incoming_x.shape[-1] == self.weights.shape[0], (
+        self.in_shape = incoming_x.shape
+
+        assert self.in_shape[-1] == self.weights.shape[0], (
             f"weights and xs don't match -- x:{incoming_x.shape} "
             f"weights: {self.weights.shape}"
         )
-        self.input = incoming_x  # do we need a ref?
-        self.z = incoming_x @ self.weights + self.bias
+
+        # flatten to 2D array
+        self.input = incoming_x.reshape(-1, self.in_shape[-1])
+
+        # lienar forward
+        self.z = self.input @ self.weights + self.bias
 
         if forced_activation is None:  # standard layer activation
             this_activation: Callable = self._func_activation
@@ -137,7 +143,8 @@ class FullyConnectedLayer(Layer):
         self._used_activation = forced_activation or self.activation
         self.output = this_activation(self.z)
 
-        return self.output
+        # back to 3D
+        return self.output.reshape(*self.in_shape[:-1], -1)
 
     def backward(
         self, incoming_grad: NDArray, forced_activation: Optional[str] = None
@@ -158,17 +165,19 @@ class FullyConnectedLayer(Layer):
             this_derivative: Callable = activations.activation_dictionary[
                 forced_activation
             ]
+        norm_factor = incoming_grad.shape[0] + EPSILON
         # reshape to 2D in case (batch, sequence, hidden)
-        # if self.input.ndim == 3:
-        #     _x = self.input.reshape(-1, self.shape[-1])
-        _delta = incoming_grad.reshape(-1, incoming_grad.shape[-1])
+        _grad = incoming_grad.reshape(-1, incoming_grad.shape[-1])
 
-        delta = incoming_grad * this_derivative(self.output, self.z)
+        delta = _grad * this_derivative(self.output, self.z)
 
-        self.gradient_weights = self.input.T @ delta
-        self.gradient_bias = delta.sum(axis=0, keepdims=True)
+        self.gradient_weights = (self.input.T @ delta) / norm_factor
+        self.gradient_bias =  delta.sum(axis=0, keepdims=True) / norm_factor
+        # delta.sum(axis=0)
 
-        return delta @ self.weights.T
+        final_grad = delta @ self.weights.T
+
+        return final_grad.reshape(*self.in_shape[:-1], self.weights.shape[0])
 
     def update_weights(self, gradient_bias: NDArray, gradient_weights: NDArray) -> None:
         """
@@ -319,17 +328,21 @@ class NormalizeLayer(Layer):
         self.std = None
 
     def forward(self, incoming_x: NDArray) -> NDArray:
-        self.input = incoming_x
-        num_samples, _ = incoming_x.shape
+        self.in_shape = incoming_x.shape
 
-        _mean = np.mean(incoming_x,  axis=-1, keepdims=True)
-        self.std = np.std(incoming_x,  axis=-1, keepdims=True)
-        self.x_norm = (incoming_x - _mean) / self.std
+        # reshape to 2D in case (batch, sequence, hidden)
+        self.input = incoming_x.reshape(-1, self.in_shape[-1])
+
+        _mean = np.mean(self.input,  axis=-1, keepdims=True)
+        self.std = np.sqrt(np.var(self.input, axis=-1, keepdims=True) + self.eps)
+
+        self.x_norm = (self.input - _mean) / self.std
+        output = self.x_norm
 
         if self.shift_scale == True:
-            return self.scale_gamma * (self.x_norm) + self.shift_beta
+            output = self.scale_gamma * (self.x_norm) + self.shift_beta
 
-        return self.x_norm
+        return output.reshape(self.in_shape)
 
     def update_weights(self, gradient_beta: Optional[NDArray] = None, gradient_gamma: Optional[NDArray] = None) -> None:
         # update the shift & scale values based on gradient contributions
@@ -340,9 +353,11 @@ class NormalizeLayer(Layer):
             pass
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
+        incoming_grad =  incoming_grad.reshape(-1, self.in_shape[-1])
+        norm_factor = incoming_grad.shape[0] + EPSILON
         if self.shift_scale == True:
-            self.gradient_beta = np.sum(incoming_grad, axis=0)
-            self.gradient_gamma = np.sum(incoming_grad * self.x_norm, axis=0)
+            self.gradient_beta = np.sum(incoming_grad, axis=0) / norm_factor
+            self.gradient_gamma = np.sum(incoming_grad * self.x_norm, axis=0) / norm_factor
             z = incoming_grad * self.scale_gamma
         else:
             self.gradient_beta = np.empty(1)
@@ -353,7 +368,7 @@ class NormalizeLayer(Layer):
                 z - np.mean(z, axis=-1, keepdims=True) - self.x_norm * np.mean(z * self.x_norm, axis=-1,  keepdims=True)
         )
 
-        return gradient
+        return gradient.reshape(self.in_shape)
 
     def purge(self):
         self.input = np.empty(shape=(1, 1))
@@ -385,6 +400,8 @@ class FrequencyFFT(Layer):
         Seting up a process for FFT transformations of windows of audio data - expecting data of 1 size batch,
         Preprocessing assumed: sliding windows or patches.
         shape -> (number_of_windows, samples per window)
+
+        We utilize a blackamn kernel to "ease in and out" -- frequency jumps from non-zero starts can give artifacts. Common for FFT / DFT application
         Parameters
         ----------
         max_sequence_length : the MAXIMUM supported sequence length - (windows)
@@ -406,21 +423,26 @@ class FrequencyFFT(Layer):
         -------
         the FFT transform of windowed_data
         """
-        num_windows, samples = incoming_x.shape
+        self.in_shape = incoming_x.shape
 
-        assert num_windows <= self.max_sequence_length, f"Shapes don't match in {self}"
-        assert samples <= self.window_size, f"Shapes don't match in {self}"
+        assert self.in_shape[0] <= self.max_sequence_length, f"Shapes don't match in {self}"
+        assert self.in_shape[-1] <= self.window_size, f"Shapes don't match in {self}"
 
-        # incoming_x = self.window_kernel * incoming_x
+        self.input = incoming_x.reshape(-1, self.in_shape[-1])
+
+        incoming_x = self.window_kernel * incoming_x
         self.output = np.fft.rfft(incoming_x, axis=-1).real
 
-        return self.output.copy()
+        return self.output.reshape(*self.in_shape[:-1], -1)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        incoming_grad = np.fft.irfft(incoming_grad, axis=-1).real
 
-        return incoming_grad
-        # return incoming_grad * self.window_kernel
+        incoming_grad = incoming_grad.reshape(-1, incoming_grad.shape[-1])
+        incoming_grad = np.fft.irfft(incoming_grad, axis=-1).real / self.window_size
+
+        # return incoming_grad
+        grad = (incoming_grad * self.window_kernel)
+        return grad.reshape(*self.in_shape[:-1], -1)
 
     def purge(self) -> None:
         self.input = np.empty(shape=(1, 1))
@@ -459,7 +481,7 @@ class FourierLayer(Layer):
         self.input = incoming_x
 
         if not self.use_2d:  # use FFT 1D
-            self.output = np.fft.fft(incoming_x, axis=self.fft_axes).real
+            self.output = np.fft.rfft(incoming_x, axis=self.fft_axes).real
 
         elif self.use_2d:
             self.output = np.fft.fft2(incoming_x, axes=self.fft_axes).real
@@ -498,6 +520,61 @@ class FourierLayer(Layer):
     def num_parameters(self) -> int:
         return 0
 
+
+class InverseFourierLayer(Layer):
+    # https://arxiv.org/pdf/2502.18394
+    def __init__(self, use_2d:bool = True):
+        super().__init__()
+        self.use_2d = use_2d
+
+        if use_2d == True:
+            self.fft_axes = (-2, -1)
+        else:
+            self.fft_axes = -1
+
+    def forward(self, incoming_x: NDArray) -> NDArray:
+        """ incoming_x """
+        self.input = incoming_x
+
+        if not self.use_2d:  # use FFT 1D
+            self.output = np.fft.ifft(incoming_x, axis=self.fft_axes).real
+
+        elif self.use_2d:
+            self.output = np.fft.ifft2(incoming_x, axes=self.fft_axes).real
+
+        return self.output
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        _grad = incoming_grad.astype(np.complex128)
+
+        if not self.use_2d:
+            _grad = np.fft.fft(_grad, axis=self.fft_axes).real
+        elif self.use_2d:
+            _grad = np.fft.fft2(_grad, axes=self.fft_axes).real
+
+        self.gradient = _grad.real
+        return self.gradient
+
+    def purge(self) -> None:
+        self.input = np.empty(shape=(1, 1))
+        self.output = np.empty(shape=(1, 1))
+        self.gradient = np.empty(shape=(1,1))
+
+    def get_weights(self):
+        return None
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        return {} # TODO: return? self.gradient
+
+    def zero_gradients(self) -> None:
+        pass
+
+    def update_weights(self, **kwargs) -> None:
+        pass
+
+    @property
+    def num_parameters(self) -> int:
+        return 0
 
 
 #

@@ -120,6 +120,19 @@ def relu_leaky(x: NDArray, alpha=0.1) -> NDArray:
     """
     return np.where(x > 0, x, alpha * x)
 
+@activation
+def mod_relu(x: NDArray, bias: float = -0.2) -> NDArray:
+    """
+     modrelu = z / |z| * max(|z| +b, 0)
+    """
+    # z / |z|
+    magnitude = np.abs(x)
+    phase = np.divide(x, magnitude, out=np.zeros_like(x), where=magnitude != 0)
+
+    activated = np.maximum(magnitude + bias, 0.0)
+
+    return activated * phase
+
 
 # ===================== and their derivatives ======================
 
@@ -216,6 +229,34 @@ def softmax_derivative(gradient: NDArray, x: Optional[NDArray]) -> NDArray:
     jacobian = np.diag(gradient) - np.outer(gradient, gradient)
 
     return jacobian
+
+
+@derivative
+def mod_relu_derivative(z, beta, dout, eps=1e-8):
+    r = np.abs(z)
+    r_safe = r + eps
+    mask = (r + beta) > 0
+
+    scale = (r + beta) / r_safe
+    proj = np.real(dout * np.conj(z)) / r_safe
+
+    d_bias = proj.sum(axis=0)
+    d_z = mask * (dout * scale + z * proj * (-beta / r_safe**2))
+    return d_bias, d_z
+# def mod_relu_derivative(gradient: NDArray, bias: float = -0.2) -> NDArray:
+#     """
+#      modrelu = z / |z| * max(|z| +b, 0)
+#     """
+#     magnitude = np.abs(gradient)
+#     mask = (magnitude + bias) > 0
+#
+#     with np.errstate(divide='ignore', invalid='ignore'):
+#         gradient = mask * (gradient / magnitude)
+#
+#     gradient[np.isnan(gradient)] = 0
+#
+#     return gradient * mask
+
 
 
 if __name__ == "__main__":

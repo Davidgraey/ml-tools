@@ -53,36 +53,45 @@ class RopeEmbedding(Layer):
 
     def forward(self, input_data: NDArray) -> NDArray:
         self.input = input_data.copy()
+
         if input_data.ndim < 3:
             seq_len, embedding_dim = input_data.shape
+            _sin = self.pos_sine[:seq_len]
+            _cos = self.pos_cosine[:seq_len]
+
+            y_even = input_data[:, 0::2] * _cos - input_data[:, 1::2] * _sin
+            y_odd = input_data[:, 0::2] * _sin + input_data[:, 1::2] * _cos
+
+            self.output = np.zeros_like(input_data)
+            self.output[:, 0::2] = y_even
+            self.output[:, 1::2] = y_odd
+
         else:
             batch, seq_len, embedding_dim = input_data.shape
+            _sin = self.pos_sine[:seq_len]
+            _cos = self.pos_cosine[:seq_len]
+
+            y_even = input_data[:, :, 0::2] * _cos - input_data[:, :, 1::2] * _sin
+            y_odd = input_data[:, :, 0::2] * _sin + input_data[:, :, 1::2] * _cos
+
+            self.output = np.zeros_like(input_data)
+            self.output[:, :, 0::2] = y_even
+            self.output[:, :, 1::2] = y_odd
 
         assert seq_len <= self.sequence_length
         assert embedding_dim == self.embedding_dimension
-
-        _sin = self.pos_sine[:seq_len]
-        _cos = self.pos_cosine[:seq_len]
-
-        y_even = input_data[:, 0::2] * _cos - input_data[:, 1::2] * _sin
-        y_odd = input_data[:, 0::2] * _sin + input_data[:, 1::2] * _cos
-
-        self.output = np.zeros_like(input_data)
-        self.output[:, 0::2] = y_even
-        self.output[:, 1::2] = y_odd
 
         return self.output
 
     def backward(self, incoming_gradient):
         # inverse the rotation --
-        if incoming_gradient.ndim < 3:
+        if incoming_gradient.ndim == 2:
             seq_len, embedding_dim = incoming_gradient.shape
-            _sin = self.pos_sine[:seq_len, :]
-            _cos = self.pos_cosine[:seq_len, :]
         else:
-            _, seq_len, embedding_dim = incoming_gradient.shape
-            _sin = self.pos_sine[None, :seq_len, :]
-            _cos = self.pos_cosine[None, :seq_len, :]
+            batch, seq_len, embedding_dim = incoming_gradient.shape
+
+        _sin = self.pos_sine[:seq_len, :]
+        _cos = self.pos_cosine[:seq_len, :]
 
         even_position = incoming_gradient[..., 0::2]
         odd_position  = incoming_gradient[..., 1::2]
@@ -92,8 +101,8 @@ class RopeEmbedding(Layer):
 
         # self.gradient = np.ones_like(incoming_gradient)
         self.gradient = np.zeros_like(incoming_gradient)
-        self.gradient[:, 0::2] = dx_even
-        self.gradient[:, 1::2] = dx_odd
+        self.gradient[..., 0::2] = dx_even
+        self.gradient[..., 1::2] = dx_odd
 
         return self.gradient
 

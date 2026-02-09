@@ -79,7 +79,7 @@ print(f"Each {window_ms} ms window will be composed of {samples_per_window} samp
 
 # now we take windows --
 windowed_data = rolling_windows_nd(
-    data=waveform_l,
+    data=waveform_r,
     window_size=samples_per_window,
     num_overlap=samples_per_window // 3,
     axis=0,
@@ -155,7 +155,7 @@ real_positive_fft_shape = (samples_per_window // 2) + 1
 
 # project dimensions down to half - this should be enough to keep our calculations
 # limited without losing too much grainularity in the data.
-LATENT_DIMENSION = int(real_positive_fft_shape * 0.75)
+LATENT_DIMENSION = int(real_positive_fft_shape * 0.5)
 
 
 # AMPLITUDE ------------------------------------------------------------------
