@@ -10,10 +10,11 @@ from ml_tools.models.layers.layers import (
 
 EPSILON = 1e-15
 
+
 class FourierAttention(Layer):
-    def __init__(self, ni: int, no: int, use_2d: bool = True):
+    def __init__(self, ni: int, no: int, use_2d: bool = False):
         super().__init__()
-        self.fftlayer = FourierLayer(use_2d)
+        self.fftlayer = FourierLayer(use_2d, fft_axis=1)
         self.norm_a = NormalizeLayer(ni=ni, shift_scale=False)
         self.fc = FullyConnectedLayer(ni=ni, no=no, activation_type="relu")
         self.norm_b = NormalizeLayer(ni=no, shift_scale=True)
@@ -50,6 +51,7 @@ class FourierAttention(Layer):
         grad = grad + grad_skip_a
 
         self.gradient = grad
+
         return grad
 
     def __call__(self, x_data: NDArray):
@@ -61,7 +63,11 @@ class FourierAttention(Layer):
         self.norm_b.purge()
 
     def get_weights(self) -> tuple[NDArray]:
-        return (self.norm_a.get_weights(), self.fc.get_weights(), self.norm_b.weights())
+        return (
+            self.norm_a.get_weights(),
+            self.fc.get_weights(),
+            self.norm_b.weights()
+        )
 
     def get_gradients(self) -> dict[str, NDArray] | None:
         return {
@@ -123,17 +129,20 @@ class SpectreAttention(Layer):
         input_data: (batch, sequence, hidden)
         """
         self.input = input_data
+        num_samples, self.num_windows, num_steps = input_data.shape
 
         # projections
         query_forward = self.fc_query(input_data)
         value_forward = self.fc_values(input_data)
 
         # FFT along SEQUENCE axis
-        value_transform = np.fft.rfft(value_forward, axis=1)
+        value_transform = np.fft.rfft(value_forward, n=self.sequence_length, axis=1, norm="ortho")
 
         # norm over the sequence axis
         seq_mu = np.mean(query_forward, axis=1)
-        global_descriptor = (seq_mu - np.mean(seq_mu)) / (np.std(seq_mu) + EPSILON)
+        _mu = np.mean(seq_mu, axis=-1, keepdims=True)
+        _std = np.std(seq_mu, axis=-1, keepdims=True)
+        global_descriptor = (seq_mu - _mu) / (_std + EPSILON)
 
         # forward pass through weights to create the "complex gate"
         gate_raw = self.fc_2(self.fc_1(global_descriptor))
@@ -142,6 +151,7 @@ class SpectreAttention(Layer):
         self.gate_raw = g_real + 1j * g_imag
 
         #mod-Relu for complex numbers
+
         self.gate = self.activation(self.gate_raw, self.activation_bias)
 
         # positional phase in the frequency domains
@@ -153,44 +163,41 @@ class SpectreAttention(Layer):
         self.values_gated = value_transform * self.gate[..., None]
 
         # invert the fourier transform
-        self.output = np.fft.irfft(self.values_gated, n=self.sequence_length, axis=1)  / self.sequence_length
+        self.output = np.fft.irfft(self.values_gated, n=self.sequence_length, axis=1, norm="ortho")[:, :self.num_windows, :]
         return self.output
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         # invert the output transform to put us back in frequency domain
-        B, S, D = incoming_gradient.shape
+        batch_size, sequence_length, hidden_dim = incoming_gradient.shape
 
         # ---- inverse FFT backward ----
-        dvalues_gated = np.fft.rfft(incoming_gradient, axis=1)  / self.sequence_length
+        dvalues_gated = np.fft.rfft(incoming_gradient, axis=1, n=self.sequence_length, norm="ortho")
 
-        # ---- spectral gating backward ----
-        V_hat = np.fft.rfft(self.fc_values.output.reshape(self.fc_values.in_shape), axis=1)
+        # spectral gating backward
+        v_hat = np.fft.rfft(self.fc_values.output.reshape(self.fc_values.in_shape), axis=1, n=self.sequence_length, norm="ortho")
 
-        dV_hat = dvalues_gated * self.gate[:, :, None]
-        dgate = np.sum(dvalues_gated * np.conj(V_hat), axis=2)
+        dv_hat = dvalues_gated * np.conj(self.gate)[..., None]
+        dgate = np.sum(dvalues_gated * np.conj(v_hat), axis=2)
 
-        # ---- positional phase backward ----
+        # positional phase backward
         phase = np.exp(1j * 2 * np.pi * self.freq_idx / self.sequence_length)
         dgate_pre = dgate * np.conj(phase)[None, :]
 
-
-        # ---- modReLU backward ----
+        # mod_relu backward
         self.grad_bias, dg_complex = self.activation_derivative(
-            self.gate, self.activation_bias, dgate_pre
+            self.gate_raw, self.activation_bias, dgate_pre
         )
 
-        # ---- complex → real split ----
+        # ---- complex and real split ----
         dg_real = dg_complex.real
         dg_imag = dg_complex.imag
         dg_raw = np.concatenate([dg_real, dg_imag], axis=-1)
 
-        # ---- fc_2 backward ----
+        # Fully connected
         dh = self.fc_2.backward(dg_raw)
-
-        # ---- fc_1 backward ----
         dglobal_descriptor = self.fc_1.backward(dh)
 
-        # ---- layer norm backward (manual LN) ----
+        # normalize
         seq_mu = np.mean(self.fc_query.output.reshape(self.fc_query.in_shape), axis=1)
         mu = np.mean(seq_mu, axis=-1, keepdims=True)
         std = np.std(seq_mu, axis=-1, keepdims=True) + EPSILON
@@ -204,13 +211,12 @@ class SpectreAttention(Layer):
         )
 
         # distribute mean-gradient across sequence
-        dq = np.repeat(dseq_mu[:, None, :], S, axis=1) / S
+        dq = np.repeat(dseq_mu[:, None, :], sequence_length, axis=1) / sequence_length
 
         # ---- propagate into fc layers ----
-        # TODO: we have a shape mismatch when we try to pass this back--
         dinput_from_q = self.fc_query.backward(dq)
 
-        dv_time = np.fft.irfft(dV_hat, n=self.sequence_length, axis=1)
+        dv_time = np.fft.irfft(dv_hat, n=self.sequence_length, axis=1, norm="ortho")[:, :self.num_windows, :]
         dinput_from_v = self.fc_values.backward(dv_time)
 
         # ---- combine input gradients ----
@@ -257,6 +263,112 @@ class SpectreAttention(Layer):
 
 
 
+class LatentSpectralAttention(SpectreAttention):
+    def __init__(self,
+                 d_model=128 * 128,
+                 sequence_length=512,
+                 num_heads=128,
+                 q_latent_dim=12,
+                 kv_latent_dim=4):
+        """
+        LoRA Latent attention and Spectral mixing along sequences
+        Dimension reprojection in Sequence dimension using Spectral mixing
+        Dimension reprojection in latent / hidden dimension with LoRA
+
+        Parameters
+        ----------
+        d_model :
+        num_heads :
+        q_latent_dim :
+        kv_latent_dim :
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.q_latent_dim = q_latent_dim
+        self.kv_latent_dim = kv_latent_dim
+        self.head_dim = d_model // num_heads
+        self.sequence_length = sequence_length
+
+
+        self.frequency_layer = SpectreLayer()
+
+        self.Wq_d = FullyConnectedLayer(d_model, q_latent_dim, "linear")
+        self.Wkv_d = FullyConnectedLayer(d_model, kv_latent_dim, "linear")
+
+        # TODO: just started this - Spectre has Query and Value weights
+        # Query
+        self.Wq_d = nn.Linear(d_model, q_latent_dim)
+
+        # Precomputed matrix multiplications of W_q^U and W_k^U, for multiple heads
+        self.W_qk = nn.Linear(q_latent_dim, num_heads * kv_latent_dim)
+        # Key/Value latent projections
+        self.Wkv_d = nn.Linear(d_model, kv_latent_dim)
+        self.Wv_u = nn.Linear(kv_latent_dim, num_heads * head_dim)
+        # Output projection
+        self.Wo = nn.Linear(num_heads * head_dim, d_model)
+
+
+    def forward(self, input_data: NDArray) -> NDArray:
+        batch_size, seq_len, d_model = x.shape
+
+        query_forward = self.fc_query(input_data)
+        value_forward = self.fc_values(input_data)
+
+        # FFT along SEQUENCE axis
+        value_transform = np.fft.rfft(value_forward, axis=1)
+
+        # norm over the sequence axis
+        seq_mu = np.mean(query_forward, axis=1)
+        global_descriptor = (seq_mu - np.mean(seq_mu)) / (np.std(seq_mu) + EPSILON)
+
+        # forward pass through weights to create the "complex gate"
+        gate_raw = self.fc_2(self.fc_1(global_descriptor))
+
+        g_real, g_imag = np.split(gate_raw, 2, axis=-1)
+        self.gate_raw = g_real + 1j * g_imag
+
+        # mod-Relu for complex numbers
+        self.gate = self.activation(self.gate_raw, self.activation_bias)
+
+        # positional phase in the frequency domains
+        phase = np.exp(1j * 2 * np.pi * self.freq_idx / self.sequence_length)
+        self.gate *= phase[None, :]
+
+        # diagonal spectral gating
+        # self.values_gated = value_transform * self.gate[:, :]
+        self.values_gated = value_transform * self.gate[..., None]
+
+        # invert the fourier transform
+        self.output = (
+            np.fft.irfft(self.values_gated, n=self.sequence_length, axis=1)
+            / self.sequence_length
+        )
+
+
+
+        # --------------------------------------------------------------------
+        # Attention score, shape: (batch_size, num_heads, seq_len, seq_len)
+        C_qW_qk = self.W_qk(C_q).view(
+            batch_size, seq_len, self.num_heads, self.kv_latent_dim
+        )
+        scores = torch.matmul(
+            C_qW_qk.transpose(1, 2), C_kv.transpose(-2, -1)[:, None, ...]
+        ) / math.sqrt(self.kv_latent_dim)
+
+        # Attention computation
+        attn_weight = torch.softmax(scores, dim=-1)
+        # Restore V from latent space
+        V = self.Wv_u(C_kv).view(batch_size, seq_len, self.num_heads, -1)
+        # Compute attention output, shape: (batch_size, seq_len, num_heads, head_dim)
+        output = (
+            torch.matmul(attn_weight, V.transpose(1, 2)).transpose(1, 2).contiguous()
+        )
+        # Concatentate the heads, then apply output projection
+        output = self.Wo(output.view(batch_size, seq_len, -1))
+        return output
+
+
 if __name__ == "__main__":
     from ml_tools.models.optimizers import SGD
     from ml_tools.models.model_loss import MSELoss
@@ -265,6 +377,8 @@ if __name__ == "__main__":
         make_multifreq_dataset,
         make_phase_mix_dataset
     )
+
+
 
 
     # x, y = make_phase_mix_dataset(50, 128, 3, 11)
@@ -301,12 +415,12 @@ if __name__ == "__main__":
 
     x, y = make_multifreq_dataset(batch_size=16, seq_len=seq_len, hidden_dim=hidden_dim)
     loss = MSELoss()
-    optimizer = SGD(2e-4)
+    optimizer = SGD(0.25)
     all_loss = []
 
     model = SpectreAttention(sequence_length=seq_len, hidden_dim=hidden_dim)
 
-    for _ in range(500):
+    for _ in range(1000):
         out = model.forward(x)
         _l = loss.forward(out, y)
 
