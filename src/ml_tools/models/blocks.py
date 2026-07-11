@@ -121,6 +121,9 @@ class SpectreAttention(Layer):
         self.fc_1 = FullyConnectedLayer(ni=self.hidden_dim, no=self.hidden_dim, activation_type="relu")
         self.fc_2 = FullyConnectedLayer(ni=self.hidden_dim, no=2*self.num_frequencies, activation_type="linear")
 
+        # LayerNorm on global descriptor (paper Section 3.2, Step 3a: q_bar = LN(1/n * sum_i q_i))
+        self.layer_norm_q = NormalizeLayer(ni=self.hidden_dim, shift_scale=True)
+
         self.activation: callable = mod_relu
         self.activation_derivative: callable =  mod_relu_derivative
 
@@ -138,11 +141,10 @@ class SpectreAttention(Layer):
         # FFT along SEQUENCE axis
         value_transform = np.fft.rfft(value_forward, n=self.sequence_length, axis=1, norm="ortho")
 
-        # norm over the sequence axis
+        # global descriptor: mean over sequence, then LayerNorm with learnable gamma/beta
+        # paper Section 3.2, Step 3a: q_bar = LN(1/n * sum_i q_i)
         seq_mu = np.mean(query_forward, axis=1)
-        _mu = np.mean(seq_mu, axis=-1, keepdims=True)
-        _std = np.std(seq_mu, axis=-1, keepdims=True)
-        global_descriptor = (seq_mu - _mu) / (_std + EPSILON)
+        global_descriptor = self.layer_norm_q(seq_mu)
 
         # forward pass through weights to create the "complex gate"
         gate_raw = self.fc_2(self.fc_1(global_descriptor))
@@ -150,16 +152,11 @@ class SpectreAttention(Layer):
         g_real, g_imag = np.split(gate_raw, 2, axis=-1)
         self.gate_raw = g_real + 1j * g_imag
 
-        #mod-Relu for complex numbers
-
+        # mod-ReLU for complex numbers
         self.gate = self.activation(self.gate_raw, self.activation_bias)
 
-        # positional phase in the frequency domains
-        phase = np.exp(1j * 2 * np.pi * self.freq_idx / self.sequence_length)
-        self.gate *= phase[None, :]
-
         # diagonal spectral gating
-        # self.values_gated = value_transform * self.gate[:, :]
+        # NOTE: positional phase e^{j2πkt/N} is decode-only (Algorithm 1 DECODESTEP); omitted for batch training
         self.values_gated = value_transform * self.gate[..., None]
 
         # invert the fourier transform
@@ -177,15 +174,11 @@ class SpectreAttention(Layer):
         v_hat = np.fft.rfft(self.fc_values.output.reshape(self.fc_values.in_shape), axis=1, n=self.sequence_length, norm="ortho")
 
         dv_hat = dvalues_gated * np.conj(self.gate)[..., None]
-        dgate = np.sum(dvalues_gated * np.conj(v_hat), axis=2)
+        dgate = np.sum(dvalues_gated * np.conj(v_hat), axis=2) / hidden_dim
 
-        # positional phase backward
-        phase = np.exp(1j * 2 * np.pi * self.freq_idx / self.sequence_length)
-        dgate_pre = dgate * np.conj(phase)[None, :]
-
-        # mod_relu backward
+        # mod_relu backward (no positional phase in batch training)
         self.grad_bias, dg_complex = self.activation_derivative(
-            self.gate_raw, self.activation_bias, dgate_pre
+            self.gate_raw, self.activation_bias, dgate
         )
 
         # ---- complex and real split ----
@@ -197,18 +190,8 @@ class SpectreAttention(Layer):
         dh = self.fc_2.backward(dg_raw)
         dglobal_descriptor = self.fc_1.backward(dh)
 
-        # normalize
-        seq_mu = np.mean(self.fc_query.output.reshape(self.fc_query.in_shape), axis=1)
-        mu = np.mean(seq_mu, axis=-1, keepdims=True)
-        std = np.std(seq_mu, axis=-1, keepdims=True) + EPSILON
-
-        dseq_mu = (
-            dglobal_descriptor / std
-            - np.mean(dglobal_descriptor, axis=-1, keepdims=True) / std
-            - (seq_mu - mu)
-            * np.mean(dglobal_descriptor * (seq_mu - mu), axis=-1, keepdims=True)
-            / (std**3)
-        )
+        # LayerNorm backward (learnable gamma/beta handled inside NormalizeLayer)
+        dseq_mu = self.layer_norm_q.backward(dglobal_descriptor)
 
         # distribute mean-gradient across sequence
         dq = np.repeat(dseq_mu[:, None, :], sequence_length, axis=1) / sequence_length
@@ -229,10 +212,11 @@ class SpectreAttention(Layer):
             "fc_values": self.fc_values.get_gradients(),
             "fc_1": self.fc_1.get_gradients(),
             "fc_2": self.fc_2.get_gradients(),
+            "layer_norm_q": self.layer_norm_q.get_gradients(),
         }
 
     def purge(self) -> None:
-        pass
+        self.layer_norm_q.purge()
 
     def zero_gradients(self):
         pass
@@ -240,11 +224,13 @@ class SpectreAttention(Layer):
     @property
     def num_parameters(self) -> int:
         return (
-            self.grad_bias.size +
+            self.activation_bias.size
             + self.fc_query.num_parameters
             + self.fc_values.num_parameters
             + self.fc_1.num_parameters
             + self.fc_2.num_parameters
+            + self.layer_norm_q.scale_gamma.size
+            + self.layer_norm_q.shift_beta.size
         )
 
     def update_weights(
@@ -254,12 +240,14 @@ class SpectreAttention(Layer):
             fc_values: dict[str, NDArray],
             fc_1: dict[str, NDArray],
             fc_2: dict[str, NDArray],
+            layer_norm_q: dict[str, NDArray],
     ) -> None:
         self.activation_bias -= grad_bias
         self.fc_query.update_weights(**fc_query)
         self.fc_values.update_weights(**fc_values)
         self.fc_1.update_weights(**fc_1)
         self.fc_2.update_weights(**fc_2)
+        self.layer_norm_q.update_weights(**layer_norm_q)
 
 
 
@@ -370,71 +358,97 @@ class LatentSpectralAttention(SpectreAttention):
 
 
 if __name__ == "__main__":
+    # -----------------------------------------------------------------------
+    # Diagnostic training loop for SpectreAttention.
+    #
+    # Task  : identity mapping  y = x  on multi-frequency sine waves.
+    # Dims  : kept small (batch=4, seq=16, hidden=16) so one pass is fast and
+    #         gradient overflows are immediately visible.
+    # Checks: gradient NaN / Inf detection, weight-update magnitudes, and
+    #         whether the loss strictly decreases over 1 000 steps.
+    # -----------------------------------------------------------------------
     from ml_tools.models.optimizers import SGD
     from ml_tools.models.model_loss import MSELoss
-    import matplotlib.pyplot as plt
-    from ml_tools.generators.periodic_signal_gen import (
-        make_multifreq_dataset,
-        make_phase_mix_dataset
-    )
 
+    np.random.seed(42)
 
+    BATCH  = 4
+    SEQ    = 16
+    HIDDEN = 16
+    # MSELoss now divides by all elements (BATCH*SEQ*HIDDEN = 1024), making
+    # per-element gradients ~256x smaller than before.  Compensate here.
+    LR     = 0.5
+    STEPS  = 1000
 
+    # Build a fixed dataset: x[b, t, d] = sin(freq[d]*t + phase[b,d])
+    rng    = np.random.RandomState(0)
+    t_axis = np.linspace(0, 2 * np.pi, SEQ, endpoint=False)
+    freqs  = np.arange(1, HIDDEN + 1, dtype=float)
+    phases = rng.uniform(0, 2 * np.pi, (BATCH, HIDDEN))
+    x = np.sin(
+        freqs[None, None, :] * t_axis[None, :, None] + phases[:, None, :]
+    ).astype(np.float32)
+    y = x.copy()   # identity target
 
-    # x, y = make_phase_mix_dataset(50, 128, 3, 11)
-    # loss = MSELoss()
-    # optimizer = SGD(2e-4)
-    #
-    # attn = FourierAttention(ni=128, no=128, use_2d=True)
-    # # attn2 = FourierAttention(ni=512, no=512, use_2d=True)
-    # # attn3 = FourierAttention(ni=512, no=512, use_2d=True)
-    #
-    # all_loss = []
-    # for _ in range(5000):
-    #     out = attn.forward(x)
-    #     # out = attn3(attn2(attn(x)))
-    #     _l = loss.forward(out, y)
-    #     if _ % 10 == 0:
-    #         print(_l.item())
-    #     all_loss.append(_l.item())
-    #     grad = loss.backward()
-    #     # attn.backward(attn2.backward(attn3.backward(grad)))
-    #     # optimizer.step([attn, attn2, attn3])
-    #     attn.backward(grad)
-    #     optimizer.step([attn])
-    #
-    # plt.plot(all_loss)
-    # plt.show()
+    model   = SpectreAttention(sequence_length=SEQ, hidden_dim=HIDDEN)
+    loss_fn = MSELoss()
+    opt     = SGD(LR)
 
-    import matplotlib.pyplot as plt
+    # ---- helper: largest absolute gradient across weight tensors -----------
+    def _max_grad(grads_dict, key):
+        v = grads_dict.get(key)
+        if isinstance(v, dict):
+            vals = [arr for arr in v.values() if arr is not None]
+            return float(np.max([np.max(np.abs(a)) for a in vals])) if vals else float("nan")
+        return float(np.max(np.abs(v))) if v is not None else float("nan")
 
-    np.random.seed(0)
+    def _has_nan_or_inf(grads_dict):
+        for v in grads_dict.values():
+            if isinstance(v, dict):
+                for arr in v.values():
+                    if arr is not None and (np.any(np.isnan(arr)) or np.any(np.isinf(arr))):
+                        return True
+            elif v is not None:
+                if np.any(np.isnan(v)) or np.any(np.isinf(v)):
+                    return True
+        return False
 
-    seq_len = 64
-    hidden_dim = 128
+    # ---- training loop -----------------------------------------------------
+    print(f"{'step':>6}  {'loss':>10}  {'|gW_q|':>8}  {'|gW_v|':>8}  {'|g_bias|':>9}  status")
+    print("-" * 62)
 
-    x, y = make_multifreq_dataset(batch_size=16, seq_len=seq_len, hidden_dim=hidden_dim)
-    loss = MSELoss()
-    optimizer = SGD(0.25)
-    all_loss = []
+    losses = []
+    stop   = False
+    for step in range(STEPS + 1):
+        out  = model.forward(x)
+        loss = loss_fn.forward(out, y)
+        losses.append(float(loss))
 
-    model = SpectreAttention(sequence_length=seq_len, hidden_dim=hidden_dim)
+        grad_out = loss_fn.backward()
+        model.backward(grad_out)
 
-    for _ in range(1000):
-        out = model.forward(x)
-        _l = loss.forward(out, y)
+        if step % 100 == 0 or stop:
+            g    = model.get_gradients()
+            gq   = _max_grad(g, "fc_query")
+            gv   = _max_grad(g, "fc_values")
+            gb   = _max_grad(g, "grad_bias")
+            bad  = _has_nan_or_inf(g)
+            div  = len(losses) > 1 and losses[-1] > losses[0] * 100
+            status = "NaN/Inf" if bad else ("diverging" if div else "ok")
+            print(f"{step:>6}  {loss:>10.6f}  {gq:>8.5f}  {gv:>8.5f}  {gb:>9.6f}  {status}")
+            if bad:
+                print("  → stopping: numerical error detected.")
+                stop = True
 
-        if _ % 50 == 0:
-            print(_l.item())
-            plt.plot(y[0, :, 0], label="target")
-            plt.plot(out[0, :, 0], label="spectre")
-            plt.legend()
-            plt.show()
-        all_loss.append(_l.item())
-        grad = loss.backward()
+        if stop or step == STEPS:
+            break
 
-        _g = model.backward(grad)
-        optimizer.step([model])
+        opt.step([model])
 
-    plt.plot(all_loss)
-    plt.show()
+    # ---- summary -----------------------------------------------------------
+    ratio = losses[-1] / (losses[0] + 1e-30)
+    print()
+    print(f"Initial loss : {losses[0]:.6f}")
+    print(f"Final loss   : {losses[-1]:.6f}")
+    print(f"Ratio        : {ratio:.4f}  (target < 0.50)")
+    print(f"Converged    : {ratio < 0.50}")

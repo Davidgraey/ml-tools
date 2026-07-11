@@ -114,7 +114,7 @@ class PLSOM(BasalModel):
             # may need to scale down bound further!
             bound = np.sqrt(2 / self.N_DIMS)
             # all our values will be between 0 and 1 for categorical data
-            return np.random.uniform(
+            return self.RNG.uniform(
                 low=0, high=bound, size=(self.n_neurons, self.N_DIMS)
             )
 
@@ -123,13 +123,13 @@ class PLSOM(BasalModel):
             for dim in range(self.N_DIMS):
                 low = np.min(x, axis=0)[dim]
                 high = np.max(x, axis=0)[dim]
-                weights[:, dim] = np.random.uniform(
+                weights[:, dim] = self.RNG.uniform(
                     low=low, high=high, size=(self.n_neurons)
                 )
             return weights
 
         else:
-            return np.random.uniform(
+            return self.RNG.uniform(
                 low=-0.1, high=0.1, size=(self.n_neurons, self.N_DIMS)
             )
 
@@ -164,11 +164,7 @@ class PLSOM(BasalModel):
         for step in range(num_iterations):
             self.RNG.shuffle(_x)
             # Decay our maximum value of THETA slightly - To  keep the full grid from being pulled back and forth by outliers
-            self.THETAMAX = (
-                self.THETAMAX * 0.98
-                if self.THETAMAX > self.THETAMIN
-                else self.THETAMIN + 1
-            )
+            self.THETAMAX = max(self.THETAMAX * 0.98, self.THETAMIN)
 
             bmu_i, bmu_dist = self.calc_bmu(_x[0])
             self.previous_step_r = bmu_dist[bmu_i]
@@ -192,22 +188,33 @@ class PLSOM(BasalModel):
                 self.weights += weight_update
                 self.hit_map[bmu_i] += 1
 
+                # Hook for subclass per-sample logic (e.g. distortion tracking)
+                self._on_sample_update(bmu_i, sample_distances)
+
                 # update error trace
                 error_trace.append(np.mean(sample_distances))
                 epsilon_trace.append(epsilon)
 
-                # if (self.verbose or verbose) and (sample_i % 10 == 0):
-                #     self.plot_neighborhood(epsilon * (neighborhood.reshape(self.n_neurons, -1)))
-
             self.q_error_trace.append(np.mean(error_trace))
             self.epsilon_trace.append(np.mean(epsilon_trace))
 
+            # Hook for subclass per-epoch logic (e.g. topology adaptation)
+            self._on_epoch_end(step, num_iterations)
+
         if self.verbose or verbose:
-            self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
+            self.plot_grid(samples=0, highlight_idx=int(np.argmin(self.hit_map)))
             plt.plot(self.q_error_trace)
             plt.plot(self.epsilon_trace)
             plt.legend(["q_error", "epsilon"])
             plt.show()
+
+    def _on_sample_update(self, bmu_i: int | NDArray, sample_distances: NDArray) -> None:
+        """Hook called after each sample update. Override in subclasses."""
+        pass
+
+    def _on_epoch_end(self, step: int, num_iterations: int) -> None:
+        """Hook called at the end of each epoch. Override in subclasses."""
+        pass
 
     def calc_bmu(self, x: NDArray) -> tuple[NDArray | int, NDArray]:
         """
@@ -301,7 +308,7 @@ class PLSOM(BasalModel):
         """
         numpy function takes 1d vector index to 2d [r,c] grid.
         """
-        r = idx // self.network_shape[0]
+        r = idx // self.network_shape[1]
         c = idx % self.network_shape[1]
         return (int(r), int(c))
 
@@ -309,7 +316,7 @@ class PLSOM(BasalModel):
         """
         numpy - takes grid index [r,c] converts to 1d index
         """
-        return int(grid_i[1] + (grid_i[0] * self.network_shape[0]))
+        return int(grid_i[1] + (grid_i[0] * self.network_shape[1]))
 
     @staticmethod
     def grid_manhattan_distance(
@@ -494,7 +501,7 @@ if __name__ == "__main__":
     max_clusters = 10
 
     for dim in [10]:
-        num_steps = dim * 5
+        num_steps = dim * 10
         st = time.time()
 
         som = PLSOM(

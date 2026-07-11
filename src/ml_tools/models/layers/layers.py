@@ -10,8 +10,8 @@ EPSILON = 1e-14
 GLOBAL_DTYPE = np.float32
 
 
-# -------------    weight initilization functions    ---------------
-# ------------------------------------------------------------------
+# -------------  weight initilization functions ---------------
+# -------------------------------------------------------------
 def xavier(rng, ni: int, no: int) -> NDArray:
     return rng.normal(loc=0.0, scale=1 / np.sqrt(ni), size=(ni, no)).astype(
         dtype=GLOBAL_DTYPE
@@ -37,11 +37,59 @@ weight_init = {
 }
 
 
+"""
+def __call__(self, x):
+
+    parent = None
+
+    if isinstance(x, Signal):
+        parent = x.producer
+        x = x.data
+
+    y = self.forward(x)
+
+    node = None
+
+    if Network.ACTIVE is not None:
+
+        node = GradFlow(
+            layer=self,
+            inputs=x,
+            output=y
+        )
+
+        if parent is not None:
+            node.upstream.append(parent)
+            parent.downstream.append(node)
+
+        Network.ACTIVE.register(node)
+
+    return Signal(
+        data=y,
+        producer=node
+    )
+
+"""
+
 # ------------------------------------------------------------------
 class Layer(ABC):
     def __init__(self):
         super().__init__()
         self.RNG = np.random.RandomState(42)
+
+        self.upstream = []
+        self.downstream = []
+        self.pending_grads = []
+
+    def connect_downstream(self, layer: Layer) -> None:
+
+        self.downstream.append(layer)
+        layer.upstream.append(self)
+
+    def connect_upstream(self, layer: Layer) -> None:
+
+        self.upstream.append(layer)
+        layer.upstream.append(self)
 
     @abstractmethod
     def forward(self, x: NDArray) -> NDArray:
@@ -72,6 +120,7 @@ class Layer(ABC):
     @property
     def num_parameters(self) -> int:
         pass
+
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
@@ -165,9 +214,9 @@ class FullyConnectedLayer(Layer):
             this_derivative: Callable = activations.activation_dictionary[
                 forced_activation
             ]
-        norm_factor = incoming_grad.shape[0] + EPSILON
         # reshape to 2D in case (batch, sequence, hidden)
         _grad = incoming_grad.reshape(-1, incoming_grad.shape[-1])
+        norm_factor = _grad.shape[0] + EPSILON
 
         delta = _grad * this_derivative(self.output, self.z)
 
@@ -206,6 +255,7 @@ class FullyConnectedLayer(Layer):
         self.z = None
         self.gradient_weights = None
         self.gradient_bias = None
+        self.pending_grads = []
 
     def get_weights(self):
         return np.concatenate([self.bias, self.weights.ravel()])
@@ -307,6 +357,37 @@ class DropoutLayer(Layer):
         return self.__str__()
 
 
+class RMSNormalizeLayer(Layer):
+    def __init__(self, ni: int):
+        super().__init__()
+        self.ni = ni
+        self.gamma = np.ones(ni)
+        pass
+
+    def forward(self, incoming_x: NDArray):
+        self.in_shape = incoming_x.shape
+
+        self.rms = np.sqrt(np.mean(incoming_x ** 2, axis=-1, keepdims=True) + EPSILON)
+        self.x_norm = incoming_x / self.rms
+        self.output = self.x_norm * self.gamma
+
+        return self.output
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+
+
+        delta_grad = np.sum(incoming_grad * self.x_norm, axis=0)
+
+        gamma_grad = incoming_grad * self.gamma
+
+        gamma_grad = (
+             self.x_norm * np.mean(gamma_grad * self.x_norm, axis=-1, keepdims=True)
+                     ) / self.rms
+
+        return dx, dgamma
+
+
+
 # numpy-ml ref:
 # https://github.com/ddbourgin/numpy-ml/blob/master/numpy_ml/neural_nets/layers/layers.py#L1634-L1803
 class NormalizeLayer(Layer):
@@ -317,8 +398,11 @@ class NormalizeLayer(Layer):
         self.eps = eps
 
         if shift_scale:
-            self.scale_gamma = np.ones((1, ni)) * .01
-            self.shift_beta = np.ones((1, ni)) * .01
+            # Standard LayerNorm init: identity transform (γ=1, β=0).
+            # Starting at γ=0.01 crushes the signal to near-zero, which kills
+            # gate_raw magnitude and puts all mod_relu gates into the dead zone.
+            self.scale_gamma = np.ones((1, ni))
+            self.shift_beta  = np.zeros((1, ni))
         else:
             self.gamma = None
             self.beta = None
@@ -397,7 +481,7 @@ class NormalizeLayer(Layer):
 class FrequencyFFT(Layer):
     def __init__(self, max_sequence_length: int, window_size: int):
         """
-        Seting up a process for FFT transformations of windows of audio data - expecting data of 1 size batch,
+        Seting up a process for FFT transformations of windows of audio data
         Preprocessing assumed: sliding windows or patches.
         shape -> (number_of_windows, samples per window)
 
@@ -428,7 +512,7 @@ class FrequencyFFT(Layer):
         assert self.in_shape[0] <= self.max_sequence_length, f"Shapes don't match in {self}"
         assert self.in_shape[-1] <= self.window_size, f"Shapes don't match in {self}"
 
-        self.input = incoming_x.reshape(-1, self.in_shape[-1])
+        self.input = incoming_x.reshape(-1, self.in_shape[1])
 
         incoming_x = self.window_kernel * incoming_x
         self.output = np.fft.rfft(incoming_x, axis=-1).real
@@ -438,7 +522,7 @@ class FrequencyFFT(Layer):
     def backward(self, incoming_grad: NDArray) -> NDArray:
 
         incoming_grad = incoming_grad.reshape(-1, incoming_grad.shape[-1])
-        incoming_grad = np.fft.irfft(incoming_grad, axis=-1).real / self.window_size
+        incoming_grad = np.fft.irfft(incoming_grad, axis=1).real / self.window_size
 
         # return incoming_grad
         grad = (incoming_grad * self.window_kernel)
@@ -467,14 +551,22 @@ class FrequencyFFT(Layer):
 
 class FourierLayer(Layer):
     #  https://ieeexplore.ieee.org/document/9616294
-    def __init__(self, use_2d:bool = True):
+    def __init__(self, use_2d:bool = True, fft_axis: int = -1):
+        """
+        #  https://ieeexplore.ieee.org/document/9616294
+        Transform the input data into frequency domain via Real-only domain FFT
+        Parameters
+        ----------
+        use_2d: bool - if use2D: Take the original FNet mechanism (applied across 2 dimensions, as with image processing -- this isn't the best way to do this.
+        fft_axis: int - target axis (likely the sequence length)
+        """
         super().__init__()
         self.use_2d = use_2d
 
         if use_2d == True:
             self.fft_axes = (-2, -1)
         else:
-            self.fft_axes = -1
+            self.fft_axes = fft_axis
 
     def forward(self, incoming_x: NDArray) -> NDArray:
         """ incoming_x """
@@ -522,8 +614,14 @@ class FourierLayer(Layer):
 
 
 class InverseFourierLayer(Layer):
-    # https://arxiv.org/pdf/2502.18394
     def __init__(self, use_2d:bool = True):
+        """
+        # https://arxiv.org/pdf/2502.18394
+        Convert Frequency-domain back to sequence / time domain.
+        Parameters
+        ----------
+        use_2d: bool - if we're doing the original FNet 2-D image-data-style
+        """
         super().__init__()
         self.use_2d = use_2d
 
@@ -581,8 +679,6 @@ class InverseFourierLayer(Layer):
 #
 # # ====== ==================================================================
 # # TODO: WIP below
-#
-#
 # class EmbeddingLayer(Layer):
 #     def __init__(
 #         self, ni: int, cardinality: int, embedding_dim: int, trainable: bool = True
@@ -676,7 +772,7 @@ if __name__ == "__main__":    ## working example -- train--- -- MOVE TO TESTS!
     fc5 = FullyConnectedLayer(ni=10, no=10, activation_type="relu_leaky", is_output=False)
     fc6 = FullyConnectedLayer(ni=10, no=1, activation_type="tanh", is_output=True)
     lossfc = MSELoss()
-    optimizer = SGD(0.002)
+    optimizer = SGD(0.25)
     all_losses = []
     y_regression = y_regression.reshape(-1, 1)
     nnet_layers = [fc, nc1, dp, fc2, nc2, fc3, fc4, fc5, fc6]

@@ -93,7 +93,13 @@ class CentroidNeuralNetwork(BasalModel):
     def split_clusters(self, xs, closest_centroids, num_centroids: int, split_target: int):
 
         cluster_xs = xs[closest_centroids == split_target]
-        cluster_mean = np.mean(cluster_xs)
+
+        # Guard: need at least 2 samples to compute covariance
+        if cluster_xs.shape[0] < 2:
+            noise = self.RNG.uniform(-self.epsilon, self.epsilon, size=cluster_xs.shape[-1])
+            return (cluster_xs[0] + noise, cluster_xs[0] - noise)
+
+        cluster_mean = np.mean(cluster_xs, axis=0)
         centered_xs = cluster_xs - cluster_mean
         cluster_covariance = np.cov(cluster_xs, rowvar=False)
 
@@ -311,17 +317,21 @@ class CentroidNeuralNetwork(BasalModel):
 
     def local_density(self, distances: NDArray, k_radius: int=10) -> NDArray:
         """
+        Estimate local density around each centroid using a KNN-based radius.
 
         Parameters
         ----------
-        x_data :
-        num_centroids :
-        k_radius :
+        distances : distance matrix (num_samples, num_centroids)
+        k_radius : number of nearest neighbors to consider
 
         Returns
         -------
-
+        density estimate per centroid
         """
+        # Clamp k_radius to available sample count
+        k_radius = min(k_radius, distances.shape[0] - 1)
+        k_radius = max(k_radius, 1)
+
         # take the mean distance of the closest-K points to centroid (KNN)
         kth_distance = np.mean(
             np.partition(distances, k_radius, axis=0)[:k_radius, :],
@@ -349,9 +359,10 @@ class CentroidNeuralNetwork(BasalModel):
         """
         if skip_standardize:
             self.skip_standardize = skip_standardize
+            xs = x_data
         else:
             xs = self.standardize(x_data)
-        for num_centroids in range(0, self.max_clusters):
+        for num_centroids in range(2, self.max_clusters + 1):
             closest_centroids, _ = self.forward(
                 x_data=xs,
                 num_centroids=num_centroids,
@@ -395,19 +406,37 @@ class CentroidNeuralNetwork(BasalModel):
                         self.centroids[cluster_idx].reshape(1, -1)
                     )
                 )
+                # weight by inverse density — sparser clusters get higher error
+                if hasattr(self, 'density') and self.density is not None:
+                    error[cluster_idx] *= (1.0 / (self.density[cluster_idx] + EPSILON))
             else:
                 error[cluster_idx] = 0
-
-                # include weighting by density - here density approaches 0 for denser clusters
-                error[cluster_idx] * (self.density + EPSILON)
         return error
 
     def get_optimal(self) -> tuple[int, NDArray, NDArray]:
         """
         Get the optimal number of clusters based on the metrics collected during fitting.
+        Falls back to computing silhouette scores if metrics were not populated (fast_forward=True).
         """
         if not self._is_fitted:
             raise RuntimeError("Model is not fitted yet. Call fit() first.")
+
+        # If all metrics are still at their default (0.0), compute them now
+        if all(v == 0.0 for v in self.metrics.values()):
+            for k, labels in self._label_tracker.items():
+                if k in self.metrics and k in self._centroid_tracker:
+                    # Need the original data — use centroid distances as a proxy
+                    # is not ideal but we don't store x_data; check if labels are valid
+                    n_unique = len(np.unique(labels))
+                    if n_unique >= 2:
+                        # Recompute assignments against stored centroids
+                        centroids = self._centroid_tracker[k]
+                        try:
+                            self.metrics[k] = silhouette_score(
+                                centroids[:k], labels[:centroids.shape[0]]
+                            )
+                        except (ValueError, IndexError):
+                            self.metrics[k] = -1.0
 
         best_scoring = max(self.metrics, key=self.metrics.get)
         if self.skip_standardize:

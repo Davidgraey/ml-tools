@@ -1,48 +1,41 @@
 import time
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
-from ml_tools.models.clustering.plsom_clustering import PLSOM
 from numpy.typing import NDArray
-from typing import Optional
 
-# Local Files
-from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork
+from ml_tools.models.clustering.plsom_clustering import PLSOM
 from ml_tools.visuals.cluster_visuals import plot_clusters
-
-import ml_tools.models.distances as plsom_distance
-
-DISTANCE_DICT = {
-    "euclidean": plsom_distance.euclidian_distance,
-    "manhattan": plsom_distance.manhattan_distance,
-    "hamming": plsom_distance.hamming_distance,
-    "cosine": plsom_distance.cosine_distance,
-}
 
 
 class GPLSOM(PLSOM):
     """
-    Growing and Shrinking Parameterless SOM
-    - Growth - triggered when nodes are poor performers
-        - if a high distortion node lies on an edge -> grow outward
-        - If it's an interior: grow between existing grid, distribute error to neighbors
-    - Shrinking / Pruning - triggered when BMU is low, excitation is low, and neighbor distances are small
+    Growing and Shrinking Parameterless SOM (GPLSOM)
 
-    https://arxiv.org/pdf/0705.0199
-    Unlike a traditional SOM, the PLSOM has minimal configurable hyperparameters.
-    ε(t)   = ||x(t) - w_c(t)||_2 / r(t)
-    r(0) = ||x(0)-w_c(0)||_2
-    r(t)   = max( ||x(t)-w_c(t)||_2, r(t-1) )
-    Θ(ε)   = neighborhood scale from ε via Eq. (9), (10), or (11)
-    h_ci   = exp( - d(i,c)^2 / Θ(ε)^2 )
-    Δw_i   = ε * h_ci * (x - w_i)
+    Extends the PLSOM with adaptive topology:
+    - **Growth**: triggered when a neuron has high quantization error (mean distance to
+      the samples it represents).  Boundary neurons spawn a new neighbor outward;
+      interior neurons spawn a new node between themselves and their highest-error
+      neighbor, with interpolated weights.
+    - **Shrinking / Pruning**: triggered when a neuron is rarely selected as BMU *and*
+      its weight vector is close to all of its grid neighbors (i.e. it is redundant).
 
+    The grid is represented as a flexible adjacency graph so that topology changes
+    do not require the map to stay rectangular.
 
-    The PLSOM algorithm works by adjusting the weights of the neurons to approximate the input data.  In this
-    process, we reduce the sample dimensionality by calculating which of the neurons ("primitives") is a best fit for a datapoint.
-    This accomplishes two goals: reduction in dimensionality (fewer samples) and pseudo-clustering (each neuron is a prototype for a set of samples).
-    The PLSOM's neurons can be easily clustered using a more traditional algorithm; leaving us with a
-    sample:pseudo-clustering:cluster membership chain.
+    Core PLSOM equations (unchanged):
+        ε(t)   = ||x(t) - w_c(t)||_2 / r(t)
+        r(0)   = ||x(0) - w_c(0)||_2
+        r(t)   = max( ||x(t)-w_c(t)||_2, r(t-1) )
+        Θ(ε)   = neighborhood scale from ε
+        h_ci   = exp( - d(i,c)^2 / Θ(ε)^2 )
+        Δw_i   = ε · h_ci · (x - w_i)
+
+    References
+    ----------
+    - PLSOM: https://arxiv.org/pdf/0705.0199
+    - Growing SOM / Neural Gas: Fritzke (1995)
     """
 
     def __init__(
@@ -53,351 +46,416 @@ class GPLSOM(PLSOM):
         theta_min=None,
         theta_max=None,
         lock_seed: int = 42,
-        distance="euclidean",
+        distance: str = "euclidean",
         verbose: bool = False,
+        # ---- growth / shrink knobs ----
+        growth_threshold: float = 0.85,
+        shrink_threshold: float = 0.02,
+        grow_every: int = 1,
+        min_neurons: int = 4,
+        max_neurons: int = 400,
     ):
         """
-        Create the Self Organizing Map  - rectangular / square grids
-
         Parameters
         ----------
-        width : for simplicity's sake, we make map of width x height neurons.
-        height : should be the same as width, number of neurons in h
-        input_dim : dimensionality of our input data (should be shape[-1]) -- this is the original number of features
-            that we'll be reprojecting through the SOM's dimensions
-        theta_min : smallest neighborhood value - set at 0
-        theta_max : Maximum neighborhood value - set at or close to width
-        lock_seed :int, give an int to lock numpy seed
-        distance :distance measure to use, can be 'euclidean', 'manhattan', 'cosine', 'hamming'
+        width, height : initial rectangular grid size
+        input_dim : feature dimensionality
+        growth_threshold : quantile of per-neuron distortion above which growth is
+            triggered (0-1, higher = more conservative).
+        shrink_threshold : fraction of mean hits below which a neuron is a candidate
+            for pruning (0-1, lower = more aggressive).
+        grow_every : apply grow/shrink logic every N epochs.
+        min_neurons : never shrink below this count.
+        max_neurons : never grow beyond this count.
         """
-        super().__init__(input_dimension=input_dim, output_dimension=width * height)
-
-        self.width = width
-        self.height = height
-        self.weights = None
-
-        self.N_DIMS = input_dim
-        self.VERBOSE = True
-
-        # variables that will need to be updated as we grow / shrink
-        self.network_shape = [height, width]
-        self.n_neurons = height * width
-        self.grid_distances = self.build_grid()
-
-    def fit(
-        self, x: NDArray, num_iterations: int, verbose: Optional[bool] = None
-    ) -> None:
-        # initalize our paramters, weights and standaridzaion trackers
-        _x = self.initalize_params(x)
-
-        for step in range(num_iterations):
-            self.RNG.shuffle(_x)
-            # Decay our maximum value of THETA slightly - To  keep the full grid from being pulled back and forth by outliers
-            self.THETAMAX = (
-                self.THETAMAX * 0.98
-                if self.THETAMAX > self.THETAMIN
-                else self.THETAMIN + 1
-            )
-
-            bmu_i, bmu_dist = self.calc_bmu(_x[0])
-            self.previous_step_r = bmu_dist[bmu_i]
-
-            error_trace = []
-            epsilon_trace = []
-
-            for sample_i in range(1, _x.shape[0]):
-                _xs = _x[sample_i : sample_i + 1, :]
-
-                bmu_i, sample_distances = self.calc_bmu(_xs)
-                epsilon = self.calc_epsilon(sample_distances[bmu_i])
-                theta = self.calc_theta(epsilon)
-                neighborhood = self.calc_neighborhood(theta, bmu_i)
-
-                # neighborhood is shape (n_samples, n_neurons, dimensions)
-                weight_update = epsilon * (
-                    neighborhood.reshape(self.n_neurons, -1) * (_xs - self.weights)
-                )
-
-                self.weights += weight_update
-                self.hit_map[bmu_i] += 1
-
-                # update error trace
-                error_trace.append(np.mean(sample_distances))
-                epsilon_trace.append(epsilon)
-
-                # if (self.verbose or verbose) and (sample_i % 10 == 0):
-                #     self.plot_neighborhood(epsilon * (neighborhood.reshape(self.n_neurons, -1)))
-
-            self.q_error_trace.append(np.mean(error_trace))
-            self.epsilon_trace.append(np.mean(epsilon_trace))
-
-        if self.verbose or verbose:
-            self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
-            plt.plot(self.q_error_trace)
-            plt.plot(self.epsilon_trace)
-            plt.legend(["q_error", "epsilon"])
-            plt.show()
-
-    def calc_bmu(self, x: NDArray) -> tuple[NDArray | int, NDArray]:
-        """
-        find the best matching unit to the input x
-
-        Parameters
-        ----------
-        x : input data
-
-        Returns
-        -------
-        BMU for each sample (shape batch_size, 1), distances to each neuron (shape batch_size, n_neurons)
-        """
-        dist = self.distance_function(x, self.weights)
-        bmu_i = np.argmin(dist, axis=-1)
-        return bmu_i, dist
-
-    def calc_epsilon(self, bmu_distance: NDArray) -> NDArray:
-        """
-        calculate epsilon -- value for the magnitude of the update - it's a value driven by the goodness-of-fit (how
-        close / far is this sample from its best matching unit, as a factor of the prior )
-
-        Parameters
-        ----------
-        bmu_distance : the distance array between the sample and its best matching unit
-
-        Returns
-        -------
-        the single-point value epsilon
-        """
-        self.previous_step_r = np.max((bmu_distance, self.previous_step_r), axis=0)
-        return bmu_distance / self.previous_step_r
-
-    def calc_theta(self, epsilon: float | NDArray) -> float | NDArray:
-        """
-        sets bounds on the reach of the neighborhood function
-        uses constants self.THETAMAX and self.THETAMIN - these are usually  set at 0, 1 or 2
-        Parameters
-        ----------
-        epsilon : the calculated epsilon value
-
-        Returns
-        -------
-        single-value theta for use in neighborhood
-        """
-        # Using the PLSOM epsilon scale
-        theta = max(self.THETAMAX * epsilon, self.THETAMIN)
-
-        return theta
-
-    def get_lateral_distance(self, bmu_i: int, method: str = "dist") -> NDArray:
-        """
-        applies the distance function to find distance between the bmu and all other neurons
-        Parameters
-        ----------
-        bmu_i : index of the best matching unit under consideration
-        method : 'grid' or 'dist' - use the precomputed grid distances (manhattan),
-            or calculate distance between the neurons' embedding dimensions
-
-        Returns
-        -------
-        distnace array between bmu and all other neurons
-        """
-        # return distance between this unit and all others - return should be n_neurons, n_dims
-        if method == "dist":
-            bmw = self.weights[bmu_i, :]
-            return self.distance_function(bmw, self.weights)
-
-        elif method == "grid":
-            return self.grid_distances[bmu_i, :] ** 2
-
-    def calc_neighborhood(self, theta: float | NDArray, bmu_i: int) -> NDArray:
-        """
-        This is the magic -- PLSOM defines the neighborhood function as an area of influence around a neuron that's
-        being updated. The neighborhood is defined as a Gaussian function (exp(-x**2) of the distance between the
-        active and the other neurons.
-
-        Parameters
-        ----------
-        theta : the derived bounds (see calc_theta)
-        bmu_i : the index of the best matching unit
-
-        Returns
-        -------
-        adjusted gaussian kernel applied to distances
-        """
-
-        return np.exp((-1 * self.get_lateral_distance(bmu_i, method="grid") / theta**2))
-
-    def _idx_to_grid(self, idx: int) -> tuple[int, int]:
-        """
-        numpy function takes 1d vector index to 2d [r,c] grid.
-        """
-        r = idx // self.network_shape[0]
-        c = idx % self.network_shape[1]
-        return (int(r), int(c))
-
-    def _grid_to_idx(self, grid_i: tuple[int, int]) -> int:
-        """
-        numpy - takes grid index [r,c] converts to 1d index
-        """
-        return int(grid_i[1] + (grid_i[0] * self.network_shape[0]))
-
-    @staticmethod
-    def grid_manhattan_distance(
-        row_a: int, col_a: int, row_b: int, col_b: int
-    ) -> float:
-        """returns the cityblock / manhattan dist between two grid points"""
-        return abs(row_a - row_b) + abs(col_a - col_b)
-
-    def build_grid(self, method: str = "grid") -> NDArray:
-        """
-        Build the manhattan distance grid for the SOM, it will contain the distances from each unit, to each other unit
-        :return: np.array, (shape n_neurons, n_neurons)
-        """
-        rows = self.network_shape[0]
-        cols = self.network_shape[1]
-        distance_matrix = np.zeros((self.n_neurons, self.n_neurons))
-
-        for idx in range(self.n_neurons):
-            home_row, home_col = self._idx_to_grid(idx)
-            for row in range(rows):
-                for col in range(cols):
-                    if method == "grid":
-                        distance_matrix[idx, self._grid_to_idx((row, col))] = (
-                            self.grid_manhattan_distance(home_row, home_col, row, col)
-                        )
-                    elif method == "distance":
-                        distance_matrix[idx, self._grid_to_idx((row, col))] = (
-                            self.distance_function(
-                                self.weights[self._idx_to_grid((row, col))],
-                            )
-                        )
-
-        return distance_matrix
-
-    def plot_grid(self, samples=0, highlight_idx=None):
-        """utility function to plot the first two dimensions of the grid of weights"""
-        ws = self.weights.reshape(
-            self.network_shape[0], self.network_shape[1], self.N_DIMS
+        super().__init__(
+            width=width,
+            height=height,
+            input_dim=input_dim,
+            theta_min=theta_min,
+            theta_max=theta_max,
+            lock_seed=lock_seed,
+            distance=distance,
+            verbose=verbose,
         )
-        # Draw lines between each 2d weight vector in grid
-        plt.figure(figsize=(15, 10))
-        plt.title("PLSOM Grid")
-        if samples != 0:
-            plt.scatter(samples[:, 0], samples[:, 1])
-        for row in range(self.network_shape[0]):
-            plt.plot(ws[row, :, 0], ws[row, :, 1], "bo-")
-        for col in range(self.network_shape[1]):
-            plt.plot(ws[:, col, 0], ws[:, col, 1], "bo-")
-        if highlight_idx:
-            focus = self._idx_to_grid(highlight_idx)
-            plt.scatter(
-                ws[focus[0], focus[1], 0], ws[focus[0], focus[1], 1], s=200.0, c="r"
-            )
-        plt.show()
 
-    def plot_neighborhood(self, neighborhood):
-        """utility function to plot the neighborhood, "gravity" or sphere of influence around the bmu"""
-        # shape the weights into the 2D grid representation
-        ns = neighborhood.reshape(self.network_shape[0], self.network_shape[1])
-        # Draw lines between each 2d weight vector in grid
-        plt.figure(figsize=(10, 10))
-        plt.title("PLSOM neighborhood")
-        for row in range(self.network_shape[0]):
-            for col in range(self.network_shape[1]):
-                plt.scatter(row, col, s=ns[row, col] * 1000)
+        # Growth / shrink configuration
+        self.growth_threshold = growth_threshold
+        self.shrink_threshold = shrink_threshold
+        self.grow_every = grow_every
+        self.min_neurons = min_neurons
+        self.max_neurons = max_neurons
+
+        # Per-neuron accumulated distortion (quantization error)
+        self.distortion_map = np.zeros(self.n_neurons)
+
+        # Adjacency graph: node_id -> set of neighbor node_ids
+        self.adjacency: dict[int, set[int]] = self._build_adjacency_from_grid()
+
+        # Track topology change history for diagnostics
+        self.topology_history: list[dict] = []
+
+    # ------------------------------------------------------------------
+    #  PLSOM hook overrides (called from super().fit)
+    # ------------------------------------------------------------------
+    def _on_sample_update(self, bmu_i: int | NDArray, sample_distances: NDArray) -> None:
+        """Accumulate per-neuron distortion for the BMU."""
+        self.distortion_map[bmu_i] += sample_distances[bmu_i]
+
+    def _on_epoch_end(self, step: int, num_iterations: int) -> None:
+        """Apply topology adaptation (grow/shrink) at configured intervals."""
+        if (step + 1) % self.grow_every == 0 and step < num_iterations - 1:
+            self.grow()
+            self.shrink()
+
+    # ------------------------------------------------------------------
+    #  Adjacency helpers
+    # ------------------------------------------------------------------
+    def _build_adjacency_from_grid(self) -> dict[int, set[int]]:
+        """Build an adjacency graph from the current rectangular grid."""
+        rows, cols = self.network_shape
+        adj: dict[int, set[int]] = {i: set() for i in range(self.n_neurons)}
+        for idx in range(self.n_neurons):
+            r, c = self._idx_to_grid(idx)
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    neighbor_idx = self._grid_to_idx((nr, nc))
+                    adj[idx].add(neighbor_idx)
+        return adj
+
+    def _rebuild_graph_distances(self) -> NDArray:
+        """
+        Compute shortest-path (BFS) distances between all neurons using the
+        adjacency graph.  This replaces the rectangular manhattan-distance grid
+        and works for arbitrary topologies.
+        """
+        n = self.n_neurons
+        dist = np.full((n, n), np.inf)
+        np.fill_diagonal(dist, 0.0)
+
+        for source in range(n):
+            visited = {source}
+            frontier = [source]
+            d = 0
+            while frontier:
+                d += 1
+                next_frontier = []
+                for node in frontier:
+                    for neighbor in self.adjacency.get(node, set()):
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            dist[source, neighbor] = d
+                            next_frontier.append(neighbor)
+                frontier = next_frontier
+        return dist
+
+    def _is_boundary_node(self, idx: int) -> bool:
+        """A node is on the boundary if it has fewer than 4 neighbors."""
+        return len(self.adjacency.get(idx, set())) < 4
+
+    def _get_neighbors(self, idx: int) -> list[int]:
+        """Return sorted list of neighbor indices for *idx*."""
+        return sorted(self.adjacency.get(idx, set()))
+
+    # ------------------------------------------------------------------
+    #  Topology mutations
+    # ------------------------------------------------------------------
+    def _add_neuron(self, new_weights: NDArray, connect_to: list[int]) -> int:
+        """
+        Insert a single neuron into the map.
+
+        Parameters
+        ----------
+        new_weights : weight vector for the new neuron (shape: input_dim,)
+        connect_to  : list of existing neuron indices to connect to
+
+        Returns
+        -------
+        The index of the newly created neuron.
+        """
+        new_idx = self.n_neurons
+
+        # Expand weight matrix
+        self.weights = np.vstack([self.weights, new_weights.reshape(1, -1)])
+
+        # Expand tracking arrays
+        self.hit_map = np.append(self.hit_map, 0.0)
+        self.distortion_map = np.append(self.distortion_map, 0.0)
+
+        # Update counts
+        self.n_neurons += 1
+
+        # Update adjacency
+        self.adjacency[new_idx] = set(connect_to)
+        for neighbor in connect_to:
+            self.adjacency[neighbor].add(new_idx)
+
+        return new_idx
+
+    def _remove_neuron(self, idx: int) -> None:
+        """
+        Remove a single neuron from the map.  Neighbors of the removed node
+        are *not* reconnected to each other (the gap is simply closed).
+        """
+        if self.n_neurons <= self.min_neurons:
+            return
+
+        # Disconnect from neighbors
+        for neighbor in list(self.adjacency.get(idx, set())):
+            self.adjacency[neighbor].discard(idx)
+        del self.adjacency[idx]
+
+        # Delete from weight matrix & tracking arrays
+        self.weights = np.delete(self.weights, idx, axis=0)
+        self.hit_map = np.delete(self.hit_map, idx)
+        self.distortion_map = np.delete(self.distortion_map, idx)
+        self.n_neurons -= 1
+
+        # Re-index everything above `idx` (shift down by 1)
+        new_adj: dict[int, set[int]] = {}
+        for old_key, old_neighbors in self.adjacency.items():
+            new_key = old_key if old_key < idx else old_key - 1
+            new_neighbors = set()
+            for n in old_neighbors:
+                new_neighbors.add(n if n < idx else n - 1)
+            new_adj[new_key] = new_neighbors
+        self.adjacency = new_adj
+
+    def _rebuild_after_topology_change(self) -> None:
+        """rebuild grid distances and update network_shape after a topology change."""
+        self.grid_distances = self._rebuild_graph_distances()
+
+        # network_shape is kept for compatibility but is now approximate
+        side = int(np.ceil(np.sqrt(self.n_neurons)))
+        self.network_shape = [side, int(np.ceil(self.n_neurons / side))]
+
+    #  Growth logic
+    def grow(self) -> int:
+        """
+        evaluate every neuron's distortion and grow where needed.
+
+        Growth strategy:
+        - mean distortion per neuron (accumulated error / hits).
+        - neurons above the ``growth_threshold`` quantile are candidates.
+        - **Boundary** candidate: spawn a new neuron *outward*, with weights
+          extrapolated from the candidate and the mean of its neighbors.
+        - **Interior** candidate: spawn a new neuron *between* the candidate and
+          its highest-distortion neighbor, with interpolated weights.
+
+        Returns
+        -------
+        Number of neurons added.
+        """
+        if self.n_neurons >= self.max_neurons:
+            return 0
+
+        # Snapshot the original neuron count — mean_distortion is only valid for
+        # indices [0, n_original).  Neurons added during this loop must not be
+        # looked up in this array.
+        n_original = self.n_neurons
+
+        # Mean distortion per neuron (avoid /0)
+        active_mask = self.hit_map[:n_original] > 0
+        mean_distortion = np.zeros(n_original)
+        mean_distortion[active_mask] = (
+            self.distortion_map[:n_original][active_mask]
+            / self.hit_map[:n_original][active_mask]
+        )
+
+        if mean_distortion.max() == 0:
+            return 0
+
+        threshold = np.quantile(mean_distortion[active_mask], self.growth_threshold)
+        candidates = np.where(mean_distortion >= threshold)[0]
+
+        added = 0
+        for cand in candidates:
+            if self.n_neurons >= self.max_neurons:
+                break
+
+            # Only consider original-topology neighbors (filter out any newly added)
+            neighbors = [n for n in self._get_neighbors(cand) if n < n_original]
+            if len(neighbors) == 0:
+                continue
+
+            neighbor_weights = self.weights[neighbors]
+            neighbor_mean = np.mean(neighbor_weights, axis=0)
+
+            if self._is_boundary_node(cand):
+                # Extrapolate outward: new = candidate + (candidate - neighbor_mean)
+                new_w = self.weights[cand] + 0.5 * (self.weights[cand] - neighbor_mean)
+                self._add_neuron(new_w, connect_to=[cand])
+            else:
+                # Interior: insert between candidate and its worst neighbor
+                neighbor_distortions = mean_distortion[neighbors]
+                worst_neighbor = neighbors[int(np.argmax(neighbor_distortions))]
+                new_w = 0.5 * (self.weights[cand] + self.weights[worst_neighbor])
+                # Connect to both the candidate and the worst neighbor
+                self._add_neuron(new_w, connect_to=[cand, worst_neighbor])
+                # Break direct edge between cand <-> worst_neighbor
+                # to keep the graph planar (the new node sits "between" them)
+                self.adjacency[cand].discard(worst_neighbor)
+                self.adjacency[worst_neighbor].discard(cand)
+
+            added += 1
+
+        if added > 0:
+            self._rebuild_after_topology_change()
+            self.topology_history.append(
+                {"epoch": len(self.q_error_trace), "action": "grow", "count": added,
+                 "n_neurons": self.n_neurons}
+            )
+            if self.verbose:
+                print(f"[GPLSOM] Grew {added} neuron(s) → {self.n_neurons} total")
+
+        return added
+
+    # ------------------------------------------------------------------
+    #  Shrink logic
+    # ------------------------------------------------------------------
+    def shrink(self) -> int:
+        """
+        Remove redundant neurons.
+
+        A neuron is pruned when:
+        1. Its hit count is below ``shrink_threshold × mean(hit_map)``  (rarely used).
+        2. Its weight vector is close to all neighbors (redundant representation).
+
+        Returns
+        -------
+        Number of neurons removed.
+        """
+        if self.n_neurons <= self.min_neurons:
+            return 0
+
+        mean_hits = np.mean(self.hit_map) if np.sum(self.hit_map) > 0 else 1.0
+        hit_threshold = self.shrink_threshold * mean_hits
+
+        # Compute per-neuron redundancy: mean weight-space distance to neighbors
+        redundancy = np.full(self.n_neurons, np.inf)
+        for idx in range(self.n_neurons):
+            neighbors = self._get_neighbors(idx)
+            if len(neighbors) == 0:
+                continue
+            neighbor_weights = self.weights[neighbors]
+            dists = self.distance_function(
+                self.weights[idx].reshape(1, -1), neighbor_weights
+            )
+            redundancy[idx] = np.mean(dists)
+
+        # median neighbor distance as a scale reference
+        finite_mask = np.isfinite(redundancy)
+        if not np.any(finite_mask):
+            return 0
+        redundancy_threshold = np.median(redundancy[finite_mask]) * 0.33
+
+        # Candidates: low hits AND close to neighbors
+        candidates = np.where(
+            (self.hit_map <= hit_threshold) & (redundancy <= redundancy_threshold)
+        )[0]
+
+        # Sort by hits ascending so we remove the least-used first
+        candidates = candidates[np.argsort(self.hit_map[candidates])]
+
+        removed = 0
+        # Remove one at a time (indices shift after each removal)
+        for cand in candidates:
+            if self.n_neurons <= self.min_neurons:
+                break
+            # Re-check after prior removals may have shifted things
+            if cand >= self.n_neurons:
+                continue
+
+            # Before removing, reconnect its neighbors to each other so the graph
+            # doesn't fragment
+            neighbors = self._get_neighbors(cand)
+            for i, ni in enumerate(neighbors):
+                for nj in neighbors[i + 1:]:
+                    self.adjacency[ni].add(nj)
+                    self.adjacency[nj].add(ni)
+
+            self._remove_neuron(cand)
+            removed += 1
+            # After removal, all indices >= cand shifted down; adjust remaining candidates
+            candidates = np.where(candidates > cand, candidates - 1, candidates)
+
+        if removed > 0:
+            self._rebuild_after_topology_change()
+            self.topology_history.append(
+                {"epoch": len(self.q_error_trace), "action": "shrink", "count": removed,
+                 "n_neurons": self.n_neurons}
+            )
+            if self.verbose:
+                print(f"[GPLSOM] Pruned {removed} neuron(s) → {self.n_neurons} total")
+
+        return removed
+
+    # ------------------------------------------------------------------
+    #  Visualization (overrides to support non-rectangular topology)
+    # ------------------------------------------------------------------
+    def plot_grid(self, samples=0, highlight_idx=None):
+        """Plot neuron positions (first 2 weight dims) with adjacency edges."""
+        if self.weights.shape[1] < 2:
+            return
+
+        plt.figure(figsize=(15, 10))
+        plt.title(f"GPLSOM Grid ({self.n_neurons} neurons)")
+
+        if not isinstance(samples, int):
+            plt.scatter(samples[:, 0], samples[:, 1], alpha=0.2, s=5)
+
+        # Draw edges from adjacency
+        drawn = set()
+        for idx, neighbors in self.adjacency.items():
+            for n in neighbors:
+                edge = (min(idx, n), max(idx, n))
+                if edge not in drawn:
+                    drawn.add(edge)
+                    plt.plot(
+                        [self.weights[idx, 0], self.weights[n, 0]],
+                        [self.weights[idx, 1], self.weights[n, 1]],
+                        "b-", alpha=0.4, linewidth=0.8,
+                    )
+
+        plt.scatter(self.weights[:, 0], self.weights[:, 1], c="blue", s=30, zorder=5)
+
+        if highlight_idx is not None and highlight_idx < self.n_neurons:
+            plt.scatter(
+                self.weights[highlight_idx, 0],
+                self.weights[highlight_idx, 1],
+                s=200, c="red", zorder=6,
+            )
         plt.show()
 
     def plot_heatmap(self):
-        """utilty function to draw the hit map as aa heat map"""
-        plt.figure(figsize=(10, 10))
-        plt.title("PLSOM Heatmap")
-        self.hit_map.reshape(self.network_shape)
-        plt.imshow(
-            self.hit_map.reshape(self.network_shape),
-            cmap="hot",
-            interpolation="nearest",
-        )
+        """Draw the hit map as a bar chart (topology may not be rectangular)."""
+        plt.figure(figsize=(12, 4))
+        plt.title("GPLSOM Hit Map")
+        plt.bar(range(self.n_neurons), self.hit_map)
+        plt.xlabel("Neuron index")
+        plt.ylabel("Hits")
         plt.show()
 
-    def forward(self, x_data: NDArray) -> tuple[NDArray, NDArray]:
-        idxs, dist = self.calc_bmu(x_data[:, np.newaxis, :])
-        return idxs, dist
+    def plot_topology_history(self):
+        """Visualise the growth/shrink events over training."""
+        if not self.topology_history:
+            print("No topology changes recorded.")
+            return
+        epochs = [e["epoch"] for e in self.topology_history]
+        sizes = [e["n_neurons"] for e in self.topology_history]
+        colors = ["green" if e["action"] == "grow" else "red" for e in self.topology_history]
+        plt.figure(figsize=(10, 4))
+        plt.title("GPLSOM Topology Changes")
+        plt.scatter(epochs, sizes, c=colors, s=40)
+        plt.plot(epochs, sizes, "k--", alpha=0.3)
+        plt.xlabel("Epoch")
+        plt.ylabel("Neuron count")
+        plt.show()
 
-    def calculate_loss(self, **kwargs):
-        pass
-
-    def predict(self, x: NDArray, n_clusters: int, verbose: bool = False) -> NDArray:
-        """
-        Using a dedicated clustering method to predict classes of samples based on the SOM's re-projected
-        representation
-        We use the clustering method on the SOM's weights, rather than on the dataset directly
-        """
-        # determine which protoype (SOM neuron) is closest to each sample
-        _x = self.standardize(x)
-
-        idxs, dist = self.forward(_x)
-        # grid_idxs = np.array(
-        #     [self._idx_to_grid(_i) for _i in idxs]
-        # )
-        print(idxs)
-
-        if verbose or self.verbose:
-            print(f"Weights: {self.weights.shape}")
-            self.plot_heatmap()
-
-        self.clust_model = CentroidNeuralNetwork(
-            max_clusters=n_clusters, seed=42, initial_clusters=None, epsilon=1e-4
-        )
-
-        _, _ = self.clust_model.fit_predict(
-            org_x_data=self.weights,
-            num_iterations=100,
-            fast_forward=False,
-            verbose=False,
-            skip_standardize=True,
-        )
-
-        best_scoring, centroids, labels = self.clust_model.get_optimal()
-        print(f"Optimal Clusters at {best_scoring}")
-
-        # assign each sample to its closest SOM neuron / prototype (idxs), then assign that neuron to its cluster (
-        # labels)
-        x_labels = np.take_along_axis(labels, idxs, axis=0)
-
-        if verbose or self.verbose:
-            plot_clusters(self.weights, labels, centroids)
-            plot_clusters(x, x_labels)
-
-        return x_labels
-
-    def fit_predict(
-        self,
-        x_data: NDArray,
-        grid_dim: int,
-        num_iterations: int,
-        max_clusters: int,
-        verbose: Optional[bool] = None,
-    ):
-        """
-
-        Parameters
-        ----------
-
-        Returns
-        -------
-
-        """
-        start = time.time()
-        self.fit(x_data, num_iterations)
-
-        prediction = self.predict(x=x_data, n_clusters=max_clusters, verbose=True)
-
-        print("plsom_fit_predict took", time.time() - start)
-
-        if self.verbose or verbose:
-            self.plot_grid(samples=0, highlight_idx=None)
-            plot_clusters(x_data, prediction)
-
-        return prediction
+    # ------------------------------------------------------------------
+    #  Forward / predict / fit_predict — all inherited from PLSOM
+    # ------------------------------------------------------------------
 
     @property
     def params(self):
@@ -422,19 +480,24 @@ if __name__ == "__main__":
 
     max_clusters = 10
 
-    for dim in [10]:
-        num_steps = dim * 5
+    for dim in [6]:
+        num_steps = dim * 8
         st = time.time()
 
-        som = PLSOM(
+        som = GPLSOM(
             width=dim,
             height=dim,
             input_dim=feature_dim,
-            theta_min=0 + 0.01,
+            theta_min=0.01,
             theta_max=dim - 0.01,
             lock_seed=42,
             distance="euclidean",
             verbose=True,
+            growth_threshold=0.80,
+            shrink_threshold=0.05,
+            grow_every=2,
+            min_neurons=4,
+            max_neurons=200,
         )
 
         predictions = som.fit_predict(
@@ -445,15 +508,18 @@ if __name__ == "__main__":
             verbose=True,
         )
 
-        print("one_cluster predict took: ", time.time() - st)
+        print("GPLSOM predict took: ", time.time() - st)
+        print(f"Final neuron count: {som.n_neurons}")
+        print(f"Topology events: {len(som.topology_history)}")
+
+        som.plot_topology_history()
 
         print("Predictions:", predictions[:20])
         print("Truth:", y_clust[:20])
-        print(homogeneity(predictions, y_clust))
 
         print(f"silhouette score (1 is best): {silhouette_score(x_clust, predictions)}")
         print(f"CH index (high): {calinski_harabasz_index(x_clust, predictions)}")
         print(f"DB index score (low): {davies_bouldin_index(x_clust, predictions)}")
 
-        print(f"homogenity: {homogeneity(y_clust, predictions)}")
+        print(f"homogeneity: {homogeneity(y_clust, predictions)}")
         print(f"Mutual Information: {mutual_information_score(y_clust, predictions)}")

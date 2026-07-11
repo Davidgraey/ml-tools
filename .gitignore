@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+data/*
 
 # C extensions
 *.so
@@ -36,6 +37,8 @@ MANIFEST
 
 # Installer logs
 pip-log.txt
+*.egg-info
+*.log
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports

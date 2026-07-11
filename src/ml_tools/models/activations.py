@@ -120,6 +120,7 @@ def relu_leaky(x: NDArray, alpha=0.1) -> NDArray:
     """
     return np.where(x > 0, x, alpha * x)
 
+
 @activation
 def mod_relu(x: NDArray, bias: float = -0.2) -> NDArray:
     """
@@ -153,12 +154,14 @@ def sigmoid_derivative(gradient: NDArray, x: Optional[NDArray]=None) -> NDArray:
 @derivative
 def relu_derivative(gradient: NDArray, x: Optional[NDArray]) -> NDArray:
     """**********ARGUMENTS**********
-    :param x: incoming values in numpy array
+    :param gradient: post-activation output (relu output, always >= 0)
+    :param x: pre-activation value (z = W @ input + b)
     **********RETURNS**********
-    :return: evaluation (single val for input_sample (row) of x)
+    :return: 1 where the neuron was active, 0 where it was dead
     """
-    grad_prime = copy.copy(gradient)
-    return np.where(grad_prime < 0, 0, 1)
+    # gradient (relu output) > 0  iff  pre-activation x > 0
+    # using > 0 correctly gates dead neurons (output == 0 means neuron was off)
+    return np.where(gradient > 0, 1.0, 0.0)
 
 
 @derivative
@@ -187,8 +190,7 @@ def tanh_derivative(gradient: NDArray, x: Optional[NDArray]) -> NDArray:
 @derivative
 def swish_derivative(gradient: NDArray, x: Optional[NDArray]) -> NDArray:
     """
-     f(y) = y + σ(x) * (1-y)
-     # f'(x) = σ(x) + x * σ(x)(1 - σ(x))
+    # f'x = sig(x) + x * (sig(x)(1 - sig(x))
     Parameters
     ----------
     x :
@@ -197,7 +199,6 @@ def swish_derivative(gradient: NDArray, x: Optional[NDArray]) -> NDArray:
     -------
 
     """
-    # TODO: fix this --
 
     return gradient + x * sigmoid_derivative(gradient)
 
@@ -232,31 +233,21 @@ def softmax_derivative(gradient: NDArray, x: Optional[NDArray]) -> NDArray:
 
 
 @derivative
-def mod_relu_derivative(z, beta, dout, eps=1e-8):
-    r = np.abs(z)
+def mod_relu_derivative(gradient, beta, d_out, eps=1e-8):
+    r = np.abs(gradient)
     r_safe = r + eps
     mask = (r + beta) > 0
 
     scale = (r + beta) / r_safe
-    proj = np.real(dout * np.conj(z)) / r_safe
+    proj = np.real(d_out * np.conj(gradient)) / r_safe
 
-    d_bias = proj.sum(axis=0)
-    d_z = mask * (dout * scale + z * proj * (-beta / r_safe**2))
+    # Bias gradient must flow even through dead neurons (straight-through estimator).
+    # Without this, a fully-dead gate can never escape: d_bias would be zero,
+    # activation_bias would never update, and training is permanently stuck at
+    # loss = mean(y^2) with zero output.
+    d_bias = proj.mean(axis=0)
+    d_z = mask * (d_out * scale + gradient * proj * (-beta / r_safe**2))
     return d_bias, d_z
-# def mod_relu_derivative(gradient: NDArray, bias: float = -0.2) -> NDArray:
-#     """
-#      modrelu = z / |z| * max(|z| +b, 0)
-#     """
-#     magnitude = np.abs(gradient)
-#     mask = (magnitude + bias) > 0
-#
-#     with np.errstate(divide='ignore', invalid='ignore'):
-#         gradient = mask * (gradient / magnitude)
-#
-#     gradient[np.isnan(gradient)] = 0
-#
-#     return gradient * mask
-
 
 
 if __name__ == "__main__":
