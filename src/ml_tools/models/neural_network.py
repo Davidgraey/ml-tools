@@ -64,19 +64,13 @@ class Node:
         self.sources = sources
         self.consumers: list["Node"] = []
 
-        # a source reports whatever it was told to expect. Everything else asks
-        # its layer, since only the layer knows whether its output width is
-        # fixed or derived from what arrives. First output only: a layer with
-        # several is read positionally by its consumers, which this does not
-        # model, and claiming a shape there would be worse than claiming none.
         if layer is None:
             self.out_shape = shape
         else:
             incoming = tuple(source.out_shape for source in sources)
             self.out_shape = layer.infer_output_shapes(incoming)[0]
 
-        # dropout and friends take a training flag. Ask once, here, rather than
-        # inspecting the signature on every forward pass.
+        # Check once here instead of inspecting the signature on every forward pass.
         self.accepts_training = bool(layer) and (
             "training_now" in inspect.signature(layer.forward).parameters
         )
@@ -108,27 +102,19 @@ class NeuralNetwork:
     """
     A directed acyclic graph of layers.
 
-    Wire it by passing nodes::
+    connect the DAG by passing nodes:
 
         net = NeuralNetwork()
         audio = net.input
+        # fanning out to multiple outputs
         amp = net.connect(amplitude_fc, audio)
-        freq = net.connect(frequency_fft, audio)      # audio reused: a fan-out
+        freq = net.connect(frequency_fft, audio)
         merged = net.connect(LatentStack(), amp, freq)
         net.output = net.connect(head, merged)
 
-    Or sequentially, when there is nothing to branch::
+    or sequentially, when there is nothing to branch::
 
         net = NeuralNetwork([layer_a, layer_b, layer_c])
-
-    Or as a subclass, where assigning a Layer to an attribute registers it, so
-    the optimizer can be handed `net.layers` rather than a list kept by hand::
-
-        class Encoder(NeuralNetwork):
-            def __init__(self):
-                super().__init__()
-                self.projection = FullyConnectedLayer(8, 8, "relu")
-                self.output = self.connect(self.projection, self.input)
     """
 
     def __init__(
@@ -164,11 +150,10 @@ class NeuralNetwork:
         if layers is not None:
             self.extend(layers)
 
-    # -------------    connecting    --------------------------------
-    # ---------------------------------------------------------------
+    # ------------- connecting
     @property
     def input(self) -> Node:
-        """the graph's source node. Pass it as a source to the first layer."""
+        """ the graph's source node; pass it as an input source to the first layer """
         return self._input
 
     def connect(
@@ -207,7 +192,7 @@ class NeuralNetwork:
                     f"source {source.name!r} belongs to a different network"
                 )
 
-        self._check_arity(layer, len(sources))
+        self._check_output_shapes(layer, len(sources))
         self._check_shapes(layer, sources)
 
         label = name or self._auto_name(layer)
@@ -221,7 +206,7 @@ class NeuralNetwork:
         object.__setattr__(self, "_output", node)
         return node
 
-    def _check_arity(self, layer: Layer, given: int) -> None:
+    def _check_output_shapes(self, layer: Layer, given: int) -> None:
         """
         Compare the source count against the layer's forward signature, so a
         merge given the wrong number of inputs fails here rather than as a
@@ -278,7 +263,7 @@ class NeuralNetwork:
         return f"{stem}_{index}"
 
     def extend(self, layers: Iterable[Layer]) -> Node:
-        """chain layers end to end, each fed by the one before"""
+        """ chain layers end to end """
         node = self._output or self._input
         for layer in layers:
             node = self.connect(layer, node)
@@ -291,7 +276,7 @@ class NeuralNetwork:
         inputs: str | Node | Iterable = "input",
     ) -> str:
         """
-        Name-based wiring, kept so existing graphs keep working.
+        name-based wiring, kept so existing graphs keep working.
 
         Resolves each name to a node and delegates to connect. Prefer connect:
         a name is matched at wiring time, so a typo that happens to hit another
@@ -302,12 +287,12 @@ class NeuralNetwork:
             (inputs,) if isinstance(inputs, (str, Node)) else tuple(inputs)
         )
         sources = tuple(
-            source if isinstance(source, Node) else self.node(source)
+            source if isinstance(source, Node) else self.get_node(source)
             for source in requested
         )
         return self.connect(layer, *sources, name=name).name
 
-    def node(self, name: str) -> Node:
+    def get_node(self, name: str) -> Node:
         """fetch a node by label"""
         for node in self._nodes:
             if node.name == name:
@@ -315,8 +300,7 @@ class NeuralNetwork:
         known = [node.name for node in self._nodes]
         raise KeyError(f"no node named {name!r}. Known nodes: {known}")
 
-    # -------------    the output    --------------------------------
-    # ---------------------------------------------------------------
+    # ------------- the output
     @property
     def output(self) -> Node:
         if self._output is None:
@@ -326,19 +310,18 @@ class NeuralNetwork:
     @output.setter
     def output(self, node: Node) -> None:
         if not isinstance(node, Node):
-            raise TypeError("the output must be a Node returned by connect()")
+            raise TypeError("the output must be a Node() returned by connect()")
         if not any(known is node for known in self._nodes):
             raise ValueError(f"node {node.name!r} belongs to a different network")
         object.__setattr__(self, "_output", node)
 
     def set_output(self, node: Node | str) -> None:
         """as the output property, accepting a name for convenience"""
-        self.output = self.node(node) if isinstance(node, str) else node
+        self.output = self.get_node(node) if isinstance(node, str) else node
 
-    # -------------    registration    ------------------------------
-    # ---------------------------------------------------------------
+    # ------------- registration
     def __setattr__(self, attribute: str, value):
-        """assigning a Layer registers it, so no bookkeeping list is needed"""
+        """ assigning a Layer registers it directly """
         if isinstance(value, Layer):
             self._remember(value)
         elif isinstance(value, NeuralNetwork) and value is not self:
@@ -350,17 +333,10 @@ class NeuralNetwork:
         if not any(known is layer for known in self._registered):
             self._registered.append(layer)
 
-    # -------------    the passes    --------------------------------
-    # ---------------------------------------------------------------
+    # ------------- the passes
     def forward(self, x_data: NDArray) -> NDArray:
         """
-        Run the graph.
-
-        Insertion order is a valid topological order -- a node's sources had to
-        exist before it could reference them -- so this is a single walk with no
-        sort. Every node's output is cached, both because a fan-out reads one
-        value twice and because it is the first thing you want when a shape is
-        wrong.
+        forward pass -- taking the insertion order or navigating the node-to-node process
         """
         output = self.output
         values = {self._input: x_data}
@@ -383,17 +359,13 @@ class NeuralNetwork:
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         """
-        Push the gradient back through the graph.
-
-        Where a node fed several consumers its gradient is the sum of what they
-        each return, which is why this cannot be a list walked in reverse.
+        Navigate the gradient back through the graph
         """
         gradients = {self.output: incoming_gradient}
 
         for node in reversed(self._nodes):
             if node.is_source or node not in gradients:
-                # nothing downstream asked this node for anything, so it
-                # contributes nothing. Normal while a graph is half built.
+                # nothing downstream in the DAG
                 continue
 
             returned = node.layer.backward(gradients.pop(node))
@@ -416,8 +388,7 @@ class NeuralNetwork:
     def __call__(self, x_data: NDArray) -> NDArray:
         return self.forward(x_data)
 
-    # -------------    inspection    --------------------------------
-    # ---------------------------------------------------------------
+    # ------------- inspection
     def edges(self) -> list[tuple[str, str]]:
         """every (producer, consumer) pair, for tracing or rendering"""
         return [
@@ -428,11 +399,7 @@ class NeuralNetwork:
 
     def validate(self) -> list[str]:
         """
-        Report structural problems that are legal but almost certainly wrong.
-
-        Cycles are not among them: references only point backwards, so a cycle
-        cannot be constructed. What remains is nodes whose output goes nowhere,
-        which cost a forward pass and never receive a gradient.
+        Check for structural problem
         """
         problems = []
         output = self._output
@@ -457,17 +424,13 @@ class NeuralNetwork:
             )
         return problems
 
-    # -------------    modes and bookkeeping    ---------------------
-    # ---------------------------------------------------------------
-    def train(self) -> "NeuralNetwork":
+    def train(self) -> NeuralNetwork:
         object.__setattr__(self, "training", True)
         return self
 
-    def eval(self) -> "NeuralNetwork":
+    def eval(self) -> NeuralNetwork:
         """
-        Switch to inference. Worth being explicit about: DropoutLayer.forward
-        defaults training_now to True, so a network that never calls this runs
-        inference with dropout still active.
+        switch to inference -- changes training behavior and training-specific behaviors
         """
         object.__setattr__(self, "training", False)
         return self
@@ -480,16 +443,15 @@ class NeuralNetwork:
     @property
     def layers(self) -> list[Layer]:
         """
-        Every registered layer, graph order first. This is what an optimizer
-        wants: `optimizer.step(net.layers)`.
+        return every registered layer in graph order
         """
-        in_graph = [node.layer for node in self._nodes if not node.is_source]
+        graph_nodes = [node.layer for node in self._nodes if not node.is_source]
         extra = [
             layer
             for layer in self._registered
-            if not any(known is layer for known in in_graph)
+            if not any(known is layer for known in graph_nodes)
         ]
-        return in_graph + extra
+        return graph_nodes + extra
 
     @property
     def num_parameters(self) -> int:
@@ -511,11 +473,7 @@ class NeuralNetwork:
 
     def shapes(self) -> dict[str, dict[str, tuple]]:
         """
-        Every node's declared input and output shapes, keyed by node name.
-
-        The layer's own view plus what the graph resolved for it, which is the
-        pair to read when a wiring error is not obvious -- the resolved shape
-        says what the edge actually carries.
+        every node's declared input and output shapes, keyed by node name
         """
         return {
             node.name: {**node.layer.shapes, "resolved": node.out_shape}
@@ -525,9 +483,7 @@ class NeuralNetwork:
 
     def summary(self, x_data: Optional[NDArray] = None) -> str:
         """
-        A table of the graph. Passing sample data runs a forward pass first so
-        real output shapes can be shown, which is usually the question. Without
-        it the shape column falls back to the trailing axes each node declares.
+        Summary of the network -- shapshot view of the setup
         """
         if x_data is not None:
             self.forward(x_data)
