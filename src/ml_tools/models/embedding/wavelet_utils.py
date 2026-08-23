@@ -1,7 +1,7 @@
 import scipy.signal as sig
 from ml_tools.models.layers.layers import Layer
 import numpy as np
-from matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 '''
 https://arxiv.org/abs/2504.08801
 https://github.com/thqiu0419/MLWNet
@@ -96,45 +96,45 @@ def morlet(f, t, width):
 
 
 import time
-width = 75
-maxFreq = 20
-freqs = np.arange(0.5, maxFreq, 0.5) # makes same freqs used in stft above
-start = time.time()
-tfrep, tfrepPhase = cwt(data[:, 1:].T,  75,  freqs,  width)
-elapsed_time = time.time() - start
-print(f'CWT time: {elapsed_time} seconds')
-
-plt.figure(figsize=(10, 10))
-plt.subplot(5, 1, 1)
-plt.plot(data[:, 1:])
-plt.axis('tight')
-
-plt.subplot(5, 1, 2)
-plt.plot(data[:, 0])
-plt.text(5000, 8, '1-Rest, 2-Coloring, 3-Legos, 4-Wii Tennis, 5-Boxing, 6-0.75, 7-1.25 m/s, 8-1.75, 9-2.25 m/s, 10-stairs')
-plt.axis('tight')
-
-nSensors = data.shape[1] - 1
-for i in range(nSensors):
-    plt.subplot(5, 1, i+3)
-    plt.imshow(np.log(tfrep[i, :, :]),
-               interpolation='nearest', origin='lower',
-               cmap=plt.cm.jet) #plt.cm.Reds)
-    plt.xlabel('Seconds')
-    plt.ylabel('Frequency in ' + ('$x$', '$y$', '$z$')[i])
-    tickstep = round(len(freqs) / 5)
-    plt.yticks(np.arange(len(freqs))[::tickstep],
-                   [str(i) for i in freqs[::tickstep]])
-    plt.axis('auto')
-    plt.axis('tight')
-
-
-tfrep.shap
-
-X = tfrep.reshape((3 * 39, -1)).T
-X.shape, T.shape, len(np.unique(T))
-
-
+# width = 75
+# maxFreq = 20
+# freqs = np.arange(0.5, maxFreq, 0.5) # makes same freqs used in stft above
+# start = time.time()
+# tfrep, tfrepPhase = cwt(data[:, 1:].T,  75,  freqs,  width)
+# elapsed_time = time.time() - start
+# print(f'CWT time: {elapsed_time} seconds')
+#
+# plt.figure(figsize=(10, 10))
+# plt.subplot(5, 1, 1)
+# plt.plot(data[:, 1:])
+# plt.axis('tight')
+#
+# plt.subplot(5, 1, 2)
+# plt.plot(data[:, 0])
+# plt.text(5000, 8, '1-Rest, 2-Coloring, 3-Legos, 4-Wii Tennis, 5-Boxing, 6-0.75, 7-1.25 m/s, 8-1.75, 9-2.25 m/s, 10-stairs')
+# plt.axis('tight')
+#
+# nSensors = data.shape[1] - 1
+# for i in range(nSensors):
+#     plt.subplot(5, 1, i+3)
+#     plt.imshow(np.log(tfrep[i, :, :]),
+#                interpolation='nearest', origin='lower',
+#                cmap=plt.cm.jet) #plt.cm.Reds)
+#     plt.xlabel('Seconds')
+#     plt.ylabel('Frequency in ' + ('$x$', '$y$', '$z$')[i])
+#     tickstep = round(len(freqs) / 5)
+#     plt.yticks(np.arange(len(freqs))[::tickstep],
+#                    [str(i) for i in freqs[::tickstep]])
+#     plt.axis('auto')
+#     plt.axis('tight')
+#
+#
+# tfrep.shap
+#
+# X = tfrep.reshape((3 * 39, -1)).T
+# X.shape, T.shape, len(np.unique(T))
+#
+#
 
 
 

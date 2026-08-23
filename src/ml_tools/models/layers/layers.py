@@ -10,8 +10,8 @@ EPSILON = 1e-14
 GLOBAL_DTYPE = np.float32
 
 
-# -------------  weight initilization functions ---------------
-# -------------------------------------------------------------
+# -------------    weight initilization functions    ---------------
+# ------------------------------------------------------------------
 def xavier(rng, ni: int, no: int) -> NDArray:
     return rng.normal(loc=0.0, scale=1 / np.sqrt(ni), size=(ni, no)).astype(
         dtype=GLOBAL_DTYPE
@@ -37,59 +37,73 @@ weight_init = {
 }
 
 
-"""
-def __call__(self, x):
+# Real-to-real spectral transform, cas(t) = cos(t) + sin(t), which is
+# Re(X) - Im(X) of the ordinary DFT.
+def hartley(x_array: NDArray, axis: int = -1) -> NDArray:
+    x_freq = np.fft.fft(x_array, axis=axis)
+    return x_freq.real - x_freq.imag
 
-    parent = None
 
-    if isinstance(x, Signal):
-        parent = x.producer
-        x = x.data
+def hartley_2d(x_array: NDArray, axes: tuple = (-2, -1)) -> NDArray:
+    x_freq = np.fft.fft2(x_array, axes=axes)
+    return x_freq.real - x_freq.imag
 
-    y = self.forward(x)
-
-    node = None
-
-    if Network.ACTIVE is not None:
-
-        node = GradFlow(
-            layer=self,
-            inputs=x,
-            output=y
-        )
-
-        if parent is not None:
-            node.upstream.append(parent)
-            parent.downstream.append(node)
-
-        Network.ACTIVE.register(node)
-
-    return Signal(
-        data=y,
-        producer=node
-    )
-
-"""
 
 # ------------------------------------------------------------------
+# A declared shape is the layer's TRAILING axes, right-aligned against a real
+# array shape, so (ni,) matches (batch, ni) and (batch, sequence, ni) alike.
+# None on an axis means the layer does not constrain it. ANY_SHAPE is the
+# weakest claim a layer can make: one free trailing axis, which is what a
+# width-agnostic elementwise layer knows about its own input.
+ANY_SHAPE = (None,)
+
+
 class Layer(ABC):
+    # set by layers whose output is their input at the same shape. They have no
+    # width of their own to declare, so they pass the incoming one through
+    # instead of dropping it and blinding everything downstream.
+    preserves_shape: bool = False
+
     def __init__(self):
         super().__init__()
         self.RNG = np.random.RandomState(42)
+        self.declare_shapes()
 
-        self.upstream = []
-        self.downstream = []
-        self.pending_grads = []
+    def declare_shapes(self, inputs=(ANY_SHAPE,), outputs=(ANY_SHAPE,)) -> None:
+        """
+        Record what this layer accepts and emits, in trailing-axis form.
 
-    def connect_downstream(self, layer: Layer) -> None:
+        Called from __init__ once the layer's widths are known. Both arguments
+        are tuples OF shapes, one per positional argument of forward, so a merge
+        layer declares two inputs and a split layer two outputs.
+        """
+        self._in_shapes = tuple(inputs)
+        self._out_shapes = tuple(outputs)
 
-        self.downstream.append(layer)
-        layer.upstream.append(self)
+    @property
+    def shapes(self) -> dict[str, tuple[tuple, ...]]:
+        """
+        The layer's declared input and output shapes.
 
-    def connect_upstream(self, layer: Layer) -> None:
+        Declared, not observed: these are known at construction, before any
+        data flows, which is what lets the graph check an edge at the line that
+        wires it rather than on the first forward pass. None marks an axis the
+        layer leaves free.
+        """
+        return {"input": self._in_shapes, "output": self._out_shapes}
 
-        self.upstream.append(layer)
-        layer.upstream.append(self)
+    def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
+        """
+        Resolve the output shapes given what actually arrives.
+
+        The default is the declaration, which is right for every layer whose
+        output width is fixed at construction. Layers that derive their width
+        from their inputs -- a concatenation, say -- override this so the shape
+        keeps flowing downstream instead of going unknown.
+        """
+        if self.preserves_shape:
+            return input_shapes
+        return self._out_shapes
 
     @abstractmethod
     def forward(self, x: NDArray) -> NDArray:
@@ -121,9 +135,32 @@ class Layer(ABC):
     def num_parameters(self) -> int:
         pass
 
-
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
+
+
+def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
+    """
+    Compare two declared shapes, right-aligned, and describe the first axis
+    where they disagree.
+
+    Only an axis where BOTH sides name a size can disagree. A None on either
+    side is not a mismatch, it is the absence of a claim, so it is skipped
+    rather than guessed at -- reporting those would turn every rank-agnostic
+    layer into a false alarm.
+
+    Returns
+    -------
+    a description of the offending axis, or None when the two are compatible
+    """
+    overlap = min(len(produced), len(expected))
+
+    for axis in range(-overlap, 0):
+        if produced[axis] is None or expected[axis] is None:
+            continue
+        if produced[axis] != expected[axis]:
+            return f"{produced} cannot feed {expected}, they differ on axis {axis}"
+    return None
 
 
 # TODO: build ENUMS for activations
@@ -149,6 +186,7 @@ class FullyConnectedLayer(Layer):
         self.weights: NDArray = weight_init[activation_type](self.RNG, ni=ni, no=no)
         self.shape: tuple = self.weights.shape
         self.bias: NDArray = np.zeros((1, no), dtype=GLOBAL_DTYPE)
+        self.declare_shapes(inputs=((ni,),), outputs=((no,),))
 
         # these values will be rewritten or updated on each pass
         self.output = np.empty(shape=(ni, no))
@@ -211,18 +249,16 @@ class FullyConnectedLayer(Layer):
         if forced_activation is None:
             this_derivative: Callable = self._func_derivative
         else:
-            this_derivative: Callable = activations.activation_dictionary[
+            this_derivative: Callable = activations.derivative_dictionary[
                 forced_activation
             ]
         # reshape to 2D in case (batch, sequence, hidden)
         _grad = incoming_grad.reshape(-1, incoming_grad.shape[-1])
-        norm_factor = _grad.shape[0] + EPSILON
 
-        delta = _grad * this_derivative(self.output, self.z)
+        delta = this_derivative(self.output, self.z, _grad)
 
-        self.gradient_weights = (self.input.T @ delta) / norm_factor
-        self.gradient_bias =  delta.sum(axis=0, keepdims=True) / norm_factor
-        # delta.sum(axis=0)
+        self.gradient_weights = self.input.T @ delta
+        self.gradient_bias = delta.sum(axis=0, keepdims=True)
 
         final_grad = delta @ self.weights.T
 
@@ -255,10 +291,9 @@ class FullyConnectedLayer(Layer):
         self.z = None
         self.gradient_weights = None
         self.gradient_bias = None
-        self.pending_grads = []
 
     def get_weights(self):
-        return np.concatenate([self.bias, self.weights.ravel()])
+        return np.concatenate([self.bias.ravel(), self.weights.ravel()])
 
     def get_gradients(self) -> dict[str, NDArray]:
         return {
@@ -285,6 +320,8 @@ class FullyConnectedLayer(Layer):
 # construction slightly to better differentiate type.
 class DropoutLayer(Layer):
     """Hinton style or simple bool mask Dropout layer with scaling outputs"""
+
+    preserves_shape = True
 
     def __init__(self, dropout_prob=0.5, use_rescale: bool = False):
         super().__init__()
@@ -357,37 +394,6 @@ class DropoutLayer(Layer):
         return self.__str__()
 
 
-class RMSNormalizeLayer(Layer):
-    def __init__(self, ni: int):
-        super().__init__()
-        self.ni = ni
-        self.gamma = np.ones(ni)
-        pass
-
-    def forward(self, incoming_x: NDArray):
-        self.in_shape = incoming_x.shape
-
-        self.rms = np.sqrt(np.mean(incoming_x ** 2, axis=-1, keepdims=True) + EPSILON)
-        self.x_norm = incoming_x / self.rms
-        self.output = self.x_norm * self.gamma
-
-        return self.output
-
-    def backward(self, incoming_grad: NDArray) -> NDArray:
-
-
-        delta_grad = np.sum(incoming_grad * self.x_norm, axis=0)
-
-        gamma_grad = incoming_grad * self.gamma
-
-        gamma_grad = (
-             self.x_norm * np.mean(gamma_grad * self.x_norm, axis=-1, keepdims=True)
-                     ) / self.rms
-
-        return dx, dgamma
-
-
-
 # numpy-ml ref:
 # https://github.com/ddbourgin/numpy-ml/blob/master/numpy_ml/neural_nets/layers/layers.py#L1634-L1803
 class NormalizeLayer(Layer):
@@ -396,16 +402,14 @@ class NormalizeLayer(Layer):
         self.ni = ni
         self.shift_scale = shift_scale
         self.eps = eps
+        self.declare_shapes(inputs=((ni,),), outputs=((ni,),))
 
         if shift_scale:
-            # Standard LayerNorm init: identity transform (γ=1, β=0).
-            # Starting at γ=0.01 crushes the signal to near-zero, which kills
-            # gate_raw magnitude and puts all mod_relu gates into the dead zone.
-            self.scale_gamma = np.ones((1, ni))
-            self.shift_beta  = np.zeros((1, ni))
+            self.scale_gamma = np.ones((1, ni), dtype=GLOBAL_DTYPE)
+            self.shift_beta = np.zeros((1, ni), dtype=GLOBAL_DTYPE)
         else:
-            self.gamma = None
-            self.beta = None
+            self.scale_gamma = None
+            self.shift_beta = None
 
         # cached for backward
         self.x_norm = None
@@ -438,14 +442,15 @@ class NormalizeLayer(Layer):
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         incoming_grad =  incoming_grad.reshape(-1, self.in_shape[-1])
-        norm_factor = incoming_grad.shape[0] + EPSILON
         if self.shift_scale == True:
-            self.gradient_beta = np.sum(incoming_grad, axis=0) / norm_factor
-            self.gradient_gamma = np.sum(incoming_grad * self.x_norm, axis=0) / norm_factor
+            self.gradient_beta = np.sum(incoming_grad, axis=0, keepdims=True)
+            self.gradient_gamma = np.sum(
+                incoming_grad * self.x_norm, axis=0, keepdims=True
+            )
             z = incoming_grad * self.scale_gamma
         else:
-            self.gradient_beta = np.empty(1)
-            self.gradient_gamma = np.empty(1)
+            self.gradient_beta = None
+            self.gradient_gamma = None
             z = incoming_grad
 
         gradient = (1.0 / self.std) * (
@@ -455,15 +460,18 @@ class NormalizeLayer(Layer):
         return gradient.reshape(self.in_shape)
 
     def purge(self):
-        self.input = np.empty(shape=(1, 1))
-        self.output = np.empty(shape=(1, 1))
-        self.gradient_beta = np.empty(shape=(1, 1))
-        self.gradient_gamma = np.empty(shape=(1, 1))
+        self.input = None
+        self.x_norm = None
+        self.std = None
+        self.gradient_beta = None
+        self.gradient_gamma = None
 
-    def get_weights(self) -> tuple[NDArray]:
-        return (self.beta, self.gamma)
+    def get_weights(self) -> tuple[NDArray, NDArray]:
+        return (self.shift_beta, self.scale_gamma)
 
-    def get_gradients(self) -> dict[str, NDArray] | None:
+    def get_gradients(self) -> dict[str, NDArray]:
+        if not self.shift_scale:
+            return {}
         return {
             "gradient_beta": self.gradient_beta,
             "gradient_gamma": self.gradient_gamma,
@@ -471,21 +479,110 @@ class NormalizeLayer(Layer):
 
     @property
     def num_parameters(self) -> int:
-        return self.beta.size + self.gamma.size
+        if not self.shift_scale:
+            return 0
+        return self.shift_beta.size + self.scale_gamma.size
 
     def zero_gradients(self) -> None:
+        if not self.shift_scale:
+            return
         self.gradient_beta = np.zeros_like(self.shift_beta)
         self.gradient_gamma = np.zeros_like(self.scale_gamma)
+
+    def __str__(self):
+        affine = "affine" if self.shift_scale else "no affine"
+        return f"LayerNorm over {self.ni}, {affine}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+# https://arxiv.org/abs/1910.07467
+class RMSNormLayer(Layer):
+    """
+    Root-mean-square norm over the last axis. No mean subtraction and no
+    shift, so the only parameter is a learnable per-feature scale.
+    """
+
+    def __init__(self, ni: int, eps: float = 1e-8):
+        super().__init__()
+        self.ni = ni
+        self.eps = eps
+        self.scale_gamma = np.ones((1, ni), dtype=GLOBAL_DTYPE)
+        self.declare_shapes(inputs=((ni,),), outputs=((ni,),))
+
+        self.x_norm = None
+        self.rms = None
+
+    def forward(self, incoming_x: NDArray) -> NDArray:
+        self.in_shape = incoming_x.shape
+
+        # reshape to 2D in case (batch, sequence, hidden)
+        self.input = incoming_x.reshape(-1, self.in_shape[-1])
+
+        self.rms = np.sqrt(
+            np.mean(self.input ** 2, axis=-1, keepdims=True) + self.eps
+        )
+        self.x_norm = self.input / self.rms
+        output = self.x_norm * self.scale_gamma
+
+        return output.reshape(self.in_shape)
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        _grad = incoming_grad.reshape(-1, self.in_shape[-1])
+
+        self.gradient_gamma = np.sum(_grad * self.x_norm, axis=0, keepdims=True)
+
+        z = _grad * self.scale_gamma
+        gradient = (
+            z - self.x_norm * np.mean(z * self.x_norm, axis=-1, keepdims=True)
+        ) / self.rms
+
+        return gradient.reshape(self.in_shape)
+
+    def update_weights(self, gradient_gamma: NDArray) -> None:
+        self.scale_gamma -= gradient_gamma
+
+    def purge(self) -> None:
+        self.input = None
+        self.x_norm = None
+        self.rms = None
+        self.gradient_gamma = None
+
+    def get_weights(self) -> NDArray:
+        return self.scale_gamma
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        return {"gradient_gamma": self.gradient_gamma}
+
+    def zero_gradients(self) -> None:
+        self.gradient_gamma = np.zeros_like(self.scale_gamma)
+
+    @property
+    def num_parameters(self) -> int:
+        return self.scale_gamma.size
+
+    def __str__(self):
+        return f"RMSNorm over {self.ni}"
+
+    def __repr__(self):
+        return self.__str__()
 
 
 class FrequencyFFT(Layer):
     def __init__(self, max_sequence_length: int, window_size: int):
         """
-        Seting up a process for FFT transformations of windows of audio data
+        Seting up a process for FFT transformations of windows of audio data - expecting data of 1 size batch,
         Preprocessing assumed: sliding windows or patches.
         shape -> (number_of_windows, samples per window)
 
         We utilize a blackamn kernel to "ease in and out" -- frequency jumps from non-zero starts can give artifacts. Common for FFT / DFT application
+
+        The transform is a discrete Hartley, not Re(fft). Re(fft) is blind to
+        the circularly-odd part of the window, so phase information is lost
+        and distinct windows collapse to the same output. Hartley is full rank
+        and stays in real arithmetic, at the cost of a window_size wide output
+        rather than window_size // 2 + 1.
         Parameters
         ----------
         max_sequence_length : the MAXIMUM supported sequence length - (windows)
@@ -495,42 +592,49 @@ class FrequencyFFT(Layer):
         self.max_sequence_length: int = max_sequence_length
         self.window_size: int = window_size
         self.window_kernel: NDArray = np.blackman(window_size)
+        # (windows, samples per window), the window count left free since the
+        # constructor only fixes its ceiling
+        self.declare_shapes(
+            inputs=((None, window_size),), outputs=((None, window_size),)
+        )
 
     def forward(self, incoming_x: NDArray) -> NDArray:
         """
-        Forward process for the FFT transform
+        Forward process for the Hartley transform
         Parameters
         ----------
         incoming_x : Numpy array of (number_of_windows, samples per window)
 
         Returns
         -------
-        the FFT transform of windowed_data
+        the Hartley transform of windowed_data, same width as the window
         """
         self.in_shape = incoming_x.shape
 
         assert self.in_shape[0] <= self.max_sequence_length, f"Shapes don't match in {self}"
-        assert self.in_shape[-1] <= self.window_size, f"Shapes don't match in {self}"
+        assert self.in_shape[-1] == self.window_size, (
+            f"last axis must equal window_size {self.window_size}, "
+            f"got {self.in_shape[-1]}"
+        )
 
-        self.input = incoming_x.reshape(-1, self.in_shape[1])
+        self.input = incoming_x.reshape(-1, self.in_shape[-1])
+        self.output = hartley(self.window_kernel * self.input, axis=-1)
 
-        incoming_x = self.window_kernel * incoming_x
-        self.output = np.fft.rfft(incoming_x, axis=-1).real
-
-        return self.output.reshape(*self.in_shape[:-1], -1)
+        return self.output.reshape(self.in_shape)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
+        """
+        Hartley is its own adjoint, so the backward pass is the same
+        transform followed by the same window weighting.
+        """
+        _grad = incoming_grad.reshape(-1, self.in_shape[-1])
 
-        incoming_grad = incoming_grad.reshape(-1, incoming_grad.shape[-1])
-        incoming_grad = np.fft.irfft(incoming_grad, axis=1).real / self.window_size
-
-        # return incoming_grad
-        grad = (incoming_grad * self.window_kernel)
-        return grad.reshape(*self.in_shape[:-1], -1)
+        grad = self.window_kernel * hartley(_grad, axis=-1)
+        return grad.reshape(self.in_shape)
 
     def purge(self) -> None:
-        self.input = np.empty(shape=(1, 1))
-        self.output = np.empty(shape=(1, 1))
+        self.input = None
+        self.output = None
 
     def get_weights(self):
         return None
@@ -551,50 +655,47 @@ class FrequencyFFT(Layer):
 
 class FourierLayer(Layer):
     #  https://ieeexplore.ieee.org/document/9616294
-    def __init__(self, use_2d:bool = True, fft_axis: int = -1):
-        """
-        #  https://ieeexplore.ieee.org/document/9616294
-        Transform the input data into frequency domain via Real-only domain FFT
-        Parameters
-        ----------
-        use_2d: bool - if use2D: Take the original FNet mechanism (applied across 2 dimensions, as with image processing -- this isn't the best way to do this.
-        fft_axis: int - target axis (likely the sequence length)
-        """
+    preserves_shape = True
+
+    def __init__(self, use_2d:bool = True):
         super().__init__()
         self.use_2d = use_2d
 
         if use_2d == True:
             self.fft_axes = (-2, -1)
         else:
-            self.fft_axes = fft_axis
+            self.fft_axes = -1
 
     def forward(self, incoming_x: NDArray) -> NDArray:
-        """ incoming_x """
+        """
+        Hartley rather than Re(fft). Re(fft) drops the circularly-odd part
+        of the input, so it is rank deficient and cannot be inverted by
+        InverseFourierLayer. Hartley keeps every component in real space
+        and preserves the input shape on both branches.
+        """
         self.input = incoming_x
 
-        if not self.use_2d:  # use FFT 1D
-            self.output = np.fft.rfft(incoming_x, axis=self.fft_axes).real
+        if not self.use_2d:
+            self.output = hartley(incoming_x, axis=self.fft_axes)
 
         elif self.use_2d:
-            self.output = np.fft.fft2(incoming_x, axes=self.fft_axes).real
+            self.output = hartley_2d(incoming_x, axes=self.fft_axes)
 
         return self.output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        _grad = incoming_grad.astype(np.complex128)
-
+        """Hartley is symmetric, so the adjoint is the same transform."""
         if not self.use_2d:
-            _grad = np.fft.ifft(_grad, axis=self.fft_axes).real
+            self.gradient = hartley(incoming_grad, axis=self.fft_axes)
         elif self.use_2d:
-            _grad = np.fft.ifft2(_grad, axes=self.fft_axes).real
+            self.gradient = hartley_2d(incoming_grad, axes=self.fft_axes)
 
-        self.gradient = _grad.real
         return self.gradient
 
     def purge(self) -> None:
-        self.input = np.empty(shape=(1, 1))
-        self.output = np.empty(shape=(1, 1))
-        self.gradient = np.empty(shape=(1,1))
+        self.input = None
+        self.output = None
+        self.gradient = None
 
     def get_weights(self):
         return None
@@ -614,14 +715,10 @@ class FourierLayer(Layer):
 
 
 class InverseFourierLayer(Layer):
+    # https://arxiv.org/pdf/2502.18394
+    preserves_shape = True
+
     def __init__(self, use_2d:bool = True):
-        """
-        # https://arxiv.org/pdf/2502.18394
-        Convert Frequency-domain back to sequence / time domain.
-        Parameters
-        ----------
-        use_2d: bool - if we're doing the original FNet 2-D image-data-style
-        """
         super().__init__()
         self.use_2d = use_2d
 
@@ -631,32 +728,40 @@ class InverseFourierLayer(Layer):
             self.fft_axes = -1
 
     def forward(self, incoming_x: NDArray) -> NDArray:
-        """ incoming_x """
+        """
+        Hartley is its own inverse up to 1/N, so the inverse direction is
+        the same transform carrying that scale. Stacking this on top of
+        FourierLayer reconstructs the input exactly.
+        """
         self.input = incoming_x
+        self.scale = self._scale(incoming_x.shape)
 
-        if not self.use_2d:  # use FFT 1D
-            self.output = np.fft.ifft(incoming_x, axis=self.fft_axes).real
+        if not self.use_2d:
+            self.output = hartley(incoming_x, axis=self.fft_axes) / self.scale
 
         elif self.use_2d:
-            self.output = np.fft.ifft2(incoming_x, axes=self.fft_axes).real
+            self.output = hartley_2d(incoming_x, axes=self.fft_axes) / self.scale
 
         return self.output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        _grad = incoming_grad.astype(np.complex128)
-
+        """Symmetric transform, so the adjoint carries the same 1/N."""
         if not self.use_2d:
-            _grad = np.fft.fft(_grad, axis=self.fft_axes).real
+            self.gradient = hartley(incoming_grad, axis=self.fft_axes) / self.scale
         elif self.use_2d:
-            _grad = np.fft.fft2(_grad, axes=self.fft_axes).real
+            self.gradient = hartley_2d(incoming_grad, axes=self.fft_axes) / self.scale
 
-        self.gradient = _grad.real
         return self.gradient
 
+    def _scale(self, shape: tuple) -> int:
+        if self.use_2d:
+            return shape[-2] * shape[-1]
+        return shape[-1]
+
     def purge(self) -> None:
-        self.input = np.empty(shape=(1, 1))
-        self.output = np.empty(shape=(1, 1))
-        self.gradient = np.empty(shape=(1,1))
+        self.input = None
+        self.output = None
+        self.gradient = None
 
     def get_weights(self):
         return None
@@ -679,6 +784,8 @@ class InverseFourierLayer(Layer):
 #
 # # ====== ==================================================================
 # # TODO: WIP below
+#
+#
 # class EmbeddingLayer(Layer):
 #     def __init__(
 #         self, ni: int, cardinality: int, embedding_dim: int, trainable: bool = True
@@ -772,7 +879,7 @@ if __name__ == "__main__":    ## working example -- train--- -- MOVE TO TESTS!
     fc5 = FullyConnectedLayer(ni=10, no=10, activation_type="relu_leaky", is_output=False)
     fc6 = FullyConnectedLayer(ni=10, no=1, activation_type="tanh", is_output=True)
     lossfc = MSELoss()
-    optimizer = SGD(0.25)
+    optimizer = SGD(0.002)
     all_losses = []
     y_regression = y_regression.reshape(-1, 1)
     nnet_layers = [fc, nc1, dp, fc2, nc2, fc3, fc4, fc5, fc6]

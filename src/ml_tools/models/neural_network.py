@@ -1,144 +1,624 @@
+"""
+A container for wiring layers into a network.
+
+Layers know how to transform an array and how to push a gradient back through
+themselves. What they do not know is what feeds them. This module owns that.
+
+Connections are object references, not names. `connect` returns the node it
+created, and you pass that node in as the source of the next one, so an edge is
+a pointer from consumer to producer rather than a string resolved later. Three
+things follow from that:
+
+  * a mistyped source is a NameError where you wrote it, not a wrong edge
+  * a cycle cannot be built, since a node can only reference nodes that already
+    exist, so there is no forward reference to close a loop with
+  * insertion order is therefore already a topological order, and the forward
+    pass is a walk down the list
+
+Names still exist, but only as labels for reading a summary or fetching a node
+after the fact. Nothing about the graph's structure depends on them.
+
+Shapes are checked as the graph is built. Every layer declares the trailing
+axes it accepts and emits (`layer.shapes`), so `connect` can compare what a
+source produces against what its consumer wants and refuse the edge on the spot
+-- a width mismatch is a ValueError at the wiring line, not a dot-product error
+several layers into the first forward pass.
+"""
+
+import inspect
+from typing import Iterable, Optional
+
 import numpy as np
 from numpy.typing import NDArray
-from typing import Iterable
-from ml_tools.models.layers.layers import Layer
-from dataclasses import dataclass, field
+
+from ml_tools.models.layers.layers import ANY_SHAPE, Layer, shape_conflict
+
+
+# the label carried by the graph's source node. Structure does not depend on it
+# -- it exists so summaries and add() have something to say.
+INPUT_NAME = "input"
+
+
+class Node:
+    """
+    One step in the graph: a layer, and references to the nodes feeding it.
+
+    A node with no layer is a source -- the graph input. Nodes are compared and
+    hashed by identity, so the same node passed to two consumers is one shared
+    producer, which is what makes a fan-out visible in the code that builds it.
+
+    Each node also carries the trailing shape it produces, resolved from its
+    sources at construction. That is what the next node's check is made
+    against, so a width flows down the graph as it is wired.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        layer: Optional[Layer] = None,
+        sources: tuple["Node", ...] = (),
+        shape: tuple = ANY_SHAPE,
+    ):
+        self.name = name
+        self.layer = layer
+        self.sources = sources
+        self.consumers: list["Node"] = []
+
+        # a source reports whatever it was told to expect. Everything else asks
+        # its layer, since only the layer knows whether its output width is
+        # fixed or derived from what arrives. First output only: a layer with
+        # several is read positionally by its consumers, which this does not
+        # model, and claiming a shape there would be worse than claiming none.
+        if layer is None:
+            self.out_shape = shape
+        else:
+            incoming = tuple(source.out_shape for source in sources)
+            self.out_shape = layer.infer_output_shapes(incoming)[0]
+
+        # dropout and friends take a training flag. Ask once, here, rather than
+        # inspecting the signature on every forward pass.
+        self.accepts_training = bool(layer) and (
+            "training_now" in inspect.signature(layer.forward).parameters
+        )
+
+        for source in sources:
+            source.consumers.append(self)
+
+    @property
+    def is_source(self) -> bool:
+        return self.layer is None
+
+    def __hash__(self):
+        return id(self)
+
+    def __eq__(self, other):
+        return self is other
+
+    def __repr__(self):
+        if self.is_source:
+            return f"Node({self.name}, graph input)"
+        feeding = ", ".join(source.name for source in self.sources)
+        return f"Node({self.name} <- {feeding})"
+
+    def __str__(self):
+        return f"{self.__repr__()} producing {self.out_shape}"
 
 
 class NeuralNetwork:
-    def __init__(self, layers: Iterable[Layer]):
+    """
+    A directed acyclic graph of layers.
 
-        self.layers: dict[int, Layer] = {
-            l_idx: l_obj
-            for l_idx, l_obj in enumerate(layers)
-        }
+    Wire it by passing nodes::
 
-        # flip around for easier backpropigation
-        self.inverse_layers: dict[int, Layer] = dict(
-            sorted(self.layers.items(), reverse=True)
+        net = NeuralNetwork()
+        audio = net.input
+        amp = net.connect(amplitude_fc, audio)
+        freq = net.connect(frequency_fft, audio)      # audio reused: a fan-out
+        merged = net.connect(LatentStack(), amp, freq)
+        net.output = net.connect(head, merged)
+
+    Or sequentially, when there is nothing to branch::
+
+        net = NeuralNetwork([layer_a, layer_b, layer_c])
+
+    Or as a subclass, where assigning a Layer to an attribute registers it, so
+    the optimizer can be handed `net.layers` rather than a list kept by hand::
+
+        class Encoder(NeuralNetwork):
+            def __init__(self):
+                super().__init__()
+                self.projection = FullyConnectedLayer(8, 8, "relu")
+                self.output = self.connect(self.projection, self.input)
+    """
+
+    def __init__(
+        self,
+        layers: Optional[Iterable[Layer]] = None,
+        name: Optional[str] = None,
+        input_shape: tuple = ANY_SHAPE,
+    ):
+        """
+        Parameters
+        ----------
+        layers : optional layers to chain end to end, for a graph with nothing
+            to branch
+        name : label for summaries
+        input_shape : trailing axes of the data the graph will be fed, with
+            None for any axis that varies. Given, the first edge is checked
+            like every other one; left out, the first layer is taken on trust
+            until data arrives.
+        """
+        # through object.__setattr__, so the attribute interception below has
+        # its registry available before any assignment happens
+        object.__setattr__(self, "_nodes", [])
+        object.__setattr__(self, "_registered", [])
+        object.__setattr__(self, "_output", None)
+        object.__setattr__(self, "training", True)
+        object.__setattr__(self, "activations", {})
+        object.__setattr__(self, "name", name or self.__class__.__name__)
+
+        source = Node(INPUT_NAME, shape=tuple(input_shape))
+        object.__setattr__(self, "_input", source)
+        self._nodes.append(source)
+
+        if layers is not None:
+            self.extend(layers)
+
+    # -------------    connecting    --------------------------------
+    # ---------------------------------------------------------------
+    @property
+    def input(self) -> Node:
+        """the graph's source node. Pass it as a source to the first layer."""
+        return self._input
+
+    def connect(
+        self, layer: Layer, *sources: Node, name: Optional[str] = None
+    ) -> Node:
+        """
+        Place a layer in the graph, fed by the given nodes, and return its node.
+
+        Parameters
+        ----------
+        layer : the layer to run at this node
+        sources : the nodes whose outputs feed it, in the order the layer's
+            forward takes them. Passing one node to two different calls is how
+            a fan-out is expressed.
+        name : optional label. Defaults to the layer's class name with a
+            counter, and is only used for display and lookup.
+
+        Returns
+        -------
+        the new node, to pass as a source to whatever comes next
+        """
+        if not sources:
+            raise ValueError(
+                f"{layer.__class__.__name__} needs at least one source. Pass "
+                "net.input for the first layer in a graph."
+            )
+
+        for position, source in enumerate(sources):
+            if not isinstance(source, Node):
+                raise TypeError(
+                    f"source {position} is {type(source).__name__}, expected a "
+                    "Node. Use the value returned by connect(), or net.input."
+                )
+            if not any(known is source for known in self._nodes):
+                raise ValueError(
+                    f"source {source.name!r} belongs to a different network"
+                )
+
+        self._check_arity(layer, len(sources))
+        self._check_shapes(layer, sources)
+
+        label = name or self._auto_name(layer)
+        if any(node.name == label for node in self._nodes):
+            raise ValueError(f"node name {label!r} is already taken")
+
+        node = Node(label, layer, tuple(sources))
+        self._nodes.append(node)
+        self._remember(layer)
+        # a freshly connected node is the natural output until told otherwise
+        object.__setattr__(self, "_output", node)
+        return node
+
+    def _check_arity(self, layer: Layer, given: int) -> None:
+        """
+        Compare the source count against the layer's forward signature, so a
+        merge given the wrong number of inputs fails here rather than as a
+        positional-argument TypeError mid-forward.
+        """
+        parameters = list(inspect.signature(layer.forward).parameters.values())
+        positional = [
+            parameter
+            for parameter in parameters
+            if parameter.kind
+            in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+            and parameter.name != "self"
+        ]
+        if any(parameter.kind == parameter.VAR_POSITIONAL for parameter in parameters):
+            return
+
+        required = sum(
+            1 for parameter in positional if parameter.default is parameter.empty
         )
+        if not (required <= given <= len(positional)):
+            raise ValueError(
+                f"{layer.__class__.__name__}.forward takes {required} to "
+                f"{len(positional)} inputs, got {given}"
+            )
 
-    def forward(self, x_data: NDArray):
-        _x = x_data.copy()
-        for l_idx, layer_object in self.layers.items():
-            _x = layer_object.forward(_x)
-        return _x
+    def _check_shapes(self, layer: Layer, sources: tuple[Node, ...]) -> None:
+        """
+        Compare what each source produces against what the layer says it takes.
 
-    def backward(self, incoming_gradient: NDArray):
-        _grad = incoming_gradient.copy()
-        for l_idx, layer_object in self.inverse_layers.items():
-            _grad = layer_object.backward(_grad)
-            # try:
-            #     _grad = layer_object.backward(_grad)
-            # except:
-            #     print(f"error in backprob during {layer_object} -> incoming shape {_grad.shape}")
-        return _grad
+        The comparison is right-aligned on the trailing axes and skips any axis
+        either side leaves open, so this only fires when both sides state a size
+        and the sizes differ. That is the case worth stopping for: it cannot
+        broadcast, cannot be a batch that varies, and is always a wiring
+        mistake.
+        """
+        expected = layer.shapes["input"]
 
-    def compile(self):
+        for position, source in enumerate(sources):
+            # forward may accept more inputs than the layer bothered to declare
+            wanted = expected[position] if position < len(expected) else ANY_SHAPE
+            conflict = shape_conflict(source.out_shape, wanted)
+            if conflict:
+                raise ValueError(
+                    f"{layer.__class__.__name__} cannot be fed by "
+                    f"{source.name!r} at position {position}: {conflict}"
+                )
 
-        indegree = {
-            layer: len(layer.upstream)
-            for layer in self.layers
-        }
+    def _auto_name(self, layer: Layer) -> str:
+        stem = layer.__class__.__name__
+        taken = {node.name for node in self._nodes}
+        index = 0
+        while f"{stem}_{index}" in taken:
+            index += 1
+        return f"{stem}_{index}"
 
-        queue = [
+    def extend(self, layers: Iterable[Layer]) -> Node:
+        """chain layers end to end, each fed by the one before"""
+        node = self._output or self._input
+        for layer in layers:
+            node = self.connect(layer, node)
+        return node
+
+    def add(
+        self,
+        name: str,
+        layer: Layer,
+        inputs: str | Node | Iterable = "input",
+    ) -> str:
+        """
+        Name-based wiring, kept so existing graphs keep working.
+
+        Resolves each name to a node and delegates to connect. Prefer connect:
+        a name is matched at wiring time, so a typo that happens to hit another
+        real node produces a valid graph with the wrong edge, which nothing can
+        detect.
+        """
+        requested = (
+            (inputs,) if isinstance(inputs, (str, Node)) else tuple(inputs)
+        )
+        sources = tuple(
+            source if isinstance(source, Node) else self.node(source)
+            for source in requested
+        )
+        return self.connect(layer, *sources, name=name).name
+
+    def node(self, name: str) -> Node:
+        """fetch a node by label"""
+        for node in self._nodes:
+            if node.name == name:
+                return node
+        known = [node.name for node in self._nodes]
+        raise KeyError(f"no node named {name!r}. Known nodes: {known}")
+
+    # -------------    the output    --------------------------------
+    # ---------------------------------------------------------------
+    @property
+    def output(self) -> Node:
+        if self._output is None:
+            raise ValueError("the network has no layers")
+        return self._output
+
+    @output.setter
+    def output(self, node: Node) -> None:
+        if not isinstance(node, Node):
+            raise TypeError("the output must be a Node returned by connect()")
+        if not any(known is node for known in self._nodes):
+            raise ValueError(f"node {node.name!r} belongs to a different network")
+        object.__setattr__(self, "_output", node)
+
+    def set_output(self, node: Node | str) -> None:
+        """as the output property, accepting a name for convenience"""
+        self.output = self.node(node) if isinstance(node, str) else node
+
+    # -------------    registration    ------------------------------
+    # ---------------------------------------------------------------
+    def __setattr__(self, attribute: str, value):
+        """assigning a Layer registers it, so no bookkeeping list is needed"""
+        if isinstance(value, Layer):
+            self._remember(value)
+        elif isinstance(value, NeuralNetwork) and value is not self:
+            for layer in value.layers:
+                self._remember(layer)
+        object.__setattr__(self, attribute, value)
+
+    def _remember(self, layer: Layer) -> None:
+        if not any(known is layer for known in self._registered):
+            self._registered.append(layer)
+
+    # -------------    the passes    --------------------------------
+    # ---------------------------------------------------------------
+    def forward(self, x_data: NDArray) -> NDArray:
+        """
+        Run the graph.
+
+        Insertion order is a valid topological order -- a node's sources had to
+        exist before it could reference them -- so this is a single walk with no
+        sort. Every node's output is cached, both because a fan-out reads one
+        value twice and because it is the first thing you want when a shape is
+        wrong.
+        """
+        output = self.output
+        values = {self._input: x_data}
+
+        for node in self._nodes:
+            if node.is_source:
+                continue
+            arguments = [values[source] for source in node.sources]
+            if node.accepts_training:
+                values[node] = node.layer.forward(
+                    *arguments, training_now=self.training
+                )
+            else:
+                values[node] = node.layer.forward(*arguments)
+
+        object.__setattr__(
+            self, "activations", {node.name: value for node, value in values.items()}
+        )
+        return values[output]
+
+    def backward(self, incoming_gradient: NDArray) -> NDArray:
+        """
+        Push the gradient back through the graph.
+
+        Where a node fed several consumers its gradient is the sum of what they
+        each return, which is why this cannot be a list walked in reverse.
+        """
+        gradients = {self.output: incoming_gradient}
+
+        for node in reversed(self._nodes):
+            if node.is_source or node not in gradients:
+                # nothing downstream asked this node for anything, so it
+                # contributes nothing. Normal while a graph is half built.
+                continue
+
+            returned = node.layer.backward(gradients.pop(node))
+            parts = returned if len(node.sources) > 1 else (returned,)
+
+            if len(parts) != len(node.sources):
+                raise ValueError(
+                    f"node {node.name!r} has {len(node.sources)} sources but "
+                    f"its backward returned {len(parts)} gradients"
+                )
+
+            for source, part in zip(node.sources, parts):
+                if source in gradients:
+                    gradients[source] = gradients[source] + part
+                else:
+                    gradients[source] = part
+
+        return gradients.get(self._input)
+
+    def __call__(self, x_data: NDArray) -> NDArray:
+        return self.forward(x_data)
+
+    # -------------    inspection    --------------------------------
+    # ---------------------------------------------------------------
+    def edges(self) -> list[tuple[str, str]]:
+        """every (producer, consumer) pair, for tracing or rendering"""
+        return [
+            (source.name, node.name)
+            for node in self._nodes
+            for source in node.sources
+        ]
+
+    def validate(self) -> list[str]:
+        """
+        Report structural problems that are legal but almost certainly wrong.
+
+        Cycles are not among them: references only point backwards, so a cycle
+        cannot be constructed. What remains is nodes whose output goes nowhere,
+        which cost a forward pass and never receive a gradient.
+        """
+        problems = []
+        output = self._output
+
+        for node in self._nodes:
+            if node.is_source or node is output:
+                continue
+            if not node.consumers:
+                problems.append(
+                    f"{node.name} feeds nothing and is not the output, so it "
+                    "runs forward but never trains"
+                )
+
+        orphans = [
             layer
-            for layer, degree in indegree.items()
-            if degree == 0
+            for layer in self._registered
+            if not any(node.layer is layer for node in self._nodes)
         ]
+        for layer in orphans:
+            problems.append(
+                f"{layer.__class__.__name__} is registered but not connected"
+            )
+        return problems
 
-        self.forward_order = []
+    # -------------    modes and bookkeeping    ---------------------
+    # ---------------------------------------------------------------
+    def train(self) -> "NeuralNetwork":
+        object.__setattr__(self, "training", True)
+        return self
 
-        while queue:
+    def eval(self) -> "NeuralNetwork":
+        """
+        Switch to inference. Worth being explicit about: DropoutLayer.forward
+        defaults training_now to True, so a network that never calls this runs
+        inference with dropout still active.
+        """
+        object.__setattr__(self, "training", False)
+        return self
 
-            layer = queue.pop(0)
+    @property
+    def nodes(self) -> list[Node]:
+        """every node including the input source, in construction order"""
+        return list(self._nodes)
 
-            self.forward_order.append(layer)
+    @property
+    def layers(self) -> list[Layer]:
+        """
+        Every registered layer, graph order first. This is what an optimizer
+        wants: `optimizer.step(net.layers)`.
+        """
+        in_graph = [node.layer for node in self._nodes if not node.is_source]
+        extra = [
+            layer
+            for layer in self._registered
+            if not any(known is layer for known in in_graph)
+        ]
+        return in_graph + extra
 
-            for child in layer.downstream:
+    @property
+    def num_parameters(self) -> int:
+        total = 0
+        for layer in self.layers:
+            count = layer.num_parameters
+            if count:
+                total += count
+        return total
 
-                indegree[child] -= 1
+    def purge(self) -> None:
+        for layer in self.layers:
+            layer.purge()
+        object.__setattr__(self, "activations", {})
 
-                if indegree[child] == 0:
-                    queue.append(child)
+    def zero_gradients(self) -> None:
+        for layer in self.layers:
+            layer.zero_gradients()
 
-        self.backward_order = list(
-            reversed(self.forward_order)
+    def shapes(self) -> dict[str, dict[str, tuple]]:
+        """
+        Every node's declared input and output shapes, keyed by node name.
+
+        The layer's own view plus what the graph resolved for it, which is the
+        pair to read when a wiring error is not obvious -- the resolved shape
+        says what the edge actually carries.
+        """
+        return {
+            node.name: {**node.layer.shapes, "resolved": node.out_shape}
+            for node in self._nodes
+            if not node.is_source
+        }
+
+    def summary(self, x_data: Optional[NDArray] = None) -> str:
+        """
+        A table of the graph. Passing sample data runs a forward pass first so
+        real output shapes can be shown, which is usually the question. Without
+        it the shape column falls back to the trailing axes each node declares.
+        """
+        if x_data is not None:
+            self.forward(x_data)
+        shapes = {
+            name: np.shape(value) for name, value in self.activations.items()
+        }
+
+        listed = [node for node in self._nodes if not node.is_source]
+        width = max((len(node.name) for node in listed), default=4)
+
+        lines = [
+            f"{self.name}: {len(listed)} nodes, {self.num_parameters} parameters"
+        ]
+        lines.append(f"  {'node'.ljust(width)}  {'sources':<26} shape")
+        for node in listed:
+            marker = " <- output" if node is self._output else ""
+            lines.append(
+                f"  {node.name.ljust(width)}  "
+                f"{','.join(source.name for source in node.sources):<26} "
+                f"{shapes.get(node.name, node.out_shape)}{marker}"
+            )
+
+        for problem in self.validate():
+            lines.append(f"  warning: {problem}")
+        return "\n".join(lines)
+
+    def __len__(self) -> int:
+        return sum(1 for node in self._nodes if not node.is_source)
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}({len(self)} nodes, "
+            f"{self.num_parameters} parameters)"
         )
 
 
-################################################################################
-################################################################################
-################################################################################
-################################################################################
+if __name__ == "__main__":
+    from ml_tools.models.layers.layers import (
+        DropoutLayer,
+        FullyConnectedLayer,
+        NormalizeLayer,
+    )
+    from ml_tools.models.layers.operators import LatentStack
+    from ml_tools.models.model_loss import MSELoss
+    from ml_tools.models.optimizers import SGD
+    from ml_tools.generators import RandomDatasetGenerator
 
-@dataclass(slots=True)
-class GradFlow:
+    generator = RandomDatasetGenerator(random_seed=42)
+    x_data, y_data, _ = generator.generate(
+        "regression", num_samples=600, num_features=6, noise_scale=0.5
+    )
+    y_data = y_data.reshape(-1, 1)
 
-    layer: Layer
+    # the input shape is declared, so the first edge is checked like the rest
+    net = NeuralNetwork(name="two_branch", input_shape=(6,))
 
-    output: np.ndarray | None = None
+    features = net.input
+    wide = net.connect(FullyConnectedLayer(6, 12, "relu"), features, name="wide")
+    wide = net.connect(NormalizeLayer(12, shift_scale=True), wide, name="wide_norm")
+    # `features` used a second time, so the fan-out is visible right here
+    narrow = net.connect(FullyConnectedLayer(6, 4, "tanh"), features, name="narrow")
 
-    incoming_grads: dict[int, list[np.ndarray]] = field(default_factory=dict)
+    merged = net.connect(LatentStack(), wide, narrow, name="merge")
+    merged = net.connect(DropoutLayer(dropout_prob=0.1), merged, name="drop")
+    merged = net.connect(FullyConnectedLayer(16, 8, "swish"), merged, name="head")
+    net.output = net.connect(
+        FullyConnectedLayer(8, 1, "linear", is_output=True), merged, name="out"
+    )
 
-    executed: bool = False
+    print(net.summary(x_data))
+    print(f"\nedges: {net.edges()}")
+    print(f"merge shapes: {net.shapes()['merge']}")
 
-def forward(self, x: np.ndarray) -> np.ndarray:
+    try:
+        net.connect(FullyConnectedLayer(9, 3, "relu"), net.node("merge"))
+    except ValueError as refused:
+        print(f"refused: {refused}")
 
-    flow = {
-        layer: GradFlow(layer)
-        for layer in self.layers
-    }
+    loss = MSELoss()
+    optimizer = SGD(0.01)
 
-    flow[self.input_layer].output = x
+    net.train()
+    first = None
+    for _ in range(300):
+        prediction = net.forward(x_data)
+        value = loss(prediction, y_data)
+        if first is None:
+            first = value
+        net.backward(loss.backward())
+        optimizer.step(net.layers)
 
-    for layer in self.forward_order:
-
-        if layer is self.input_layer:
-            continue
-
-        inputs = [
-            flow[parent].output
-            for parent in layer.upstream
-        ]
-
-        if len(inputs) == 1:
-            inputs = inputs[0]
-        else:
-            inputs = tuple(inputs)
-
-        flow[layer].output = layer.forward(inputs)
-
-    self.flow = flow
-
-    return flow[self.output_layer].output
-
-def forward(self, x: np.ndarray) -> np.ndarray:
-
-    flow = {
-        layer: GradFlow(layer)
-        for layer in self.layers
-    }
-
-    flow[self.input_layer].output = x
-
-    for layer in self.forward_order:
-
-        if layer is self.input_layer:
-            continue
-
-        inputs = [
-            flow[parent].output
-            for parent in layer.upstream
-        ]
-
-        if len(inputs) == 1:
-            inputs = inputs[0]
-        else:
-            inputs = tuple(inputs)
-
-        flow[layer].output = layer.forward(inputs)
-
-    self.flow = flow
-
-    return flow[self.output_layer].output
+    print(f"\ntraining loss {first:.4f} -> {value:.4f}")
+    net.eval()
+    print(f"eval loss (dropout off) {loss(net.forward(x_data), y_data):.4f}")

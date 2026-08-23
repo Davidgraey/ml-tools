@@ -74,11 +74,11 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool = True) -> dict:
 
         # Regress the predicted log‐odds on Z to get bZ (OLS or standard linear regression in papers)
         grad_model = GradientDescent(
-            task="regression", use_elastic_reg=False
+            task=ClassificationTask.BINARY, use_elastic_reg=False
         )
         grad_model.fit(
             x_data=z_std,
-            y_data=logits,
+            y_data=y.reshape(num_samples, -1),
             iterations=25,
             add_constant=True,
         )
@@ -99,11 +99,11 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool = True) -> dict:
 
         # Regress the predicted log‐odds on Z to get bZ (OLS or standard linear regression in papers)
         grad_model = GradientDescent(
-            task="regression", use_elastic_reg=False
+            task=ClassificationTask.MULTINOMIAL, use_elastic_reg=False
         )
         grad_model.fit(
             x_data=z_std,
-            y_data=logits,
+            y_data=y.reshape(num_samples, -1),
             iterations=25,
             add_constant=True,
         )
@@ -124,11 +124,11 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool = True) -> dict:
 
         # Regress the predicted log‐odds on Z to get bZ (OLS or standard linear regression in papers)
         grad_model = GradientDescent(
-            task="regression", use_elastic_reg=False
+            task=ClassificationTask.MULTILABEL, use_elastic_reg=False
         )
         grad_model.fit(
             x_data=z_std,
-            y_data=logits,
+            y_data=y.reshape(num_samples, -1),
             iterations=25,
             add_constant=True,
         )
@@ -157,7 +157,7 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool = True) -> dict:
 
     if logistic:
         # use the y_hat (logits -- not probability / sigmoid!)
-        std_logit = np.std(logits, axis=0)
+        std_logit = np.std(logits)
         # estimate standardized coefficients (betastar)
         # np.std(z_std, axis=0)  # should all be 1.0, so we can skip s_Z in the paper
         beta = (unstd_beta * np.sqrt(r2 + EPSILON)) / (std_logit + EPSILON)
@@ -167,7 +167,7 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool = True) -> dict:
         # we'll call it beta for simplicity
         beta = unstd_beta
 
-    signs = np.sign(beta)
+    signs = [np.sign(beta) for beta in beta]
 
     # Link funciton ------
     lambda_star = np.linalg.inv(z_std.T @ z_std) @ (z_std.T @ d)
@@ -200,9 +200,9 @@ def relative_weights(x: NDArray, y: NDArray, logistic: bool = True) -> dict:
 if __name__ == "__main__":
     from ml_tools.generators.data_generators import RandomDatasetGenerator, to_onehot
 
-    num_samples = 500
-    num_features = 10
-    NOISE = 0.66
+    num_samples = 2000
+    num_features = 8
+    NOISE = 0.33
     N_steps = 100
 
     gen = RandomDatasetGenerator(random_seed=123)
@@ -310,11 +310,11 @@ if __name__ == "__main__":
     diff = np.abs(y - pred)
     noise = np.random.uniform(0.5, 1, size=num_samples)
     diff = (diff * noise) / num_classes * num_samples
-    # for idx in range(num_samples):
-    #     sign = np.random.choice([-1, 1])
-    #     plt.scatter(
-    #         spread[idx], (spread[idx] + sign * diff[idx]), alpha=0.1, color="blue"
-    #     )
+    for idx in range(num_samples):
+        sign = np.random.choice([-1, 1])
+        plt.scatter(
+            spread[idx], (spread[idx] + sign * diff[idx]), alpha=0.1, color="blue"
+        )
     # plt.scatter(spread, spread, alpha=0.2, color="orange")
     plt.show()
 

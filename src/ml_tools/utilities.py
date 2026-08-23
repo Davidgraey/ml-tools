@@ -27,6 +27,7 @@ def standardize_data(design_matrix: NDArray, axis=0):
 
     return (design_matrix - array_mean) / array_std
 
+
 # -------------- Decorators  --------------
 def timed_lru_cache(seconds: int, maxsize: int = 128):
     """from realpython example - uses as @timed_lru_cache"""

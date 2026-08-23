@@ -1,10 +1,10 @@
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
-from typing import Literal, Optional, Tuple
-from ml_tools.types import BasalModel
-from ml_tools.models.activations import sigmoid, softmax
-import copy
+from typing import Optional
+from ml_tools.types import BasalTransform
+from ml_tools.models.activations import sigmoid
+from ml_tools.models.constants import EPSILON
 from enum import Enum
 
 
@@ -14,14 +14,14 @@ class CalibrationType(Enum):
     spline = "spline"
 
 
-class ProbCalibration(BasalModel):
+class ProbCalibration(BasalTransform):
     """
-    Probability calibration - takes in logits as a predictionum_samples, and, using CalibrationType methods, projects those
+    Probability calibration - takes in logits as a prediction, and, using CalibrationType methods, projects those
     logist into a calibrated probability space
 
-    platt scaling - fits a sigmoid / 2nd stage logistic regression to calibrate logits to probability
-    isotonic - fits a non-decreasing step function via a pava mechanism and linear interpolation
-    spline - building up the isotonic, then fits spline between points
+    Platt Scaling fits a sigmoid: P(y=1|f) = 1 / (1 + exp(A*f + B))
+    Isotonic Regression (PAVA) fits a non-decreasing step function.
+    Temperature Scaling divides logits by learned T: P = sigmoid(f/T) or softmax(f/T)
     """
 
     def __init__(self, data_dimension: int, method: CalibrationType = "platt"):
@@ -30,47 +30,48 @@ class ProbCalibration(BasalModel):
         self.output_dimension: int = data_dimension
 
         self.method = CalibrationType(method)
-        # platt parameters
+        # Platt parameters
         self.platt_coefficient = None
         self.platt_intercept = None
 
-        # isotonic parameters
+        # Isotonic parameters
         self.isotonic_scores: Optional[NDArray] = None
         self.isotonic_values: Optional[NDArray] = None
 
-        # spline / curve parameters
+        # Spline parameters
         self.spline_x = None
         self.spline_y = None
         self.spline_d = None
 
         self._is_fitted: bool = False
 
-    def fit(self, logit_data: NDArray, targets: NDArray):
+    def fit(self, logit_data: NDArray, y_data: NDArray):
         """
-        fit the calibration model-- logits (x) are compared to the actual labels(y)
+        Fit the calibration model-- logits (x) are compared to the actual labels(y)
         # TODO: insure one-hot shape matching.
 
         Parameters
         ----------
-        logit_data : array-like of shape (num_samples, input_dimension)
+        logit_data : array-like of shape (n_samples, input_dimension)
 
-        targets : array-like of shape (num_samples, input_dimension) - ground truth labels
+        y_true : array-like of shape (n_samples, input_dimension) - ground truth labels
 
         Returns
         -------
 
         """
         x_data = np.asarray(logit_data)
-        targets = np.asarray(targets)
+        y_data = np.asarray(y_data)
 
-        assert x_data.shape == targets.shape, "you fucked it up, shapes must match"
+        assert x_data.shape == y_data.shape, "you fucked it up, shapes must match"
+
 
         if self.method == CalibrationType.platt:
-            fitted = self._fit_platt(x_data, targets)
+            fitted = self._fit_platt(x_data, y_data)
         elif self.method == CalibrationType.isotonic:
-            fitted = self._fit_isotonic(x_data, targets)
+            fitted = self._fit_isotonic(x_data, y_data)
         elif self.method == CalibrationType.spline:
-            fitted = self._fit_monotone_spline(scores=x_data, labels=targets)
+            fitted = self._fit_monotone_spline(scores=x_data, labels=y_data)
         else:
             raise ValueError(f"Unknown method: {self.method}.")
 
@@ -89,12 +90,12 @@ class ProbCalibration(BasalModel):
 
         Parameters
         ----------
-        logits : array-like of shape (num_samples, num_classes)
+        logits : array-like of shape (n_samples, num_classes)
             Raw predicted scores, logits or uncalibrated probabilities.
 
         Returns
         -------
-        calibrated : ndarray of shape (num_samples, num_classes)
+        calibrated : ndarray of shape (n_samples, num_classes)
             Calibrated probabilities .
         """
         if not self._is_fitted:
@@ -113,7 +114,7 @@ class ProbCalibration(BasalModel):
         """Fit and transform in one step."""
         return self.fit(y_score, y_true).predict(y_score)
 
-    # Platt Scaling ------------------------------------------------------------------------
+    # Platt Scaling # ------------------------------------------------------------------------
     def _platt_forward(self, logits: NDArray) -> NDArray:
         z = (self.platt_coefficient * logits) + self.platt_intercept
         return sigmoid(z)
@@ -122,133 +123,132 @@ class ProbCalibration(BasalModel):
                    logits: NDArray,
                    labels: NDArray,
                    max_iter: int = 100,
-                   tolerance: float = 1e-25,
-                   ) -> BasalModel:
+                   tolerance: float = 1e-10,
+                   ) -> "ProbCalibration":
         """
-        Platt scaling via linear interpolation / PaVa
+        Platt scaling via Gauss-Newtonian (L-Sum-of-Squares) / line search
 
         Minimizes the negative log-likelihood:
         derived from label smoothing (Platt's original formulation).
 
-        sigmoid(A*s + B)
+        sigmoid(A*s +B)
 
         Parameters
         ----------
-        logits:
-        labels:
-        max_iter:
-        tolerance:
+        logits -
+        labels
+        max_iter
+        tolerance
 
         Returns
         -------
-        A, B : float the fitted logistic regression parameters
+        A, B : float
+            Fitted sigmoid parameters.
         """
         num_samples = len(logits)
 
         # n_pos = positive counts per label (if multiclass)
         n_pos = np.sum(labels == 1, axis=0)
-
         # n_neg = negative counts per label (if multiclass)
         n_neg = num_samples - n_pos
 
-        # target probabilities
+        # Target probabilities (Platt's label smoothing)
         targets = np.where(labels == 1,
                            (n_pos + 1) / (n_pos + 2),
                            1.0 / (n_neg + 2))
 
-        # Initialize A, B
-        self.platt_coefficient = 1.0
-        self.platt_intercept = np.log((n_neg + 1) / (n_pos + 1)) # valid init?
+        # Platt's initialisation: flat coefficient, intercept at the log odds
+        self.platt_coefficient = np.zeros_like(n_pos, dtype=np.float64)
+        self.platt_intercept = np.log((n_neg + 1) / (n_pos + 1)).astype(np.float64)
 
         for step_i in range(max_iter):
-            # compute the forward
             prob_scores = self._platt_forward(logits)
+            residual = prob_scores - targets
 
-            loss = prob_scores - targets  # shape (num_samples,)
-            # gradients
-            delta_a = logits.T @ logits
-            delta_b = np.sum(loss)
+            # gradient of the NLL. d/dA is the residual weighted by the score,
+            # d/dB is the plain residual sum, both reduced over samples only so
+            # every column keeps its own parameters.
+            grad_a = np.sum(residual * logits, axis=0)
+            grad_b = np.sum(residual, axis=0)
 
-            # hessian diagonal approximation: H = p*(1-p))
-            w = prob_scores * (1.0 - prob_scores)  # weights
-            _h11 = w.T @ (logits ** 2)
-            _h22 = np.sum(w)
-            _h12 = w.T @ logits
+            # Hessian entries, w = p (1 - p)
+            w = prob_scores * (1.0 - prob_scores)
+            _h11 = np.sum(w * logits ** 2, axis=0)
+            _h22 = np.sum(w, axis=0)
+            _h12 = np.sum(w * logits, axis=0)
 
-            # 2x2 determinate
             determinate = (_h11 * _h22) - (_h12 * _h12)
-            if np.any(np.abs(determinate)) < 1e-15: # TODO: EPSILON
-                print('nope')
+            if np.any(np.abs(determinate) < EPSILON):
                 break
 
-            # Newton step (solve H * delta = -grad)
-            delta_a = -((_h22 * delta_a - _h12 * delta_b) / determinate).ravel()
-            delta_b = -((_h11 * delta_b - _h12 * delta_a) / determinate).ravel()
+            # Newton direction, solving H @ delta = -grad for the 2x2 system.
+            # Both components read the original gradient, so neither may be
+            # written until the pair has been computed.
+            delta_a = -(_h22 * grad_a - _h12 * grad_b) / determinate
+            delta_b = -(_h11 * grad_b - _h12 * grad_a) / determinate
 
-            # Line search with halving
+            base_coef = self.platt_coefficient
+            base_intercept = self.platt_intercept
+            old_nll = self._nll(logits, targets, base_coef, base_intercept)
+
+            # backtracking line search. Each trial starts from the base point
+            # rather than the previous trial, so halving shortens the step
+            # instead of compounding it.
             step = 1.0
-            old_nll = self._nll(scores=logits,
-                                targets=targets,
-                                coef=self.platt_coefficient,
-                                intercept=self.platt_intercept)
-
-            new_coef = copy.copy(self.platt_coefficient)
-            new_intercept = copy.copy(self.platt_intercept)
-
-            # N-steps down this line---
+            accepted = False
             for _ in range(10):
-                new_coef = new_coef + (step * delta_a)
-                new_intercept = new_intercept + (step * delta_b)
-                new_nll = self._nll(scores=logits,
-                                    targets=targets,
-                                    coef=new_coef,
-                                    intercept=new_intercept)
-
-                # reduce delta by half
-                step *= 0.5
-                if new_nll < old_nll:
+                trial_coef = base_coef + step * delta_a
+                trial_intercept = base_intercept + step * delta_b
+                if self._nll(logits, targets, trial_coef, trial_intercept) < old_nll:
+                    accepted = True
                     break
+                step *= 0.5
 
+            if not accepted:
+                break
 
-            # adjust weights
-            self.platt_coefficient -= (step * delta_a)
-            self.platt_intercept -= (step * delta_b)
+            # move along the direction that was actually tested
+            self.platt_coefficient = base_coef + step * delta_a
+            self.platt_intercept = base_intercept + step * delta_b
 
-            # Convergence check
-            if (abs(step * delta_a) < tolerance) and (abs(step * delta_b) < tolerance):
-                print(f'halted at convergence {step_i}')
+            movement = max(
+                np.max(np.abs(step * delta_a)), np.max(np.abs(step * delta_b))
+            )
+            if movement < tolerance:
                 break
 
         return self
 
     def _nll(self, scores: NDArray, targets: NDArray, coef: Optional = None, intercept: Optional = None) -> float:
-        """Negative log-likelihood for platt scaling."""
+        """Negative log-likelihood for Platt scaling."""
         if (coef is not None) and (intercept is not None):
             p = sigmoid(coef * scores + intercept)
         else:
             p = sigmoid(scores)
         p = np.clip(p, 1e-15, 1.0 - 1e-15)
-
         return -np.sum(targets * np.log(p) + (1 - targets) * np.log(1 - p))
 
 
     # Isotonic Regression (PAVA) # ──────────────────────────────────────────────
+
     @staticmethod
     def _pava(y: NDArray) -> NDArray:
         """
-        Pool Adjacent Violators Algorithm (PAVA)
+        Pool Adjacent Violators Algorithm.
 
-        finds the isotonic (non-decreasing) regression of y that minimizes
-        the weighted least squares.
-        Assumptions: y values move isotonically increasing only
+        Finds the isotonic (non-decreasing) regression of y that minimizes
+        the weighted least squares: sum w_i * (y_i - y_hat_i)^2
+        subject to y_hat being non-decreasing.
 
         Parameters
         ----------
-        y : ndarray, shape (num samples)
+        y : ndarray, shape (n,)
+            Input values.
 
         Returns
         -------
-        result : ndarray, shape (num_samples,) Isotonic (non-decreasing) fitted values.
+        result : ndarray, shape (n,)
+            Isotonic (non-decreasing) fitted values.
         """
         n = len(y)
         if n <= 1:
@@ -291,18 +291,18 @@ class ProbCalibration(BasalModel):
     def _fit_isotonic(self,
                       logits: NDArray,
                       labels: NDArray,
-                      ) -> BasalModel:
+                      ) -> "ProbCalibration":
         """
-        fit isotonic regression using the PAVA.
+        Fit isotonic regression using the Pool Adjacent Violators Algorithm (PAVA).
 
-        produces a non-decreasing mapping from scores to calibrated probabilities.
-        collapses each constant-value PAVA block into a single knot at the block's
+        Produces a non-decreasing mapping from scores to calibrated probabilities.
+        Collapses each constant-value PAVA block into a single knot at the block's
         centroid score, enabling smooth linear interpolation between steps.
 
         Parameters
         ----------
-        logits : ndarray, shape (num_samples,) or (num_samples, 1)
-        labels : ndarray, shape (num_samples,) or (num_samples, 1) with values in {0, 1}
+        logits : ndarray, shape (n_samples,) or (n_samples, 1)
+        labels : ndarray, shape (n_samples,) or (n_samples, 1) with values in {0, 1}
 
         Returns
         -------
@@ -313,15 +313,16 @@ class ProbCalibration(BasalModel):
         labels_flat = labels.ravel()
         num_samples = len(scores_flat)
 
+        # Sort by score
         order = np.argsort(scores_flat)
         sorted_scores = scores_flat[order]
         sorted_labels = labels_flat[order]
 
-        # run PAVA on 1D sorted labels
+        # Run PAVA on 1D sorted labels → non-decreasing step function
         isotonic_values = self._pava(sorted_labels)
 
-        # collapse to one knot per PAVA block
-        # identify block boundaries: where the isotonic value changes
+        # Collapse to one knot per PAVA block (centroid of scores in each block)
+        # Identify block boundaries: where the isotonic value changes
         change_mask = np.diff(isotonic_values) != 0
         change_points = np.where(change_mask)[0] + 1
 
@@ -333,8 +334,9 @@ class ProbCalibration(BasalModel):
         self.isotonic_values = np.empty(n_blocks, dtype=np.float64)
 
         for i, (start, end) in enumerate(zip(block_starts, block_ends)):
-            # central score is the representative point
+            # Centroid score for this block → representative x position
             self.isotonic_scores[i] = np.mean(sorted_scores[start:end])
+            # Isotonic value is constant within the block
             self.isotonic_values[i] = isotonic_values[start]
 
         return self
@@ -342,15 +344,15 @@ class ProbCalibration(BasalModel):
 
     def _predict_isotonic(self, y_score: NDArray) -> NDArray:
         """
-        apply isotonic calibration via linear interpolation.
+        Apply isotonic calibration via linear interpolation.
 
-        for each input score, linearly interpolate between the fitted
+        For each input score, linearly interpolate between the fitted
         (isotonic_scores -> isotonic_values) knot pairs.
         Scores outside the fitted range are clamped to boundary values.
 
         Parameters
         ----------
-        y_score : ndarray of shape (num_samples,) or (num_samples, 1)
+        y_score : ndarray of shape (n_samples,) or (n_samples, 1)
 
         Returns
         -------
@@ -369,23 +371,23 @@ class ProbCalibration(BasalModel):
 
         return calibrated_flat.reshape(original_shape)
 
-    # monotone spline ----------
+    # Monotone Spline (Fritsch-Carlson PCHIP) ----------
     def _fit_monotone_spline(self,
                              scores: NDArray,
                              labels: NDArray
-                             ) -> Tuple[NDArray, NDArray, NDArray]:
+                             ) -> "ProbCalibration":
         """
-        fit a monotone cubic Hermite spline
+        Fit a monotone cubic Hermite spline (Fritsch-Carlson method).
 
         Steps:
-          1. apply PAVA to get monotone (score, probability) pairs.
-          2. deduplicate tied scores.
-          3. compute derivatives at each knot that guarantee monotonicity.
+          1. Apply PAVA to get monotone (score, probability) pairs.
+          2. Deduplicate tied scores.
+          3. Compute derivatives at each knot that guarantee monotonicity.
 
         Parameters
         ----------
-        scores : ndarray, shape (num_samples,)
-        labels : ndarray, shape (num_samples,) with values in {0, 1}
+        scores : ndarray, shape (n,)
+        labels : ndarray, shape (n,) with values in {0, 1}
 
         Returns
         -------
@@ -396,12 +398,13 @@ class ProbCalibration(BasalModel):
         # Get isotonic step function first
         self._fit_isotonic(scores, labels)
 
-        # Need at least 2 points for a spline
+        # Need at least 2 points for a spline. Fall back to the flat isotonic
+        # step function, and still return self so fit_predict can chain.
         if len(self.isotonic_scores) < 2:
-            return (self.isotonic_scores,
-                    self.isotonic_values,
-                    np.zeros_like(self.isotonic_values)
-                    )
+            self.spline_x = self.isotonic_scores
+            self.spline_y = self.isotonic_values
+            self.spline_d = np.zeros_like(self.isotonic_values)
+            return self
 
         # Compute monotone Hermite derivatives (Fritsch-Carlson)
         self.spline_d = self._fritsch_carlson_derivatives(self.isotonic_scores, self.isotonic_values)
@@ -418,12 +421,12 @@ class ProbCalibration(BasalModel):
 
         Parameters
         ----------
-        x : ndarray, shape (num_samples,) - strictly increasing knot positions
-        y : ndarray, shape (num_samples,) - non-decreasing knot values
+        x : ndarray, shape (n,) - strictly increasing knot positions
+        y : ndarray, shape (n,) - non-decreasing knot values
 
         Returns
         -------
-        d : ndarray, shape (num_samples,) - derivatives at each knot
+        d : ndarray, shape (n,) - derivatives at each knot
         """
         n = len(x)
         d = np.zeros(n)
@@ -486,7 +489,7 @@ class ProbCalibration(BasalModel):
 
         Parameters
         ----------
-        y_score : ndarray of shape (num_samples,) or (num_samples, 1)
+        y_score : ndarray of shape (n_samples,) or (n_samples, 1)
 
         Returns
         -------
@@ -494,6 +497,11 @@ class ProbCalibration(BasalModel):
         """
         original_shape = y_score.shape
         scores_flat = y_score.ravel()
+
+        # a single knot leaves no interval to interpolate over, so the fitted
+        # value is constant everywhere
+        if len(self.spline_x) < 2:
+            return np.full(original_shape, self.spline_y[0], dtype=np.float64)
 
         s = np.clip(scores_flat, self.spline_x[0], self.spline_x[-1])
 

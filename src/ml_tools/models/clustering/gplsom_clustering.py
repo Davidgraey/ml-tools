@@ -1,9 +1,8 @@
 import time
-from typing import Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
+from typing import Optional
 
 from ml_tools.models.clustering.plsom_clustering import PLSOM
 from ml_tools.visuals.cluster_visuals import plot_clusters
@@ -11,31 +10,30 @@ from ml_tools.visuals.cluster_visuals import plot_clusters
 
 class GPLSOM(PLSOM):
     """
-    Growing and Shrinking Parameterless SOM (GPLSOM)
+    Growing and Shrinking Parameterless SOM.
 
-    Extends the PLSOM with adaptive topology:
-    - **Growth**: triggered when a neuron has high quantization error (mean distance to
-      the samples it represents).  Boundary neurons spawn a new neighbor outward;
-      interior neurons spawn a new node between themselves and their highest-error
-      neighbor, with interpolated weights.
-    - **Shrinking / Pruning**: triggered when a neuron is rarely selected as BMU *and*
-      its weight vector is close to all of its grid neighbors (i.e. it is redundant).
+    The lattice stays a full rectangle. Growth and pruning add or drop a whole
+    row or column, so everything inherited from PLSOM keeps working unchanged --
+    manhattan distance on a grid is still well defined, it just covers a grid of
+    a different size.
 
-    The grid is represented as a flexible adjacency graph so that topology changes
-    do not require the map to stay rectangular.
+    Growth follows GSOM (Alahakoon et al.), comparing an accumulated
+    quantisation error per node against a threshold set by a spread factor:
 
-    Core PLSOM equations (unchanged):
-        ε(t)   = ||x(t) - w_c(t)||_2 / r(t)
-        r(0)   = ||x(0) - w_c(0)||_2
-        r(t)   = max( ||x(t)-w_c(t)||_2, r(t-1) )
-        Θ(ε)   = neighborhood scale from ε
-        h_ci   = exp( - d(i,c)^2 / Θ(ε)^2 )
-        Δw_i   = ε · h_ci · (x - w_i)
+        GT = -input_dim * ln(spread_factor)
 
-    References
-    ----------
-    - PLSOM: https://arxiv.org/pdf/0705.0199
-    - Growing SOM / Neural Gas: Fritzke (1995)
+    When the worst node's accumulated error passes GT the map grows near that
+    node. A node on the boundary grows outward, and the new line is
+    extrapolated from the two lines behind it. An interior node splits between
+    its neighbours, interpolated from them, which relieves crowding rather than
+    only widening the footprint.
+
+    Pruning is the mirror: a row or column whose share of recent activity falls
+    well below the average line is dropped, subject to a floor on map size.
+    Both signals read the decayed hit_map and node_error from PLSOM, so they
+    describe recent behaviour rather than the whole training history.
+
+    https://arxiv.org/pdf/0705.0199    (PLSOM)
     """
 
     def __init__(
@@ -46,27 +44,29 @@ class GPLSOM(PLSOM):
         theta_min=None,
         theta_max=None,
         lock_seed: int = 42,
-        distance: str = "euclidean",
+        distance="euclidean",
         verbose: bool = False,
-        # ---- growth / shrink knobs ----
-        growth_threshold: float = 0.85,
-        shrink_threshold: float = 0.02,
-        grow_every: int = 1,
-        min_neurons: int = 4,
-        max_neurons: int = 400,
+        hit_decay: float = 0.9,
+        spread_factor: float = 0.5,
+        prune_ratio: float = 0.25,
+        min_shape: tuple[int, int] = (2, 2),
+        max_neurons: Optional[int] = None,
+        settle_epochs: int = 3,
     ):
         """
         Parameters
         ----------
-        width, height : initial rectangular grid size
-        input_dim : feature dimensionality
-        growth_threshold : quantile of per-neuron distortion above which growth is
-            triggered (0-1, higher = more conservative).
-        shrink_threshold : fraction of mean hits below which a neuron is a candidate
-            for pruning (0-1, lower = more aggressive).
-        grow_every : apply grow/shrink logic every N epochs.
-        min_neurons : never shrink below this count.
-        max_neurons : never grow beyond this count.
+        width, height, input_dim, theta_min, theta_max, lock_seed, distance,
+        verbose, hit_decay : see PLSOM
+        spread_factor : GSOM spread factor in (0, 1). Lower raises the growth
+            threshold and yields a smaller final map.
+        prune_ratio : a row or column becomes a pruning candidate when its
+            share of recent hits drops below this fraction of the average line.
+        min_shape : (rows, cols) floor, so pruning cannot collapse the map.
+        max_neurons : ceiling on total neurons. Defaults to four times the
+            starting count.
+        settle_epochs : epochs to wait between structural changes, so the map
+            can converge before it is measured again.
         """
         super().__init__(
             width=width,
@@ -77,395 +77,290 @@ class GPLSOM(PLSOM):
             lock_seed=lock_seed,
             distance=distance,
             verbose=verbose,
+            hit_decay=hit_decay,
         )
 
-        # Growth / shrink configuration
-        self.growth_threshold = growth_threshold
-        self.shrink_threshold = shrink_threshold
-        self.grow_every = grow_every
-        self.min_neurons = min_neurons
-        self.max_neurons = max_neurons
+        assert 0.0 < spread_factor < 1.0, "spread_factor must be in (0, 1)"
 
-        # Per-neuron accumulated distortion (quantization error)
-        self.distortion_map = np.zeros(self.n_neurons)
+        self.spread_factor = spread_factor
+        self.growth_threshold = -input_dim * np.log(spread_factor)
+        self.prune_ratio = prune_ratio
+        self.min_shape = min_shape
+        self.max_neurons = max_neurons if max_neurons else 4 * self.n_neurons
+        self.settle_epochs = settle_epochs
 
-        # Adjacency graph: node_id -> set of neighbor node_ids
-        self.adjacency: dict[int, set[int]] = self._build_adjacency_from_grid()
+        self.last_structural_epoch = -settle_epochs
+        self.structure_trace: list[tuple[int, str, int, int]] = []
 
-        # Track topology change history for diagnostics
-        self.topology_history: list[dict] = []
-
+    # -------------    the grow / prune decision    --------------------
     # ------------------------------------------------------------------
-    #  PLSOM hook overrides (called from super().fit)
-    # ------------------------------------------------------------------
-    def _on_sample_update(self, bmu_i: int | NDArray, sample_distances: NDArray) -> None:
-        """Accumulate per-neuron distortion for the BMU."""
-        self.distortion_map[bmu_i] += sample_distances[bmu_i]
+    def after_epoch(self, step: int) -> None:
+        """
+        At most one structural change per epoch, growth taking precedence.
+        Doing both in one epoch oscillates, since the two decisions read the
+        same decayed counters.
+        """
+        if self.weights is None:
+            return
+        if step - self.last_structural_epoch < self.settle_epochs:
+            return
 
-    def _on_epoch_end(self, step: int, num_iterations: int) -> None:
-        """Apply topology adaptation (grow/shrink) at configured intervals."""
-        if (step + 1) % self.grow_every == 0 and step < num_iterations - 1:
-            self.grow()
-            self.shrink()
+        if self.mean_node_error().max() > self.growth_threshold:
+            axis, position, edge = self.pick_growth_site()
+            if self.growth_fits(axis):
+                self.grow_line(axis, position, edge)
+                self.structure_trace.append((step, "grow", *self.network_shape))
+                self.last_structural_epoch = step
+                return
 
-    # ------------------------------------------------------------------
-    #  Adjacency helpers
-    # ------------------------------------------------------------------
-    def _build_adjacency_from_grid(self) -> dict[int, set[int]]:
-        """Build an adjacency graph from the current rectangular grid."""
+        candidate = self.pick_prune_site()
+        if candidate is not None:
+            self.prune_line(*candidate)
+            self.structure_trace.append((step, "prune", *self.network_shape))
+            self.last_structural_epoch = step
+
+    def mean_node_error(self) -> NDArray:
+        """
+        Average quantisation error per sample assigned to each node.
+
+        The raw node_error is a decayed sum over every sample the node won, so
+        its scale rides on dataset size and would clear any fixed threshold.
+        Dividing by the hit count puts it in the units of a single distance,
+        which is what GT = -input_dim * ln(spread_factor) is expressed in.
+        """
+        return self.node_error / np.maximum(self.hit_map, 1.0)
+
+    def growth_fits(self, axis: int) -> bool:
+        """
+        Whether a new line along this axis stays inside the neuron budget. The
+        check has to be made against the post-growth count, since a line adds a
+        whole row or column at once rather than a single node.
+        """
+        addition = self.network_shape[1 - axis]
+        return self.n_neurons + addition <= self.max_neurons
+
+    def pick_growth_site(self) -> tuple[int, int, bool]:
+        """
+        Find the worst node and decide where its new line goes.
+
+        Returns
+        -------
+        (axis, position, edge): axis 0 inserts a row and 1 a column, position
+        is the insertion index, and edge marks an outward extension rather than
+        an interior split.
+        """
         rows, cols = self.network_shape
-        adj: dict[int, set[int]] = {i: set() for i in range(self.n_neurons)}
-        for idx in range(self.n_neurons):
-            r, c = self._idx_to_grid(idx)
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols:
-                    neighbor_idx = self._grid_to_idx((nr, nc))
-                    adj[idx].add(neighbor_idx)
-        return adj
+        row, col = self._idx_to_grid(int(np.argmax(self.mean_node_error())))
 
-    def _rebuild_graph_distances(self) -> NDArray:
+        # grow along whichever axis the node sits further out on, so a node
+        # stranded against an edge extends the map that way. The offsets are
+        # normalised by each axis's extent, otherwise the longer axis keeps
+        # winning and the lattice drifts into a stripe.
+        row_offset = abs(row - (rows - 1) / 2) / max(rows - 1, 1)
+        col_offset = abs(col - (cols - 1) / 2) / max(cols - 1, 1)
+        axis = 0 if row_offset >= col_offset else 1
+
+        index, extent = (row, rows) if axis == 0 else (col, cols)
+
+        if index == 0:
+            return axis, 0, True
+        if index == extent - 1:
+            return axis, extent, True
+
+        return axis, index + 1, False
+
+    def pick_prune_site(self) -> Optional[tuple[int, int]]:
         """
-        Compute shortest-path (BFS) distances between all neurons using the
-        adjacency graph.  This replaces the rectangular manhattan-distance grid
-        and works for arbitrary topologies.
+        The coldest row or column, when it is cold enough to be worth dropping
+        and the map can afford to lose it.
         """
-        n = self.n_neurons
-        dist = np.full((n, n), np.inf)
-        np.fill_diagonal(dist, 0.0)
+        candidates = []
+        for axis in (0, 1):
+            if self.network_shape[axis] <= self.min_shape[axis]:
+                continue
 
-        for source in range(n):
-            visited = {source}
-            frontier = [source]
-            d = 0
-            while frontier:
-                d += 1
-                next_frontier = []
-                for node in frontier:
-                    for neighbor in self.adjacency.get(node, set()):
-                        if neighbor not in visited:
-                            visited.add(neighbor)
-                            dist[source, neighbor] = d
-                            next_frontier.append(neighbor)
-                frontier = next_frontier
-        return dist
+            line_hits = self.hit_map.reshape(self.network_shape).sum(axis=1 - axis)
+            average = line_hits.mean()
+            if average <= 0:
+                continue
 
-    def _is_boundary_node(self, idx: int) -> bool:
-        """A node is on the boundary if it has fewer than 4 neighbors."""
-        return len(self.adjacency.get(idx, set())) < 4
+            position = int(np.argmin(line_hits))
+            if line_hits[position] < self.prune_ratio * average:
+                candidates.append((float(line_hits[position]), axis, position))
 
-    def _get_neighbors(self, idx: int) -> list[int]:
-        """Return sorted list of neighbor indices for *idx*."""
-        return sorted(self.adjacency.get(idx, set()))
+        if not candidates:
+            return None
 
+        _, axis, position = min(candidates)
+        return axis, position
+
+    # -------------    the structural operations    --------------------
     # ------------------------------------------------------------------
-    #  Topology mutations
-    # ------------------------------------------------------------------
-    def _add_neuron(self, new_weights: NDArray, connect_to: list[int]) -> int:
+    def weight_grid(self) -> NDArray:
+        """weights as (rows, cols, dims), which is how the lattice reads"""
+        return self.weights.reshape(*self.network_shape, self.N_DIMS)
+
+    def new_line(self, axis: int, position: int, edge: bool) -> NDArray:
         """
-        Insert a single neuron into the map.
-
-        Parameters
-        ----------
-        new_weights : weight vector for the new neuron (shape: input_dim,)
-        connect_to  : list of existing neuron indices to connect to
-
-        Returns
-        -------
-        The index of the newly created neuron.
+        Weights for the line about to be inserted. Interior lines interpolate
+        between the neighbours they separate, edge lines extrapolate outward
+        from the two lines behind them.
         """
-        new_idx = self.n_neurons
+        lines = np.moveaxis(self.weight_grid(), axis, 0)
 
-        # Expand weight matrix
-        self.weights = np.vstack([self.weights, new_weights.reshape(1, -1)])
+        if not edge:
+            return 0.5 * (lines[position - 1] + lines[position])
 
-        # Expand tracking arrays
-        self.hit_map = np.append(self.hit_map, 0.0)
-        self.distortion_map = np.append(self.distortion_map, 0.0)
+        if position == 0:
+            return 2 * lines[0] - lines[1]
+        return 2 * lines[-1] - lines[-2]
 
-        # Update counts
-        self.n_neurons += 1
+    def grow_line(self, axis: int, position: int, edge: bool) -> None:
+        """insert a row (axis 0) or column (axis 1) at position"""
+        addition = self.new_line(axis, position, edge)
+        grid = np.insert(self.weight_grid(), position, addition, axis=axis)
 
-        # Update adjacency
-        self.adjacency[new_idx] = set(connect_to)
-        for neighbor in connect_to:
-            self.adjacency[neighbor].add(new_idx)
+        self.network_shape[axis] += 1
+        self.resync(grid, axis, position, inserted=True)
 
-        return new_idx
+    def prune_line(self, axis: int, position: int) -> None:
+        """drop a row (axis 0) or column (axis 1)"""
+        grid = np.delete(self.weight_grid(), position, axis=axis)
 
-    def _remove_neuron(self, idx: int) -> None:
+        self.network_shape[axis] -= 1
+        self.resync(grid, axis, position, inserted=False)
+
+    def resync(self, grid: NDArray, axis: int, position: int, inserted: bool) -> None:
         """
-        Remove a single neuron from the map.  Neighbors of the removed node
-        are *not* reconnected to each other (the gap is simply closed).
+        Return the map to a consistent state after a structural change: weights
+        flattened, lattice distances rebuilt, per-node records resized, and the
+        PLSOM radius reset.
         """
-        if self.n_neurons <= self.min_neurons:
-            return
+        rows, cols = self.network_shape
+        self.height, self.width = rows, cols
+        self.n_neurons = rows * cols
+        self.weights = grid.reshape(self.n_neurons, self.N_DIMS)
+        self.grid_distances = self.build_grid()
 
-        # Disconnect from neighbors
-        for neighbor in list(self.adjacency.get(idx, set())):
-            self.adjacency[neighbor].discard(idx)
-        del self.adjacency[idx]
-
-        # Delete from weight matrix & tracking arrays
-        self.weights = np.delete(self.weights, idx, axis=0)
-        self.hit_map = np.delete(self.hit_map, idx)
-        self.distortion_map = np.delete(self.distortion_map, idx)
-        self.n_neurons -= 1
-
-        # Re-index everything above `idx` (shift down by 1)
-        new_adj: dict[int, set[int]] = {}
-        for old_key, old_neighbors in self.adjacency.items():
-            new_key = old_key if old_key < idx else old_key - 1
-            new_neighbors = set()
-            for n in old_neighbors:
-                new_neighbors.add(n if n < idx else n - 1)
-            new_adj[new_key] = new_neighbors
-        self.adjacency = new_adj
-
-    def _rebuild_after_topology_change(self) -> None:
-        """rebuild grid distances and update network_shape after a topology change."""
-        self.grid_distances = self._rebuild_graph_distances()
-
-        # network_shape is kept for compatibility but is now approximate
-        side = int(np.ceil(np.sqrt(self.n_neurons)))
-        self.network_shape = [side, int(np.ceil(self.n_neurons / side))]
-
-    #  Growth logic
-    def grow(self) -> int:
-        """
-        evaluate every neuron's distortion and grow where needed.
-
-        Growth strategy:
-        - mean distortion per neuron (accumulated error / hits).
-        - neurons above the ``growth_threshold`` quantile are candidates.
-        - **Boundary** candidate: spawn a new neuron *outward*, with weights
-          extrapolated from the candidate and the mean of its neighbors.
-        - **Interior** candidate: spawn a new neuron *between* the candidate and
-          its highest-distortion neighbor, with interpolated weights.
-
-        Returns
-        -------
-        Number of neurons added.
-        """
-        if self.n_neurons >= self.max_neurons:
-            return 0
-
-        # Snapshot the original neuron count — mean_distortion is only valid for
-        # indices [0, n_original).  Neurons added during this loop must not be
-        # looked up in this array.
-        n_original = self.n_neurons
-
-        # Mean distortion per neuron (avoid /0)
-        active_mask = self.hit_map[:n_original] > 0
-        mean_distortion = np.zeros(n_original)
-        mean_distortion[active_mask] = (
-            self.distortion_map[:n_original][active_mask]
-            / self.hit_map[:n_original][active_mask]
+        # a new line inherits its neighbours' activity, otherwise it is the
+        # coldest line in the map by construction and pruning removes it again
+        self.hit_map = self.resize_record(
+            self.hit_map, axis, position, inserted, fill="neighbour_mean"
+        )
+        # error, by contrast, starts at zero so the new line does not itself
+        # look like it needs splitting
+        self.node_error = self.resize_record(
+            self.node_error, axis, position, inserted, fill="zero"
         )
 
-        if mean_distortion.max() == 0:
-            return 0
+        if inserted:
+            # halve the records either side of a split so the same node does not
+            # immediately trigger the next growth event
+            lines = np.moveaxis(self.node_error.reshape(rows, cols), axis, 0)
+            for neighbour in (position - 1, position + 1):
+                if 0 <= neighbour < lines.shape[0]:
+                    lines[neighbour] *= 0.5
 
-        threshold = np.quantile(mean_distortion[active_mask], self.growth_threshold)
-        candidates = np.where(mean_distortion >= threshold)[0]
+        # changing the node count changes the scale of BMU distances, so the
+        # running maximum driving epsilon has to re-establish itself
+        self.previous_step_r = 0
 
-        added = 0
-        for cand in candidates:
-            if self.n_neurons >= self.max_neurons:
-                break
-
-            # Only consider original-topology neighbors (filter out any newly added)
-            neighbors = [n for n in self._get_neighbors(cand) if n < n_original]
-            if len(neighbors) == 0:
-                continue
-
-            neighbor_weights = self.weights[neighbors]
-            neighbor_mean = np.mean(neighbor_weights, axis=0)
-
-            if self._is_boundary_node(cand):
-                # Extrapolate outward: new = candidate + (candidate - neighbor_mean)
-                new_w = self.weights[cand] + 0.5 * (self.weights[cand] - neighbor_mean)
-                self._add_neuron(new_w, connect_to=[cand])
-            else:
-                # Interior: insert between candidate and its worst neighbor
-                neighbor_distortions = mean_distortion[neighbors]
-                worst_neighbor = neighbors[int(np.argmax(neighbor_distortions))]
-                new_w = 0.5 * (self.weights[cand] + self.weights[worst_neighbor])
-                # Connect to both the candidate and the worst neighbor
-                self._add_neuron(new_w, connect_to=[cand, worst_neighbor])
-                # Break direct edge between cand <-> worst_neighbor
-                # to keep the graph planar (the new node sits "between" them)
-                self.adjacency[cand].discard(worst_neighbor)
-                self.adjacency[worst_neighbor].discard(cand)
-
-            added += 1
-
-        if added > 0:
-            self._rebuild_after_topology_change()
-            self.topology_history.append(
-                {"epoch": len(self.q_error_trace), "action": "grow", "count": added,
-                 "n_neurons": self.n_neurons}
-            )
-            if self.verbose:
-                print(f"[GPLSOM] Grew {added} neuron(s) → {self.n_neurons} total")
-
-        return added
-
-    # ------------------------------------------------------------------
-    #  Shrink logic
-    # ------------------------------------------------------------------
-    def shrink(self) -> int:
+    def resize_record(
+        self,
+        record: NDArray,
+        axis: int,
+        position: int,
+        inserted: bool,
+        fill: str = "zero",
+    ) -> NDArray:
         """
-        Remove redundant neurons.
+        Insert a line into, or delete a line from, a per-node record so it stays
+        aligned with the lattice. network_shape is already updated, so the
+        record's own shape is still the pre-change one.
 
-        A neuron is pruned when:
-        1. Its hit count is below ``shrink_threshold × mean(hit_map)``  (rarely used).
-        2. Its weight vector is close to all neighbors (redundant representation).
-
-        Returns
-        -------
-        Number of neurons removed.
+        fill picks what an inserted line starts at: "zero", or
+        "neighbour_mean" to average whichever adjacent lines exist.
         """
-        if self.n_neurons <= self.min_neurons:
-            return 0
+        rows, cols = self.network_shape
+        was = [rows, cols]
+        was[axis] += -1 if inserted else 1
 
-        mean_hits = np.mean(self.hit_map) if np.sum(self.hit_map) > 0 else 1.0
-        hit_threshold = self.shrink_threshold * mean_hits
+        grid = record.reshape(was[0], was[1])
 
-        # Compute per-neuron redundancy: mean weight-space distance to neighbors
-        redundancy = np.full(self.n_neurons, np.inf)
-        for idx in range(self.n_neurons):
-            neighbors = self._get_neighbors(idx)
-            if len(neighbors) == 0:
-                continue
-            neighbor_weights = self.weights[neighbors]
-            dists = self.distance_function(
-                self.weights[idx].reshape(1, -1), neighbor_weights
+        if not inserted:
+            return np.delete(grid, position, axis=axis).reshape(-1)
+
+        lines = np.moveaxis(grid, axis, 0)
+        if fill == "neighbour_mean":
+            neighbours = [
+                lines[i] for i in (position - 1, position) if 0 <= i < lines.shape[0]
+            ]
+            addition = np.mean(neighbours, axis=0)
+        else:
+            addition = np.zeros(lines.shape[1])
+
+        return np.insert(grid, position, addition, axis=axis).reshape(-1)
+
+    def predict(self, x: NDArray, n_clusters: int, verbose: bool = False) -> NDArray:
+        """
+        As PLSOM.predict, but the lattice can have shrunk since construction.
+        The downstream clusterer runs on the neurons rather than the samples, so
+        asking for more clusters than the map can support fails deep inside it
+        with an out of bounds partition. Clamp instead.
+        """
+        affordable = max(2, self.n_neurons // 2)
+        if n_clusters > affordable:
+            print(
+                f"n_clusters {n_clusters} exceeds what a {self.network_shape} "
+                f"lattice supports, clamping to {affordable}"
             )
-            redundancy[idx] = np.mean(dists)
+            n_clusters = affordable
 
-        # median neighbor distance as a scale reference
-        finite_mask = np.isfinite(redundancy)
-        if not np.any(finite_mask):
-            return 0
-        redundancy_threshold = np.median(redundancy[finite_mask]) * 0.33
+        return super().predict(x=x, n_clusters=n_clusters, verbose=verbose)
 
-        # Candidates: low hits AND close to neighbors
-        candidates = np.where(
-            (self.hit_map <= hit_threshold) & (redundancy <= redundancy_threshold)
-        )[0]
+    def fit_predict(
+        self,
+        x_data: NDArray,
+        grid_dim: int,
+        num_iterations: int,
+        max_clusters: int,
+        verbose: Optional[bool] = None,
+    ):
+        """fit then predict, reporting where the lattice ended up"""
+        start = time.time()
+        self.fit(x_data, num_iterations)
 
-        # Sort by hits ascending so we remove the least-used first
-        candidates = candidates[np.argsort(self.hit_map[candidates])]
+        prediction = self.predict(x=x_data, n_clusters=max_clusters, verbose=verbose)
 
-        removed = 0
-        # Remove one at a time (indices shift after each removal)
-        for cand in candidates:
-            if self.n_neurons <= self.min_neurons:
-                break
-            # Re-check after prior removals may have shifted things
-            if cand >= self.n_neurons:
-                continue
+        print(f"gplsom_fit_predict took {time.time() - start:.2f}s")
+        print(
+            f"lattice finished at {self.network_shape} after "
+            f"{len(self.structure_trace)} structural changes"
+        )
 
-            # Before removing, reconnect its neighbors to each other so the graph
-            # doesn't fragment
-            neighbors = self._get_neighbors(cand)
-            for i, ni in enumerate(neighbors):
-                for nj in neighbors[i + 1:]:
-                    self.adjacency[ni].add(nj)
-                    self.adjacency[nj].add(ni)
+        if self.verbose or verbose:
+            self.plot_grid(samples=0, highlight_idx=None)
+            plot_clusters(x_data, prediction)
 
-            self._remove_neuron(cand)
-            removed += 1
-            # After removal, all indices >= cand shifted down; adjust remaining candidates
-            candidates = np.where(candidates > cand, candidates - 1, candidates)
+        return prediction
 
-        if removed > 0:
-            self._rebuild_after_topology_change()
-            self.topology_history.append(
-                {"epoch": len(self.q_error_trace), "action": "shrink", "count": removed,
-                 "n_neurons": self.n_neurons}
-            )
-            if self.verbose:
-                print(f"[GPLSOM] Pruned {removed} neuron(s) → {self.n_neurons} total")
-
-        return removed
-
-    # ------------------------------------------------------------------
-    #  Visualization (overrides to support non-rectangular topology)
-    # ------------------------------------------------------------------
-    def plot_grid(self, samples=0, highlight_idx=None):
-        """Plot neuron positions (first 2 weight dims) with adjacency edges."""
-        if self.weights.shape[1] < 2:
-            return
-
-        plt.figure(figsize=(15, 10))
-        plt.title(f"GPLSOM Grid ({self.n_neurons} neurons)")
-
-        if not isinstance(samples, int):
-            plt.scatter(samples[:, 0], samples[:, 1], alpha=0.2, s=5)
-
-        # Draw edges from adjacency
-        drawn = set()
-        for idx, neighbors in self.adjacency.items():
-            for n in neighbors:
-                edge = (min(idx, n), max(idx, n))
-                if edge not in drawn:
-                    drawn.add(edge)
-                    plt.plot(
-                        [self.weights[idx, 0], self.weights[n, 0]],
-                        [self.weights[idx, 1], self.weights[n, 1]],
-                        "b-", alpha=0.4, linewidth=0.8,
-                    )
-
-        plt.scatter(self.weights[:, 0], self.weights[:, 1], c="blue", s=30, zorder=5)
-
-        if highlight_idx is not None and highlight_idx < self.n_neurons:
-            plt.scatter(
-                self.weights[highlight_idx, 0],
-                self.weights[highlight_idx, 1],
-                s=200, c="red", zorder=6,
-            )
-        plt.show()
-
-    def plot_heatmap(self):
-        """Draw the hit map as a bar chart (topology may not be rectangular)."""
-        plt.figure(figsize=(12, 4))
-        plt.title("GPLSOM Hit Map")
-        plt.bar(range(self.n_neurons), self.hit_map)
-        plt.xlabel("Neuron index")
-        plt.ylabel("Hits")
-        plt.show()
-
-    def plot_topology_history(self):
-        """Visualise the growth/shrink events over training."""
-        if not self.topology_history:
-            print("No topology changes recorded.")
-            return
-        epochs = [e["epoch"] for e in self.topology_history]
-        sizes = [e["n_neurons"] for e in self.topology_history]
-        colors = ["green" if e["action"] == "grow" else "red" for e in self.topology_history]
-        plt.figure(figsize=(10, 4))
-        plt.title("GPLSOM Topology Changes")
-        plt.scatter(epochs, sizes, c=colors, s=40)
-        plt.plot(epochs, sizes, "k--", alpha=0.3)
-        plt.xlabel("Epoch")
-        plt.ylabel("Neuron count")
-        plt.show()
-
-    # ------------------------------------------------------------------
-    #  Forward / predict / fit_predict — all inherited from PLSOM
-    # ------------------------------------------------------------------
-
-    @property
-    def params(self):
-        return self.weights
+    def __str__(self):
+        return (
+            f"GPLSOM lattice {self.network_shape[0]}x{self.network_shape[1]}, "
+            f"growth threshold {self.growth_threshold:.3f}, "
+            f"{len(self.structure_trace)} structural changes"
+        )
 
 
 if __name__ == "__main__":
-    # Example usage
+    import matplotlib.pyplot as plt
     from ml_tools.generators import RandomDatasetGenerator
-    from ml_tools.models.clustering.cluster_metrics import *
+    from ml_tools.models.clustering.cluster_metrics import (
+        silhouette_score,
+        calinski_harabasz_index,
+        davies_bouldin_index,
+        homogeneity,
+    )
 
     feature_dim = 2
     gen = RandomDatasetGenerator(random_seed=123)
@@ -476,50 +371,61 @@ if __name__ == "__main__":
         num_clusters=6,
         noise_scale=0.4,
     )
+
+    # ground truth, before the map sees any of it
     plot_clusters(x_clust, y_clust, meta["centroids"])
 
-    max_clusters = 10
+    # start deliberately undersized so growth has something to do
+    som = GPLSOM(
+        width=3,
+        height=3,
+        input_dim=feature_dim,
+        theta_min=0.01,
+        theta_max=2.99,
+        spread_factor=0.95,
+        max_neurons=120,
+        verbose=False,
+    )
 
-    for dim in [6]:
-        num_steps = dim * 8
-        st = time.time()
+    start_neurons = som.n_neurons
+    som.fit(x_clust, num_iterations=60)
+    print(som)
+    for step, action, rows, cols in som.structure_trace:
+        print(f"  epoch {step:3d}  {action:5s} -> {rows}x{cols}")
+    print(
+        f"quantisation error {som.q_error_trace[0]:.4f} -> {som.q_error_trace[-1]:.4f}"
+    )
 
-        som = GPLSOM(
-            width=dim,
-            height=dim,
-            input_dim=feature_dim,
-            theta_min=0.01,
-            theta_max=dim - 0.01,
-            lock_seed=42,
-            distance="euclidean",
-            verbose=True,
-            growth_threshold=0.80,
-            shrink_threshold=0.05,
-            grow_every=2,
-            min_neurons=4,
-            max_neurons=200,
-        )
+    # the grown lattice, with the coldest unit marked. The weights live in
+    # standardized space, so the samples have to be standardized to match
+    som.plot_grid(
+        samples=som.standardize(x_clust), highlight_idx=int(np.argmin(som.hit_map))
+    )
+    # where the decayed hits landed across the final lattice
+    som.plot_heatmap()
 
-        predictions = som.fit_predict(
-            x_data=x_clust,
-            grid_dim=dim,
-            num_iterations=num_steps,
-            max_clusters=max_clusters,
-            verbose=True,
-        )
+    predictions = som.predict(x=x_clust, n_clusters=6)
+    print(f"silhouette (1 is best): {silhouette_score(x_clust, predictions):.4f}")
+    print(f"CH index (high):        {calinski_harabasz_index(x_clust, predictions):.4f}")
+    print(f"DB index (low):         {davies_bouldin_index(x_clust, predictions):.4f}")
+    print(f"homogeneity:            {homogeneity(y_clust, predictions):.4f}")
 
-        print("GPLSOM predict took: ", time.time() - st)
-        print(f"Final neuron count: {som.n_neurons}")
-        print(f"Topology events: {len(som.topology_history)}")
+    # the clustering the SOM's prototypes imply for the original samples
+    plot_clusters(x_clust, predictions)
 
-        som.plot_topology_history()
+    plt.plot(som.q_error_trace)
+    plt.plot(som.epsilon_trace)
+    plt.legend(["q_error", "epsilon"])
+    plt.title("GPLSOM convergence")
+    plt.show()
 
-        print("Predictions:", predictions[:20])
-        print("Truth:", y_clust[:20])
-
-        print(f"silhouette score (1 is best): {silhouette_score(x_clust, predictions)}")
-        print(f"CH index (high): {calinski_harabasz_index(x_clust, predictions)}")
-        print(f"DB index score (low): {davies_bouldin_index(x_clust, predictions)}")
-
-        print(f"homogeneity: {homogeneity(y_clust, predictions)}")
-        print(f"Mutual Information: {mutual_information_score(y_clust, predictions)}")
+    # lattice size over training, which the fixed-size PLSOM has no analogue for
+    epochs = [0] + [step for step, *_ in som.structure_trace]
+    neurons = [start_neurons] + [
+        rows * cols for _, _, rows, cols in som.structure_trace
+    ]
+    plt.step(epochs, neurons, where="post")
+    plt.xlabel("epoch")
+    plt.ylabel("neurons")
+    plt.title("GPLSOM lattice growth")
+    plt.show()

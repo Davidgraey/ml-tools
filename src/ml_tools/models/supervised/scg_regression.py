@@ -33,16 +33,17 @@ class GradientDescent(BasalModel):
     def __init__(
         self,
         task: str | ClassificationTask = "regression",
+        divisi: int = 3,
         reg_lambda: float = 0.1,
         reg_alpha: float = 0.5,
         use_elastic_reg: bool = False,
         early_termination: bool = True,
     ):
         """
-
         Parameters
         ----------
         task : Union[str, constants.ClassificationTask]
+        divisi : int the divisor to slow down learning rate - higher = slower
         reg_lambda : float  overall regularization strength
         reg_alpha : float balance between lasso L1 (0.0) ridge L2 (1.0)
         use_elastic_reg : bool enable elastic regularization
@@ -52,7 +53,7 @@ class GradientDescent(BasalModel):
         self.early_termination = early_termination
 
         # hyperparameters for elasticnet regularization
-        self.divisi = 0.5
+        self.divisi = divisi
         self.use_elastic_reg = use_elastic_reg
         self.reg_lambda: float = reg_lambda  # overall regularization strength
         self.reg_alpha: float = (
@@ -343,17 +344,16 @@ class GradientDescent(BasalModel):
             W = copy.deepcopy(self.weights)
 
             # weight updates -------------------------------------------------
+            if i % 2 == 0:
+                # Scaled Conjugate Gradient - take a partial step towards the SCG results
+                # between current weights and SCG weights
+                scg_weights = self.scaled_conjugate_gradient(xs, ys, iterations // 2)
+                self.weights = (W + scg_weights) / (self.divisi)
 
-            # Scaled Conjugate Gradient - take a partial step towards the SCG results
-            # between current weights and SCG weights
-            # delta_ws = self.scaled_conjugate_gradient(xs, ys, iterations // 2)
-            scg_weights = self.scaled_conjugate_gradient(xs, ys, 10)
-            self.weights = (W + (self.divisi * scg_weights)) / 2
-
-            # else:
-            #     # standard gradient descent approach ---------
-            #     delta_ws, prediction = self._calculate_gradients(xs, ys)
-            #     self.weights = (W + (self.divisi * delta_ws))
+            else:
+                # standard gradient descent approach ---------
+                delta_ws, prediction = self._calculate_gradients(xs, ys)
+                self.weights = W - (delta_ws * (0.001 / self.divisi))
 
             epoch_loss = np.mean(loss)
             errors.append(epoch_loss)
@@ -364,7 +364,7 @@ class GradientDescent(BasalModel):
                 loss_delta = np.array(errors[-min(i, 5) :]) - epoch_loss
                 loss_new = np.mean(self.calculate_loss(xs, ys))
                 if (np.mean(loss_delta) < 0.01) or ((epoch_loss - loss_new) >= 0):
-                    self.divisi *= 0.887
+                    self.divisi += 1
 
                 if np.sum(loss_delta < 0) > 10:
                     print(f"early termination at {i} with error {epoch_loss}")
@@ -486,7 +486,6 @@ class GradientDescent(BasalModel):
 
 
 if __name__ == "__main__":
-    from ml_tools.visuals.supervised_visuals import plot_model_diagnostics
     import matplotlib.pyplot as plt
 
     num_samples = 2000
@@ -495,9 +494,7 @@ if __name__ == "__main__":
     N_steps = 25
 
     # ============================ REGRESSION ==============================
-    print("=" * 60)
-    print("REGRESSION")
-    print("=" * 60)
+    print("============ REGRESSION ============")
     generator = RandomDatasetGenerator(random_seed=44)
     x, y, meta = generator.generate(
         task="regression",
@@ -505,24 +502,66 @@ if __name__ == "__main__":
         num_features=num_features,
         noise_scale=NOISE,
     )
-
+    coef = meta["weights"]
+    ws = []
     for reg in [False, True]:
         model = GradientDescent(
             task="regression", use_elastic_reg=reg, early_termination=True
         )
+        print(x.shape, y.shape)
         errors = model.fit(x_data=x, y_data=y.reshape(-1, 1), iterations=N_steps)
-        print(f"  elastic_reg={reg}  R²={model.r_square:.4f}  adj_R²={model.adjusted_r_square:.4f}")
-        plot_model_diagnostics(
-            model, x, y.reshape(-1, 1), meta,
-            task_label=f"Regression (reg={reg})",
-            errors=errors,
-            filename_prefix=f"scg_regression_reg{reg}",
-        )
+        print(model.use_elastic_reg)
+        print("R2: ", model.r_square, model.adjusted_r_square)
 
-    # ============================ BINARY CLASSIFICATION ==============================
-    print("\n" + "=" * 60)
-    print("BINARY CLASSIFICATION")
-    print("=" * 60)
+        plt.title("regression loss")
+        plt.subplot(2, 1, 1)
+        plt.plot(errors)
+        plt.subplot(2, 1, 2)
+        plt.plot(errors[-20:])
+        plt.show()
+
+        pred = model.predict(x)
+
+        plt.figure(figsize=(7, 10))
+        plt.title(f"regression info for {reg}")
+        ax1 = plt.subplot(2, 3, 1, label="ys")
+        plt.plot(y[:], "r")
+        ax1.set_title("targets")
+
+        ax2 = plt.subplot(2, 3, 2, label="both")
+        ax2.set_title("pred/targets")
+        plt.plot(y, alpha=0.8, c="r")
+        plt.plot(pred, alpha=0.8, c="b")
+
+        ax3 = plt.subplot(2, 3, 3, label="prediction")
+        ax3.set_title("prediction")
+        plt.plot(pred[:], "b")
+
+        ax4 = plt.subplot(2, 3, 4)
+        ax4.set_title("Target coefficients")
+        _xs = np.arange(num_features + 1)
+        _coef = np.insert(coef, 0, meta["bias"], axis=0)
+        plt.scatter(_xs, _coef, label="ceoffs")
+        ax5 = plt.subplot(2, 3, 5)
+        ax5.set_title("coeff - Weights DIFF")
+        plt.plot(
+            _xs,
+            np.abs(_coef - model.weights.squeeze()),
+            label="diff",
+            alpha=0.66,
+            c="r",
+        )
+        plt.scatter(_xs, _coef.T, label="T Betas", alpha=0.66, c="y")
+        plt.scatter(_xs, model.weights.squeeze(), label="T Betas", alpha=0.66, c="b")
+
+        ax6 = plt.subplot(2, 3, 6)
+        ax6.set_title("Model Weights")
+        plt.scatter(_xs, model.weights.T, label="weights", c="b")
+
+        plt.show()
+
+    # ============================ CLASSIFICATION ==============================
+    print("============ BINARY CLASSIFICATION ============")
     x, y, meta = generator.generate(
         task="binary",
         num_samples=num_samples,
@@ -536,19 +575,57 @@ if __name__ == "__main__":
     )
     _y = to_onehot(y)
     errors = model.fit(x_data=x, y_data=_y, iterations=N_steps)
-    pred = np.argmax(model.predict(x), axis=-1)
-    print(f"  Accuracy: {np.mean(pred == y):.4f}  R²={model.r_square:.4f}")
-    plot_model_diagnostics(
-        model, x, _y, meta,
-        task_label="Binary Classification",
-        errors=errors,
-        filename_prefix="scg_binary",
-    )
 
-    # ============================ MULTINOMIAL CLASSIFICATION ==============================
-    print("\n" + "=" * 60)
-    print("MULTINOMIAL CLASSIFICATION")
-    print("=" * 60)
+    coef = meta["weights"]
+    plt.title("binary classification loss")
+    plt.subplot(2, 1, 1)
+    plt.plot(errors)
+    plt.subplot(2, 1, 2)
+    plt.plot(errors[-20:])
+    plt.show()
+
+    pred = model.predict(x)
+    pred = np.argmax(pred, axis=-1)
+
+    print("correct: ", np.sum(pred == y))
+    print("wrong: ", np.sum(pred != y))
+    print(np.unique(y, return_counts=True)[-1])
+    print("accuracy: ", np.sum(pred == y) / num_samples)
+    print("R2: ", model.r_square, model.adjusted_r_square)
+
+    plt.figure(figsize=(7, 10))
+    _xs = np.arange(num_samples)
+    plt.title("Model details for binary classification")
+    # to_int_classes
+    ax1 = plt.subplot(2, 3, 1, label="targets")
+    plt.scatter(_xs, y, c="r")
+    ax1.set_title("targets")
+    ax2 = plt.subplot(2, 3, 2, label="both")
+    ax2.set_title("pred/targets")
+    plt.scatter(_xs, y, alpha=0.66, c="r")
+    plt.scatter(_xs, pred, alpha=0.33, c="b")
+    ax3 = plt.subplot(2, 3, 3, label="prediction")
+    ax3.set_title("prediction")
+    plt.scatter(_xs, pred[:], c="b")
+    ax4 = plt.subplot(2, 3, 4)
+    ax4.set_title("Target coefficients")
+    _xs = np.arange(num_features + 1)
+    _coef = np.insert(coef, 0, meta["bias"], axis=0)
+    plt.scatter(_xs, _coef.T, label="T Betas", c="y")
+    ax5 = plt.subplot(2, 3, 5)
+    ax5.set_title("Beta - Weights DIFF")
+    to_plot = np.abs(model.weights).sum(axis=-1)
+    plt.plot(_xs, np.abs(_coef - to_plot), label="diff", alpha=0.66, c="r")
+    plt.scatter(_xs, _coef, label="T Betas", alpha=0.66, c="y")
+    plt.scatter(_xs, to_plot, label="T Betas", alpha=0.66, c="b")
+    ax6 = plt.subplot(2, 3, 6)
+    ax6.set_title("Model Weights")
+    plt.scatter(_xs, to_plot, label="weights", c="b")
+
+    plt.show()
+
+    # ======================= multinomial CLASSIFICATION ===========================
+    print("============ MULTINOMIAL CLASSIFICATION ============")
     x, y, meta = generator.generate(
         task="multiclass",
         num_samples=num_samples,
@@ -564,19 +641,60 @@ if __name__ == "__main__":
     )
     _y = to_onehot(y)
     errors = model.fit(x_data=x, y_data=_y, iterations=N_steps)
-    pred = np.argmax(model.predict(x), axis=-1)
-    print(f"  Accuracy: {np.mean(pred == y):.4f}  R²={model.r_square:.4f}")
-    plot_model_diagnostics(
-        model, x, _y, meta,
-        task_label="Multinomial Classification",
-        errors=errors,
-        filename_prefix="scg_multinomial",
-    )
+
+    coef = meta["weights"]
+    plt.title("multinomial classification loss")
+    plt.subplot(2, 1, 1)
+    plt.plot(errors)
+    plt.subplot(2, 1, 2)
+    plt.plot(errors[-20:])
+    plt.show()
+
+    pred = model.predict(x)
+    pred = np.argmax(pred, axis=-1)
+    print("correct: ", np.sum(pred == y))
+    print("wrong: ", np.sum(pred != y))
+    print("accuracy: ", np.sum(pred == y) / num_samples)
+    print("R2: ", model.r_square, model.adjusted_r_square)
+
+    # sanity_check = LogisticRegression(penalty="elasticnet", max_iter = N_steps, )
+    # sanity_check.fit(x, y)
+    # sanity_y = sanity_check.predict(x)
+
+    plt.figure(figsize=(7, 10))
+    _xs = np.arange(num_samples)
+    plt.title("Model details for multinomial classification")
+    # to_int_classes
+    ax1 = plt.subplot(2, 3, 1, label="ys")
+    plt.scatter(_xs, y, c="r")
+    ax1.set_title("targets")
+    ax2 = plt.subplot(2, 3, 2, label="both")
+    ax2.set_title("pred/targets")
+    plt.scatter(_xs, y, alpha=0.66, c="r")
+    plt.scatter(_xs, pred, alpha=0.33, c="b")
+    ax3 = plt.subplot(2, 3, 3, label="prediction")
+    ax3.set_title("prediction")
+    plt.scatter(_xs, pred, c="b")
+    ax4 = plt.subplot(2, 3, 4)
+    ax4.set_title("Target coefficients")
+    _xs = np.arange(num_features + 1)
+    _coef = np.insert(coef, 0, meta["bias"], axis=0)
+    _coef = np.sum(_coef, axis=-1)
+    ws = np.sum(model.weights, axis=-1)
+    plt.scatter(_xs, _coef, label="T Betas", c="y")
+    ax5 = plt.subplot(2, 3, 5)
+    ax5.set_title("Beta - Weights DIFF")
+    plt.plot(_xs, np.abs(_coef - ws), label="diff", alpha=0.66, c="r")
+    plt.scatter(_xs, _coef, label="T Betas", alpha=0.66, c="y")
+    plt.scatter(_xs, ws, label="T Betas", alpha=0.66, c="b")
+    ax6 = plt.subplot(2, 3, 6)
+    ax6.set_title("Model Weights")
+    plt.scatter(_xs, ws, label="weights", c="b")
+
+    plt.show()
 
     # ============================ MULTILABEL CLASSIFICATION ==============================
-    print("\n" + "=" * 60)
-    print("MULTILABEL CLASSIFICATION")
-    print("=" * 60)
+    print("============ MULTILABEL CLASSIFICATION ============")
     num_classes = 5
     x, y, meta = generator.generate(
         task="multilabel",
@@ -591,14 +709,56 @@ if __name__ == "__main__":
         use_elastic_reg=False,
         early_termination=True,
     )
-    errors = model.fit(x_data=x, y_data=y, iterations=N_steps)
-    pred = np.where(model.predict(x) > 0.5, 1, 0)
-    print(f"  Accuracy: {np.mean(pred == y):.4f}  R²={model.r_square:.4f}")
-    plot_model_diagnostics(
-        model, x, y, meta,
-        task_label="Multilabel Classification",
-        errors=errors,
-        filename_prefix="scg_multilabel",
-    )
 
-    print("\nAll plots displayed and saved.")
+    print(x.shape, y.shape)
+    errors = model.fit(x_data=x, y_data=y, iterations=N_steps)
+
+    coef = meta["weights"]
+    plt.title("multilabel classification loss")
+    plt.subplot(2, 1, 1)
+    plt.plot(errors)
+    plt.subplot(2, 1, 2)
+    plt.plot(errors[-20:])
+    plt.show()
+
+    pred = model.predict(x)
+    pred = np.where(pred > 0.5, 1, 0)
+    print("correct: ", np.sum(pred == y))
+    print("wrong: ", np.sum(pred != y))
+    print("accuracy: ", np.sum(pred == y) / (num_samples * num_classes))
+    print("R2: ", model.r_square, model.adjusted_r_square)
+
+    plt.figure(figsize=(7, 10))
+    _xs = np.tile(np.arange(num_samples), num_classes).reshape(num_samples, -1)
+
+    plt.title("Model details for multinomial, multilabel classification")
+    # to_int_classes
+    plotable_y = y * np.arange(0, num_classes)
+    plotable_pred = pred * np.arange(0, num_classes)
+    ax1 = plt.subplot(2, 3, 1, label="targets")
+    plt.scatter(_xs, plotable_y, c="r")
+    ax1.set_title("targets")
+    ax2 = plt.subplot(2, 3, 2, label="both")
+    ax2.set_title("pred/targets")
+    plt.scatter(_xs, plotable_y, alpha=0.66, c="r")
+    plt.scatter(_xs, plotable_pred, alpha=0.33, c="b")
+    ax3 = plt.subplot(2, 3, 3, label="prediction")
+    ax3.set_title("prediction")
+    plt.scatter(_xs, plotable_pred, c="b")
+    ax4 = plt.subplot(2, 3, 4)
+    ax4.set_title("Target coefficients")
+    _xs = np.arange(num_features + 1)
+    _coef = np.sum(np.insert(coef, 0, meta["bias"], axis=0), axis=-1)
+    ws = np.sum(model.weights, axis=-1)
+    plt.scatter(_xs, _coef.T, label="T Betas", c="y")
+    ax5 = plt.subplot(2, 3, 5)
+    ax5.set_title("Beta - Weights DIFF")
+    plt.plot(_xs, np.abs(_coef - ws), label="diff", alpha=0.66, c="r")
+    plt.scatter(_xs, _coef, label="T Betas", alpha=0.66, c="y")
+    plt.scatter(_xs, ws, label="T Betas", alpha=0.66, c="b")
+    ax6 = plt.subplot(2, 3, 6)
+    ax6.set_title("Model Weights")
+    plt.scatter(_xs, ws, label="weights", c="b")
+
+    plt.legend()
+    plt.show()

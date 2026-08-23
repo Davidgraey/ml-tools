@@ -14,10 +14,17 @@ class RopeEmbedding(Layer):
         embedding_dimension : the dimension of the prior layer's embedding
             process
         """
+        super().__init__()
         self.sequence_length: int = sequence_length
         self.embedding_dimension: int = embedding_dimension
         self.pos_sine = 0
         self.pos_cosine = 0
+        # rotation is elementwise over position, so the sequence axis is free
+        # up to the ceiling the rotation matrix was built for
+        self.declare_shapes(
+            inputs=((None, embedding_dimension),),
+            outputs=((None, embedding_dimension),),
+        )
 
         self.build_rope_array(sequence_length, embedding_dimension)
 

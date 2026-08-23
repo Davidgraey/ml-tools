@@ -9,6 +9,38 @@ from abc import ABC, abstractmethod
 from ml_tools.models.constants import EPSILON
 
 
+# -------------- Transform Base Class  --------------
+class BasalTransform(ABC):
+    """
+    Base for stateful transforms: things that learn a mapping from data and
+    then apply it. Deliberately narrower than BasalModel -- a transform has no
+    forward pass and no loss to minimise on its own behalf, so it only
+    promises fit, predict and the two combined.
+    """
+
+    @abstractmethod
+    def fit(self, x_data: NDArray, **kwargs):
+        """learn the transform's parameters from data"""
+
+    @abstractmethod
+    def predict(self, x_data: NDArray, **kwargs):
+        """apply the fitted transform"""
+
+    @abstractmethod
+    def fit_predict(self, x_data: NDArray, **kwargs):
+        """fit then apply, in one call"""
+
+    @property
+    def is_fitted(self) -> bool:
+        return getattr(self, "_is_fitted", False)
+
+    @property
+    def info(self) -> dict:
+        info = {"self": self.__class__}
+        info.update(self.__dict__)
+        return info
+
+
 # -------------- Model Base Class  --------------
 class BasalModel(ABC):
     def __init__(self,

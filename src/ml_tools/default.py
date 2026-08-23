@@ -24,12 +24,12 @@ from numpy.typing import ArrayLike, NDArray
 
 # -------------------------------- set up logging --------------------------------
 log = logging.getLogger(__name__)
-log.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 f_handler = logging.FileHandler(f'{__name__}.log')
 f_handler.setLevel(logging.INFO)
 log.addHandler(f_handler)
 
-RNG = np.random.Gendrator(seed=1)
+RNG = np.random.default_rng(seed=1)
 
 if __name__ == "__main__":
     print('hello')

@@ -6,8 +6,10 @@ import numpy as np
 from abc import ABC, abstractmethod
 from numpy.typing import NDArray
 from typing import Optional
+from ml_tools.models.activations import sigmoid, softmax
 from ml_tools.models.constants import ClassificationTask, Reductions
-from ml_tools.models.distances import cosine_distance
+from ml_tools.distances import cosine_distance
+from ml_tools.models.constants import EPSILON
 
 
 loss_dictionary, derivative_dictionary = {}, {}
@@ -48,17 +50,16 @@ class DifferenceLoss(Loss):
 
 class MSELoss(Loss):
     def forward(self, prediction, targets):
-        # num_samples = total elements so backward gradient matches d/d_pred of np.mean(diff**2)
-        self.num_samples = prediction.size
         self.prediction = prediction
         self.targets = targets
         diff = prediction - targets
         return np.mean(diff ** 2)
+        # return 0.5 * np.mean(diff ** 2)
 
     def backward(self):
-        # d/d_pred [ mean(diff^2) ] = 2 * diff / total_elements
+        """forward means over every element, so the reduction is size not shape[0]"""
         diff = self.prediction - self.targets
-        return (2 / self.num_samples) * diff
+        return (2 / self.prediction.size) * diff
 
 
 class RMSELoss(Loss):
@@ -152,8 +153,18 @@ class CrossEntropyLoss(Loss):
         return np.mean(loss)
 
     def backward(self):
-        sample_count = self.targets.shape[0]
-        return (self.prediction - self.targets) / sample_count
+        """
+        dL / d(logits). forward() consumes logits and applies its own
+        log-softmax / log-sigmoid, so the squashing belongs here too.
+        Reduction matches forward: mean over samples for multinomial,
+        mean over every element for the elementwise tasks.
+        """
+        if self.task == ClassificationTask.MULTINOMIAL:
+            probs = softmax(self.prediction)
+            return (probs - self.targets) / self.targets.shape[0]
+
+        probs = sigmoid(self.prediction)
+        return (probs - self.targets) / self.targets.size
 
     def __call__(self, predictions: NDArray, targets: NDArray):
          return self.forward(predictions, targets)

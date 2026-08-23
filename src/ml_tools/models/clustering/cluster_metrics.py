@@ -75,11 +75,11 @@ def silhouette_score(x_data: NDArray, prediction: NDArray) -> float:
 def davies_bouldin_index(x_data: NDArray, prediction: NDArray) -> float:
     """
     DB index quantifies the within-cluster spread to inter-cluster distances
-    Lower DB scores indicate a more compact, more separated cluster
+    Lower DB scores indicate a more compact, more seperated cluster
     Parameters
     ----------
     x_data : our original data samples
-    prediction : predicted labels as integers
+    prediction : predictied labels as integers
 
     Returns
     -------
@@ -102,18 +102,20 @@ def davies_bouldin_index(x_data: NDArray, prediction: NDArray) -> float:
         cluster_points = x_data[prediction == k]
         s[i] = np.mean(np.linalg.norm(cluster_points - centroids[i], axis=1))
 
-    # pairwise centroid distances
-    centroid_dists = np.linalg.norm(
-        centroids[:, None, :] - centroids[None, :, :], axis=2
-    )
-    # avoid division by zero on the diagonal
-    np.fill_diagonal(centroid_dists, np.inf)
+    # calculate Davies-Bouldin index - ratio of norm'd dist between centroids
+    db_index = 0
+    for i in range(num_clusters):
+        max_ratio = 0
+        for j in range(num_clusters):
+            if i != j:
+                dist = np.linalg.norm(centroids[i] - centroids[j])
+                ratio = (s[i] + s[j]) / dist
 
-    # DB = mean of max r per cluster
-    r_matrix = (s[:, None] + s[None, :]) / centroid_dists
-    db_index = np.mean(np.max(r_matrix, axis=1))
+                if ratio > max_ratio:
+                    max_ratio = ratio
+        db_index += max_ratio
 
-    return db_index
+    return db_index / num_clusters
 
 
 def calinski_harabasz_index(x_data: NDArray, prediction: NDArray) -> float:
@@ -134,9 +136,6 @@ def calinski_harabasz_index(x_data: NDArray, prediction: NDArray) -> float:
     n_clusters = len(unique_labels)
     overall_mean = np.mean(x_data, axis=0)
 
-    # Map labels to contiguous indices 0..k-1
-    label_to_idx = {label: i for i, label in enumerate(unique_labels)}
-    sample_cluster_idx = np.array([label_to_idx[p] for p in prediction])
 
     cluster_means = np.array(
         [np.mean(x_data[prediction == k], axis=0) for k in unique_labels]
@@ -146,12 +145,14 @@ def calinski_harabasz_index(x_data: NDArray, prediction: NDArray) -> float:
         [np.sum(prediction == k) for k in unique_labels]
     )
 
-    # inter-cluster dispersion (between-group)
+    # inter-cluster dispersion
     inter_dispersion = np.sum(cluster_sizes[:, None] * (cluster_means - overall_mean) ** 2)
 
-    # intra-cluster dispersion (within-group) — vectorized via per-sample cluster mean
-    per_sample_means = cluster_means[sample_cluster_idx]
-    intra_dispersion = np.sum((x_data - per_sample_means) ** 2)
+    # intra-cluster dispersion
+    intra_dispersion = 0
+    for i, label in enumerate(unique_labels):
+        cluster_data = x_data[prediction == label]
+        intra_dispersion += np.sum((cluster_data - cluster_means[i]) ** 2)
 
     return (inter_dispersion / intra_dispersion) * ((n_samples - n_clusters) / (n_clusters - 1))
 
@@ -189,13 +190,8 @@ def entropy(labels):
 
 
 def homogeneity(labels_true, labels_pred):
-    """Compute homogeneity score of predicted labels given true labels.
+    """Compute homogeneity score of predicted labels given true labels."""
 
-    Homogeneity = 1 - H(C|K) / H(C)
-    where C = true classes, K = predicted clusters.
-    A clustering is homogeneous if each cluster contains only members of a
-    single class.
-    """
     # get unique class and cluster indices
     classes, class_idx = np.unique(labels_true, return_inverse=True)
     clusters, cluster_idx = np.unique(labels_pred, return_inverse=True)
@@ -207,28 +203,20 @@ def homogeneity(labels_true, labels_pred):
     np.add.at(cont_matrix, (class_idx, cluster_idx), 1)
 
     num_samples = np.sum(cont_matrix)
+    class_freqs = np.sum(cont_matrix, axis=1)
+    class_entropy = entropy(class_freqs)
 
-    # H(C) — entropy of the true class distribution
-    class_freqs = np.sum(cont_matrix, axis=1)  # shape (num_classes,)
-    class_probs = class_freqs / num_samples
-    nonzero = class_probs > 0
-    class_entropy = -np.sum(class_probs[nonzero] * np.log(class_probs[nonzero]))
+    cond_ent = 0.0
 
+    for i in range(num_clusters):
+        cluster = cont_matrix[:, i]
+        cluster_size = np.sum(cluster)
+        if cluster_size > 0:
+            cond_ent = entropy(cluster)
+
+    cond_ent /= num_samples
+
+    # homogeneity score
     if class_entropy == 0:
         return 1.0
-
-    # H(C|K) — conditional entropy of classes given clusters
-    cluster_sizes = np.sum(cont_matrix, axis=0)  # shape (num_clusters,)
-    cond_entropy = 0.0
-    for k in range(num_clusters):
-        if cluster_sizes[k] == 0:
-            continue
-        # P(C|K=k) for each class
-        probs_in_cluster = cont_matrix[:, k] / cluster_sizes[k]
-        nonzero_k = probs_in_cluster > 0
-        # Weight by P(K=k) = cluster_size / n
-        cond_entropy -= (cluster_sizes[k] / num_samples) * np.sum(
-            probs_in_cluster[nonzero_k] * np.log(probs_in_cluster[nonzero_k])
-        )
-
-    return 1.0 - cond_entropy / class_entropy
+    return 1 - cond_ent / class_entropy

@@ -6,7 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 from typing import Optional
 
-import ml_tools.models.distances as distances
+import ml_tools.distances as distances
 from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork
 from ml_tools.visuals.cluster_visuals import plot_clusters
 from ml_tools.types import BasalModel
@@ -50,6 +50,7 @@ class PLSOM(BasalModel):
         lock_seed: int = 42,
         distance="euclidean",
         verbose: bool = False,
+        hit_decay: float = 0.9,
     ):
         """
         Create the Self Organizing Map  - rectangular / square grids
@@ -64,6 +65,9 @@ class PLSOM(BasalModel):
         theta_max : Maximum neighborhood value - set at or close to width
         lock_seed :int, give an int to lock numpy seed
         distance :distance measure to use, can be 'euclidean', 'manhattan', 'cosine', 'hamming'
+        hit_decay : per-epoch multiplier on hit_map and node_error, so both
+            describe recent activity rather than the whole training history. At
+            0.9 a node's record is largely forgotten over about ten epochs.
         """
         super().__init__(input_dimension=input_dim, output_dimension=width * height)
 
@@ -79,7 +83,9 @@ class PLSOM(BasalModel):
         self.n_neurons = height * width
         self.grid_distances = self.build_grid()
 
+        self.hit_decay = hit_decay
         self.hit_map = np.zeros(shape=self.n_neurons)
+        self.node_error = np.zeros(shape=self.n_neurons)
         self.verbose = verbose
 
         # Constants
@@ -114,7 +120,7 @@ class PLSOM(BasalModel):
             # may need to scale down bound further!
             bound = np.sqrt(2 / self.N_DIMS)
             # all our values will be between 0 and 1 for categorical data
-            return self.RNG.uniform(
+            return np.random.uniform(
                 low=0, high=bound, size=(self.n_neurons, self.N_DIMS)
             )
 
@@ -123,13 +129,13 @@ class PLSOM(BasalModel):
             for dim in range(self.N_DIMS):
                 low = np.min(x, axis=0)[dim]
                 high = np.max(x, axis=0)[dim]
-                weights[:, dim] = self.RNG.uniform(
+                weights[:, dim] = np.random.uniform(
                     low=low, high=high, size=(self.n_neurons)
                 )
             return weights
 
         else:
-            return self.RNG.uniform(
+            return np.random.uniform(
                 low=-0.1, high=0.1, size=(self.n_neurons, self.N_DIMS)
             )
 
@@ -164,7 +170,16 @@ class PLSOM(BasalModel):
         for step in range(num_iterations):
             self.RNG.shuffle(_x)
             # Decay our maximum value of THETA slightly - To  keep the full grid from being pulled back and forth by outliers
-            self.THETAMAX = max(self.THETAMAX * 0.98, self.THETAMIN)
+            self.THETAMAX = (
+                self.THETAMAX * 0.98
+                if self.THETAMAX > self.THETAMIN
+                else self.THETAMIN + 1
+            )
+
+            # fade the per-node records so they track recent activity. Without
+            # this a node that was dead early still reads as dead once busy.
+            self.hit_map *= self.hit_decay
+            self.node_error *= self.hit_decay
 
             bmu_i, bmu_dist = self.calc_bmu(_x[0])
             self.previous_step_r = bmu_dist[bmu_i]
@@ -176,7 +191,8 @@ class PLSOM(BasalModel):
                 _xs = _x[sample_i : sample_i + 1, :]
 
                 bmu_i, sample_distances = self.calc_bmu(_xs)
-                epsilon = self.calc_epsilon(sample_distances[bmu_i])
+                bmu_distance = sample_distances[bmu_i]
+                epsilon = self.calc_epsilon(bmu_distance)
                 theta = self.calc_theta(epsilon)
                 neighborhood = self.calc_neighborhood(theta, bmu_i)
 
@@ -187,33 +203,33 @@ class PLSOM(BasalModel):
 
                 self.weights += weight_update
                 self.hit_map[bmu_i] += 1
+                self.node_error[bmu_i] += bmu_distance
 
-                # Hook for subclass per-sample logic (e.g. distortion tracking)
-                self._on_sample_update(bmu_i, sample_distances)
-
-                # update error trace
-                error_trace.append(np.mean(sample_distances))
+                # quantisation error is the distance to the winning unit. The
+                # mean over every neuron grows as the map spreads out, so it
+                # cannot be compared across maps of different sizes.
+                error_trace.append(bmu_distance)
                 epsilon_trace.append(epsilon)
+
+                # if (self.verbose or verbose) and (sample_i % 10 == 0):
+                #     self.plot_neighborhood(epsilon * (neighborhood.reshape(self.n_neurons, -1)))
 
             self.q_error_trace.append(np.mean(error_trace))
             self.epsilon_trace.append(np.mean(epsilon_trace))
-
-            # Hook for subclass per-epoch logic (e.g. topology adaptation)
-            self._on_epoch_end(step, num_iterations)
+            self.after_epoch(step)
 
         if self.verbose or verbose:
-            self.plot_grid(samples=0, highlight_idx=int(np.argmin(self.hit_map)))
+            self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
             plt.plot(self.q_error_trace)
             plt.plot(self.epsilon_trace)
             plt.legend(["q_error", "epsilon"])
             plt.show()
 
-    def _on_sample_update(self, bmu_i: int | NDArray, sample_distances: NDArray) -> None:
-        """Hook called after each sample update. Override in subclasses."""
-        pass
-
-    def _on_epoch_end(self, step: int, num_iterations: int) -> None:
-        """Hook called at the end of each epoch. Override in subclasses."""
+    def after_epoch(self, step: int) -> None:
+        """
+        Seam for subclasses that restructure the map between epochs. A fixed
+        lattice has nothing to do here, so this is deliberately empty.
+        """
         pass
 
     def calc_bmu(self, x: NDArray) -> tuple[NDArray | int, NDArray]:
@@ -306,17 +322,16 @@ class PLSOM(BasalModel):
 
     def _idx_to_grid(self, idx: int) -> tuple[int, int]:
         """
-        numpy function takes 1d vector index to 2d [r,c] grid.
+        1d vector index to 2d [row, col]. Row major, so the divisor is the
+        column count. Using the row count instead only agrees on square maps.
         """
-        r = idx // self.network_shape[1]
-        c = idx % self.network_shape[1]
-        return (int(r), int(c))
+        rows, cols = self.network_shape
+        return (int(idx // cols), int(idx % cols))
 
     def _grid_to_idx(self, grid_i: tuple[int, int]) -> int:
-        """
-        numpy - takes grid index [r,c] converts to 1d index
-        """
-        return int(grid_i[1] + (grid_i[0] * self.network_shape[1]))
+        """2d [row, col] back to a 1d index, row major"""
+        rows, cols = self.network_shape
+        return int(grid_i[1] + (grid_i[0] * cols))
 
     @staticmethod
     def grid_manhattan_distance(
@@ -325,31 +340,19 @@ class PLSOM(BasalModel):
         """returns the cityblock / manhattan dist between two grid points"""
         return abs(row_a - row_b) + abs(col_a - col_b)
 
-    def build_grid(self, method: str = "grid") -> NDArray:
+    def build_grid(self) -> NDArray:
         """
-        Build the manhattan distance grid for the SOM, it will contain the distances from each unit, to each other unit
-        :return: np.array, (shape n_neurons, n_neurons)
+        All pairs manhattan distance between lattice positions, shaped
+        (n_neurons, n_neurons). Growing or shrinking the map invalidates this,
+        so it is cheap enough to rebuild outright.
         """
-        rows = self.network_shape[0]
-        cols = self.network_shape[1]
-        distance_matrix = np.zeros((self.n_neurons, self.n_neurons))
+        rows, cols = self.network_shape
+        row_idx, col_idx = np.divmod(np.arange(rows * cols), cols)
 
-        for idx in range(self.n_neurons):
-            home_row, home_col = self._idx_to_grid(idx)
-            for row in range(rows):
-                for col in range(cols):
-                    if method == "grid":
-                        distance_matrix[idx, self._grid_to_idx((row, col))] = (
-                            self.grid_manhattan_distance(home_row, home_col, row, col)
-                        )
-                    elif method == "distance":
-                        distance_matrix[idx, self._grid_to_idx((row, col))] = (
-                            self.distance_function(
-                                self.weights[self._idx_to_grid((row, col))],
-                            )
-                        )
-
-        return distance_matrix
+        return (
+            np.abs(row_idx[:, None] - row_idx[None, :])
+            + np.abs(col_idx[:, None] - col_idx[None, :])
+        ).astype(float)
 
     def plot_grid(self, samples=0, highlight_idx=None):
         """utility function to plot the first two dimensions of the grid of weights"""
@@ -358,14 +361,16 @@ class PLSOM(BasalModel):
         )
         # Draw lines between each 2d weight vector in grid
         plt.figure(figsize=(15, 10))
-        plt.title("PLSOM Grid")
-        if samples != 0:
-            plt.scatter(samples[:, 0], samples[:, 1])
+        plt.title(f"PLSOM Grid {self.network_shape[0]}x{self.network_shape[1]}")
+        # np.size rather than a truth test, so an array of samples can be passed
+        if np.size(samples) > 1:
+            plt.scatter(samples[:, 0], samples[:, 1], s=6, alpha=0.3)
         for row in range(self.network_shape[0]):
             plt.plot(ws[row, :, 0], ws[row, :, 1], "bo-")
         for col in range(self.network_shape[1]):
             plt.plot(ws[:, col, 0], ws[:, col, 1], "bo-")
-        if highlight_idx:
+        # index 0 is a valid unit to highlight, so test against None
+        if highlight_idx is not None:
             focus = self._idx_to_grid(highlight_idx)
             plt.scatter(
                 ws[focus[0], focus[1], 0], ws[focus[0], focus[1], 1], s=200.0, c="r"
@@ -501,7 +506,7 @@ if __name__ == "__main__":
     max_clusters = 10
 
     for dim in [10]:
-        num_steps = dim * 10
+        num_steps = dim * 5
         st = time.time()
 
         som = PLSOM(
