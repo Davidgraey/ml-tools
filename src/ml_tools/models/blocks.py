@@ -149,11 +149,6 @@ class SpectreAttention(Layer):
     """
     SPECTRE mixing layer, https://arxiv.org/abs/2502.18394
 
-    Query and value projections only (the paper defines no key), a real FFT of
-    the values along the sequence axis, a content-adaptive diagonal spectral
-    gate driven by the sequence-pooled query, then an inverse real FFT. The
-    gate is per frequency and broadcasts across every channel.
-
     Deviations from the paper, both deliberate:
       - single head. The paper is per-head with heads concatenated.
       - no positional phase. The paper only defines the phase rotation
@@ -165,7 +160,10 @@ class SpectreAttention(Layer):
     1/n sits on the inverse only, which is numpy's default convention.
     """
 
-    def __init__(self, sequence_length: int, hidden_dim: int, band_radius: int = 0):
+    def __init__(self,
+                 sequence_length: int,
+                 hidden_dim: int,
+                 band_radius: int = 0):
         """
         Parameters
         ----------

@@ -56,13 +56,13 @@ class Node:
         self,
         name: str,
         layer: Optional[Layer] = None,
-        sources: tuple["Node", ...] = (),
+        sources: tuple = (),
         shape: tuple = ANY_SHAPE,
     ):
         self.name = name
         self.layer = layer
         self.sources = sources
-        self.consumers: list["Node"] = []
+        self.consumers: list = []
 
         if layer is None:
             self.out_shape = shape
@@ -156,9 +156,11 @@ class NeuralNetwork:
         """ the graph's source node; pass it as an input source to the first layer """
         return self._input
 
-    def connect(
-        self, layer: Layer, *sources: Node, name: Optional[str] = None
-    ) -> Node:
+    def connect(self,
+                layer: Layer,
+                *sources: Node,
+                name: Optional[str] = None
+                ) -> Node:
         """
         Place a layer in the graph, fed by the given nodes, and return its node.
 
@@ -235,19 +237,28 @@ class NeuralNetwork:
     def _check_shapes(self, layer: Layer, sources: tuple[Node, ...]) -> None:
         """
         Compare what each source produces against what the layer says it takes.
-
-        The comparison is right-aligned on the trailing axes and skips any axis
-        either side leaves open, so this only fires when both sides state a size
-        and the sizes differ. That is the case worth stopping for: it cannot
-        broadcast, cannot be a batch that varies, and is always a wiring
-        mistake.
         """
         expected = layer.shapes["input"]
 
+        if isinstance(expected, tuple):
+            if isinstance(expected[0], tuple):
+                expected = expected[0]
+            expected = expected[0]
+
         for position, source in enumerate(sources):
-            # forward may accept more inputs than the layer bothered to declare
-            wanted = expected[position] if position < len(expected) else ANY_SHAPE
-            conflict = shape_conflict(source.out_shape, wanted)
+            # forward may accept more inputs than the layer
+            if source.layer is None:
+                upstream = source.out_shape
+            else:
+                upstream = source.layer.shapes["output"]
+
+            if isinstance(upstream, tuple):
+                if isinstance(upstream[-1], tuple):
+                    upstream = upstream[-1]
+                upstream = upstream[-1]
+            print(upstream, expected)
+            conflict = shape_conflict(upstream, expected)
+
             if conflict:
                 raise ValueError(
                     f"{layer.__class__.__name__} cannot be fed by "

@@ -11,7 +11,6 @@ GLOBAL_DTYPE = np.float32
 
 
 # -------------    weight initilization functions    ---------------
-# ------------------------------------------------------------------
 def xavier(rng, ni: int, no: int) -> NDArray:
     return rng.normal(loc=0.0, scale=1 / np.sqrt(ni), size=(ni, no)).astype(
         dtype=GLOBAL_DTYPE
@@ -50,11 +49,6 @@ def hartley_2d(x_array: NDArray, axes: tuple = (-2, -1)) -> NDArray:
 
 
 # ------------------------------------------------------------------
-# A declared shape is the layer's TRAILING axes, right-aligned against a real
-# array shape, so (ni,) matches (batch, ni) and (batch, sequence, ni) alike.
-# None on an axis means the layer does not constrain it. ANY_SHAPE is the
-# weakest claim a layer can make: one free trailing axis, which is what a
-# width-agnostic elementwise layer knows about its own input.
 ANY_SHAPE = (None,)
 
 
@@ -153,6 +147,12 @@ def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
     -------
     a description of the offending axis, or None when the two are compatible
     """
+    if (produced is None) or (expected is None):
+        return None
+    elif produced == expected:
+        return None
+    return f"{produced} cannot feed {expected}"
+
     overlap = min(len(produced), len(expected))
 
     for axis in range(-overlap, 0):
@@ -595,7 +595,7 @@ class FrequencyFFT(Layer):
         # (windows, samples per window), the window count left free since the
         # constructor only fixes its ceiling
         self.declare_shapes(
-            inputs=((None, window_size),), outputs=((None, window_size),)
+            inputs=((window_size,),), outputs=((window_size,),)
         )
 
     def forward(self, incoming_x: NDArray) -> NDArray:

@@ -20,10 +20,10 @@ from ml_tools.utilities import rolling_windows_nd, standardize_data
 EPSILON = 1e-12
 
 
-# -------------    waveform to frames    ---------------------------
-# ------------------------------------------------------------------
 def read_wav(
-    file_path: str, channel: Optional[int] = 0, standardize: bool = True
+        file_path: str,
+        channel: Optional[int] = 0,
+        standardize: bool = True
 ) -> tuple[int, NDArray]:
     """
     Read a wav file and pull out one channel.
@@ -55,46 +55,42 @@ def window_size_from_ms(sample_rate: int, window_ms: float) -> int:
     return int(window_ms * sample_rate / 1000)
 
 
-def frame_signal(
+def build_windows(
     waveform: NDArray, window_size: int, num_overlap: int = 0
 ) -> NDArray:
     """
-    Cut the waveform into overlapping frames, shaped (num_frames, window_size).
-    Every downstream stage works from these frames, so the spectrogram and the
-    time domain frames always describe the same segments of signal.
+    Cut the waveform into overlapping windows, shaped (num_frames, window_size).
+    Every downstream stage works from these windowed timesteps, so the spectrogram and the
+    time domain windows always describe the same segments of signal.
     """
+    if waveform.ndim == 2:  # if we have 2 dimensions (batch, amplitude)
+        axis = 1
+    elif waveform.ndim == 1:
+        axis = 0
     return rolling_windows_nd(
-        data=waveform, window_size=window_size, num_overlap=num_overlap, axis=0
+        data=waveform, window_size=window_size, num_overlap=num_overlap, axis=axis
     )
 
 
-# -------------    frames to spectral features    ------------------
-# ------------------------------------------------------------------
 def windowed_spectrum(
-    frames: NDArray, window_kernel: Optional[NDArray] = None
+        windows: NDArray,
+        window_kernel: Optional[NDArray] = None
 ) -> NDArray:
     """
-    Real FFT of each frame, tapered first to stop the frame edges ringing.
+    Real FFT of each window, tapered first to stop the window edges ringing.
 
-    Returns the complex spectrum, shaped (..., window_size // 2 + 1). Keep it
-    if you intend to reconstruct, since the phase lives here and cannot be
-    recovered from magnitude alone.
+    Returns the complex spectrum, shaped (..., window_size // 2 + 1)
     """
     if window_kernel is None:
-        window_kernel = np.blackman(frames.shape[-1])
+        window_kernel = np.blackman(windows.shape[-1])
 
-    return np.fft.rfft(frames * window_kernel, axis=-1)
+    return np.fft.rfft(windows * window_kernel, axis=-1)
 
 
 def _paired_bins(num_frequencies: int, window_size: Optional[int]) -> slice:
     """
-    Which rfft bins stand for a conjugate pair, and so carry double the energy
-    of a two sided spectrum.
-
-    DC is never paired. Nyquist exists, and is likewise unpaired, only when the
-    window length is even. The bin count alone cannot tell us which case we are
-    in, since a window of 8 and a window of 9 both produce 5 bins, so the
-    window size has to be supplied for odd length windows.
+    which rfft bins stand for a conjugate pair, and so carry double the energy
+    of a two sided spectrum
     """
     if window_size is None:
         window_size = 2 * (num_frequencies - 1)
@@ -126,7 +122,7 @@ def to_power(
 
 
 def to_decibels(power: NDArray, epsilon: float = EPSILON) -> NDArray:
-    """decibels from a power spectrum, 10 * log10, floored by epsilon"""
+    """decibels from a power spectrum, 10 * log_base_10, floored by epsilon"""
     return 10 * np.log10(power + epsilon)
 
 
@@ -140,35 +136,33 @@ def frequency_axis(window_size: int, sample_rate: int) -> NDArray:
     return np.fft.rfftfreq(window_size, d=1.0 / sample_rate)
 
 
-# -------------    frames back to a waveform    --------------------
-# ------------------------------------------------------------------
+# -------------    windows back to a waveform    --------------------
 def overlap_add(
-    frames: NDArray, num_overlap: int = 0, window_kernel: Optional[NDArray] = None
+    windows: NDArray, num_overlap: int = 0, window_kernel: Optional[NDArray] = None
 ) -> NDArray:
     """
-    Fold overlapping frames back into one signal, weighted so that the taper
+    Fold overlapping windows back into one signal, weighted so that the taper
     applied on the way in is divided out on the way back.
     """
-    num_frames, window_size = frames.shape
+    num_windows, window_size = windows.shape
     stride = window_size - num_overlap
 
     if window_kernel is None:
         window_kernel = np.ones(window_size)
 
-    length = stride * (num_frames - 1) + window_size
+    length = stride * (num_windows - 1) + window_size
     signal = np.zeros(length)
     weight = np.zeros(length)
 
-    for i in range(num_frames):
+    for i in range(num_windows):
         start = i * stride
-        signal[start: start + window_size] += frames[i] * window_kernel
+        signal[start: start + window_size] += windows[i] * window_kernel
         weight[start: start + window_size] += window_kernel ** 2
 
     return signal / np.maximum(weight, EPSILON)
 
 
 # -------------    plotting    -------------------------------------
-# ------------------------------------------------------------------
 def plot_waveform(waveform: NDArray, sample_rate: Optional[int] = None) -> None:
     """time domain view of one channel"""
     xs = np.arange(waveform.shape[0])
@@ -274,7 +268,6 @@ class AudioProcessor(Processor):
         self.window_kernel: NDArray = np.blackman(self.window_size)
         self.freqs: NDArray = frequency_axis(self.window_size, sample_rate)
 
-        self.spectrum: Optional[NDArray] = None
 
     def fit(self, values: NDArray) -> "AudioProcessor":
         """record the observed range, which inverse() needs to undo scaling"""
@@ -282,16 +275,21 @@ class AudioProcessor(Processor):
         self._fitted = True
         return self
 
-    def encode(self, values: NDArray) -> NDArray:
+    def encode(self, values: NDArray) -> dict[str,NDArray]:
         """
         Waveform to (num_frames, num_frequencies). The complex spectrum is
         cached on the way through so inverse() can reuse its phase.
         """
-        frames = frame_signal(values, self.window_size, self.num_overlap)
-        self.spectrum = windowed_spectrum(frames, self.window_kernel)
+        windows = build_windows(values, self.window_size, self.num_overlap)
+        power = to_power(windows, window_size=self.window_size)
 
-        power = to_power(self.spectrum, window_size=self.window_size)
-        return to_decibels(power) if self.use_decibels else power
+        self.spectrum = windowed_spectrum(power, self.window_kernel)
+
+        if self.use_decibels:
+            return {"spectrum": to_decibels(self.spectrum), "amplitude": to_decibels(power)}
+
+        return {"spectrum": self.spectrum, "amplitude": power}
+
 
     def fit_encode(self, values: NDArray) -> NDArray:
         return self.fit(values).encode(values)
@@ -316,8 +314,8 @@ class AudioProcessor(Processor):
         else:
             phase = 1.0
 
-        frames = np.fft.irfft(magnitude * phase, n=self.window_size, axis=-1)
-        return overlap_add(frames, self.num_overlap, self.window_kernel)
+        windows = np.fft.irfft(magnitude * phase, n=self.window_size, axis=-1)
+        return overlap_add(windows, self.num_overlap, self.window_kernel)
 
     @property
     def metadata(self) -> dict:
@@ -328,7 +326,7 @@ class AudioProcessor(Processor):
             "window_ms": self.window_ms,
             "window_size": self.window_size,
             "num_overlap": self.num_overlap,
-            "num_frequencies": self.freqs.size,
+            "num_frequencies": self.spectrum.size,
             "use_decibels": self.use_decibels,
         }
 
@@ -364,8 +362,8 @@ if __name__ == "__main__":
     window_size = window_size_from_ms(SAMPLE_RATE, WINDOW_MS)
     num_overlap = window_size // 3
 
-    frames = frame_signal(waveform, window_size, num_overlap)
-    spectrum = windowed_spectrum(frames)
+    windows = build_windows(waveform, window_size, num_overlap)
+    spectrum = windowed_spectrum(windows)
     power = to_power(spectrum, window_size=window_size)
     decibels = to_decibels(power)
     freqs = frequency_axis(window_size, SAMPLE_RATE)
@@ -374,7 +372,7 @@ if __name__ == "__main__":
     print(f"window_size      {window_size} samples ({WINDOW_MS} ms)")
     print(f"num_overlap      {num_overlap} samples")
     print(f"bin width        {freqs[1] - freqs[0]:.1f} Hz")
-    print(f"frames           {frames.shape}")
+    print(f"windows           {windows.shape}")
     print(f"spectrum         {spectrum.shape}  {spectrum.dtype}")
     print(f"power, decibels  {power.shape}, {decibels.shape}")
 

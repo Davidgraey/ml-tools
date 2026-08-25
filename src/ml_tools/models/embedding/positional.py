@@ -22,8 +22,8 @@ class RopeEmbedding(Layer):
         # rotation is elementwise over position, so the sequence axis is free
         # up to the ceiling the rotation matrix was built for
         self.declare_shapes(
-            inputs=((None, embedding_dimension),),
-            outputs=((None, embedding_dimension),),
+            inputs=((embedding_dimension,),),
+            outputs=((embedding_dimension,),),
         )
 
         self.build_rope_array(sequence_length, embedding_dimension)
