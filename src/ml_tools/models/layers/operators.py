@@ -1,5 +1,6 @@
 import numpy as np
 from numpy.typing import NDArray
+from typing import Optional
 from ml_tools.models.layers.layers import ANY_SHAPE, Layer
 
 
@@ -65,6 +66,121 @@ class LatentStack(Layer):
 
     def zero_gradients(self) -> None:
         pass
+
+
+class LatentSum(Layer):
+    """
+    sum two arrays together, element-wise
+
+    """
+    def __init__(self):
+        super().__init__()
+        self.input_1: Optional[NDArray] = None
+        self.input_2: Optional[NDArray] = None
+        self.output: Optional[NDArray] = None
+
+        # Gradients calculated during backward pass
+        self.gradient_input_1: Optional[NDArray] = None
+        self.gradient_input_2: Optional[NDArray] = None
+
+        self.is_output: bool = False
+
+        self.declare_shapes(inputs=(ANY_SHAPE, ANY_SHAPE), outputs=(ANY_SHAPE,))
+
+    def forward(self,
+                input_1: NDArray,
+                input_2: NDArray) -> NDArray:
+        """
+        Sums input_1 and input_2 element-wise.
+        """
+        self.in_shape_1 = input_1.shape
+        self.in_shape_2 = input_2.shape
+
+        # Assert that input shapes are broadcastable
+        try:
+            sum_array = input_1 + input_2
+        except ValueError as e:
+            raise RuntimeError(f"SummingLayer: Inputs not broadcastable. {e}")
+
+        self.input_1 = input_1
+        self.input_2 = input_2
+        self.output = sum_array
+
+        return self.output
+
+    def backward(
+            self, incoming_grad: NDArray
+    ) -> tuple[NDArray, NDArray]:
+        """
+        Backward pass. Calculates gradients for input_1 and input_2.
+
+        Parameters
+        ----------
+        incoming_grad : NDArray
+            Gradient of the loss with respect to the output of this layer.
+
+        Returns
+        -------
+        Tuple[NDArray, NDArray]
+        """
+        # Derivative of sum function is 1 for all inputs.
+        # Therefore, gradients flow back unchanged (identity).
+        self.gradient_input_1 = incoming_grad
+        self.gradient_input_2 = incoming_grad
+
+        return self.gradient_input_1, self.gradient_input_2
+
+    def update_weights(self, **kwargs) -> None:
+        """
+        Pass through -- no weights to update
+        """
+        pass
+
+    def purge(self) -> None:
+        """
+        Resets all layer state.
+        """
+        self.input_1 = None
+        self.input_2 = None
+        self.output = None
+        self.gradient_input_1 = None
+        self.gradient_input_2 = None
+        self.gradient = None
+
+    def get_weights(self):
+        return None
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        """
+        Returns a dictionary of gradients.
+        For this layer, returns gradients of the inputs.
+        """
+        grads = {}
+        if self.gradient_input_1 is not None:
+            grads["grad_input_1"] = self.gradient_input_1
+        if self.gradient_input_2 is not None:
+            grads["grad_input_2"] = self.gradient_input_2
+        return grads
+
+    def zero_gradients(self) -> None:
+        """
+        Zeroes the stored gradient values.
+        """
+        self.gradient_input_1 = np.zeros_like(self.input_1)
+        self.gradient_input_2 = np.zeros_like(self.input_2)
+        self.gradient = None
+
+    @property
+    def num_parameters(self) -> int:
+        return 0
+
+    def __str__(self):
+        return "SummingLayer"
+
+    def __repr__(self):
+        return f"{self}"
+
+
 
 
 if __name__ == "__main__":

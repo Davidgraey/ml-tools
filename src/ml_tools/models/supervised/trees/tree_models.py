@@ -26,23 +26,11 @@ class SupervisedTreeModel(BasalModel):
 
 class ExplainableBoostedTreeModel(BasalModel):
     """
-    Explainable Boosting Machine (EBM) — a Generalized Additive Model with
-    pairwise interactions, fit via cyclic gradient boosting of histogram-based
-    learners (equivalent to bagged depth-1 trees per bin).
+    Explainable Boosting Machine (EBM) — additive model with
+    pairwise interactions, fit via cyclic gradient boosting of bagged / histogram learning
 
-        f(x) = intercept + Σ_j  f_j(x_j)  +  Σ_(j,k) f_jk(x_j, x_k)
-
-    Each univariate shape function f_j and bivariate interaction f_jk is stored
-    as a lookup table over equal-frequency (quantile) bins.
-
-    Supports regression and classification (binary / multinomial / multilabel)
-    via the ``ClassificationTask`` enum.  Set ``task=None`` for regression.
+    supports regression and classification (binary / multinomial / multilabel)
     """
-
-    # ──────────────────────────────────────────────
-    # Construction
-    # ──────────────────────────────────────────────
-
     def __init__(
         self,
         input_dimension: int = 1,
@@ -65,7 +53,7 @@ class ExplainableBoostedTreeModel(BasalModel):
         self.interaction_num_bins = interaction_num_bins
 
         # --- Main-effect storage (populated during fit) ---
-        # keyed by feature index.  Each value is a dict:
+        # keyed by feature idx.  Each value is a dict:
         #   { "edges": NDArray, # quantile bounds
         #     "contributions": NDArray, # shape-function values per bin
         #     "num_bins": int }
@@ -75,7 +63,7 @@ class ExplainableBoostedTreeModel(BasalModel):
         # Keyed by (feature_j, feature_k) tuple.  Each value is a dict:
         #   { "edges_j": NDArray, # quantile bounds for feature j
         #     "edges_k": NDArray, # quantile bounds for feature k
-        #     "contributions": NDArray,    # 2-D (or 3-D for multinomial) lookup
+        #     "contributions": NDArray, # lookup
         #     "explained_variance": float } # selection score at time of ranking
         self.interactions: Dict[Tuple[int, int], dict] = {}
 
@@ -88,21 +76,20 @@ class ExplainableBoostedTreeModel(BasalModel):
 
     # Binning processes
     @staticmethod
-    def _compute_bin_edges(feature: NDArray, num_bins: int) -> NDArray:
-        """Return *unique* equal-frequency (quantile) cut-points for *feature*."""
+    def _calculate_bin_edges(feature: NDArray, num_bins: int) -> NDArray:
+        """ Return unique equal-frequency (quantile) cut-points for one feature's data """
         percentiles = np.linspace(0, 100, num_bins + 1)[1:-1]
         edges = np.percentile(feature, percentiles)
         return np.unique(edges)
 
     @staticmethod
     def _digitize(feature: NDArray, edges: NDArray) -> NDArray:
-        """Map each value to its bin index (0-based)."""
+        """ Map each value to its bin index (0-based) """
         return np.digitize(feature, edges)
 
-    # 1-D / 2-D histogram-stump fitters
     @staticmethod
     def _fit_bins_1d(bin_indices: NDArray, num_bins: int, residuals: NDArray) -> NDArray:
-        """Mean residual per bin — the histogram-based gradient-boost update."""
+        """ mean residual per bin — the gradient-boost update """
         contributions = np.zeros(num_bins)
         for b in range(num_bins):
             mask = bin_indices == b
@@ -155,10 +142,8 @@ class ExplainableBoostedTreeModel(BasalModel):
     ) -> Dict[Tuple[int, int], dict]:
         """
         Rank all (j, k) pairs by the weighted variance of 2-D bin means and
-        return the top ``max_interaction_pairs`` as a dict keyed by (j, k).
 
-        Each value contains pre-computed bin edges and a zero-initialized
-        contribution matrix, ready for boosting.
+        returns the top ranked interaction pairs as a dict[j, k]
         """
         n_features = x_data.shape[1]
 
@@ -173,10 +158,10 @@ class ExplainableBoostedTreeModel(BasalModel):
 
         candidates: List[Tuple[float, int, int]] = []
         for j in range(n_features):
-            edges_j = self._compute_bin_edges(x_data[:, j], self.interaction_num_bins)
+            edges_j = self._calculate_bin_edges(x_data[:, j], self.interaction_num_bins)
             bins_j = self._digitize(x_data[:, j], edges_j)
             for k in range(j + 1, n_features):
-                edges_k = self._compute_bin_edges(x_data[:, k], self.interaction_num_bins)
+                edges_k = self._calculate_bin_edges(x_data[:, k], self.interaction_num_bins)
                 bins_k = self._digitize(x_data[:, k], edges_k)
 
                 explained_var = 0.0
@@ -195,8 +180,8 @@ class ExplainableBoostedTreeModel(BasalModel):
 
         result: Dict[Tuple[int, int], dict] = {}
         for explained_var, j, k in top:
-            ej = self._compute_bin_edges(x_data[:, j], self.interaction_num_bins)
-            ek = self._compute_bin_edges(x_data[:, k], self.interaction_num_bins)
+            ej = self._calculate_bin_edges(x_data[:, j], self.interaction_num_bins)
+            ek = self._calculate_bin_edges(x_data[:, k], self.interaction_num_bins)
             nbj, nbk = len(ej) + 1, len(ek) + 1
 
             if self.is_multitarget:
@@ -213,15 +198,16 @@ class ExplainableBoostedTreeModel(BasalModel):
 
         return result
 
-    # Pseudo-residuals (negative gradient)
+    # residuals (negative gradient)
     def _compute_residuals(self, scores: NDArray, targets: NDArray) -> NDArray:
         """
-        Negative gradient of the loss w.r.t. the current scores.
+        Negative gradient of the loss -- not really residuals, pseudo resid?
 
-        Regression:    target − score
-        Binary:        target − σ(score)
-        Multinomial:   target − softmax(score)
-        Multilabel:    target − σ(score)
+        regression: target − score
+        binary:        target − sigmoid(score)
+        multinomial:   target − softmax(score)
+        multilabel:    target − sigmoid(score)
+
         """
         if self.is_regression:
             return targets.ravel() - scores.ravel()
@@ -235,21 +221,16 @@ class ExplainableBoostedTreeModel(BasalModel):
 
         return targets.ravel() - scores.ravel()
 
-    # Loss function
     def calculate_loss(self, scores: NDArray, targets: NDArray) -> float:
         """Internal loss dispatch used during training."""
         if self.is_regression:
             return float(mse(scores, targets))
         return float(cross_entropy(scores, targets, task=self.task))
 
-    # ──────────────────────────────────────────────
-    # Forward / Predict
-    # ──────────────────────────────────────────────
-
+    # --------- forward pass ----------
     def forward(self, x_data: NDArray, **kwargs) -> NDArray:
         """
-        Compute raw additive scores:
-            intercept + Σ f_j(x_j) + Σ f_jk(x_j, x_k)
+        Compute raw additive scores for the regression and interaction effects
         """
         num_samples = x_data.shape[0]
 
@@ -285,11 +266,11 @@ class ExplainableBoostedTreeModel(BasalModel):
                          a_max=contribs.shape[1] - 1
                          )
             scores += contribs[bj, bk]
-
+        # scores / logits
         return scores
 
     def predict(self, x_data: NDArray, **kwargs) -> NDArray:
-        """Apply the appropriate activation and return hard predictions."""
+        """ apply the appropriate activation and return hard predictions """
         scores = self.forward(x_data)
 
         if self.is_regression:
@@ -304,31 +285,29 @@ class ExplainableBoostedTreeModel(BasalModel):
 
         return scores
 
-    # ──────────────────────────────────────────────
-    # Fit
     def fit(self, x_data: NDArray, y_data: NDArray = None, **kwargs) -> List[float]:
         """
         Train the EBM in two phases:
-          1. Cyclic boosting of main (univariate) effects.
-          2. Greedy selection then cyclic boosting of pairwise interactions.
+          GB main effects f(x)
+          GB pairwise interaction effects fj(j_x) +fk(k_x)
 
         Parameters
         ----------
-        x_data : (N, D) feature matrix
-        y_data : (N,) or (N, C) targets
+        x_data: (num_samples, dimension) feature matrix
+        y_data: (num_samples) or (num_samples, class_dim)
 
         Returns
         -------
-        List of loss values recorded at the end of each boosting round.
+        List of loss values recorded at the end of each gradient boosting round
         """
         num_samples, num_features = x_data.shape
         self.input_dimension = num_features
         # is_multi = self.task == ClassificationTask.MULTINOMIAL
 
-        # ── 1. Build quantile bins per feature ──────────────────
+        # build bins on quantiles
         self.main_effects = {}
         for j in range(num_features):
-            edges = self._compute_bin_edges(x_data[:, j], self.num_bins)
+            edges = self._calculate_bin_edges(x_data[:, j], self.num_bins)
             num_actual = len(edges) + 1
             if self.is_multitarget:
                 contribs = np.zeros((num_actual, self.output_dimension))
@@ -341,7 +320,7 @@ class ExplainableBoostedTreeModel(BasalModel):
                 "num_bins": num_actual,
             }
 
-        # ── 2. Set intercept to the base rate ───────────────────
+        # establish intercetps
         if self.is_regression:
             self.intercept = float(np.mean(y_data))
         elif self.task == ClassificationTask.BINARY:
@@ -355,7 +334,7 @@ class ExplainableBoostedTreeModel(BasalModel):
         else:
             self.intercept = 0.0
 
-        # ── 3. Phase 1 — main effects ──────────────────────────
+        # main effects f(x)
         losses: List[float] = []
 
         for round_i in range(self.num_rounds):
@@ -385,7 +364,7 @@ class ExplainableBoostedTreeModel(BasalModel):
                 log.info(f"EBM main-effects converged at round {round_i}")
                 break
 
-        # ── 4. Phase 2 — pairwise interactions ─────────────────
+        # pairwise effects
         scores = self.forward(x_data)
         residuals = self._compute_residuals(scores, y_data)
         self.interactions = self._select_interaction_pairs(x_data, residuals)
@@ -415,7 +394,7 @@ class ExplainableBoostedTreeModel(BasalModel):
             losses.append(loss)
 
             if len(losses) > 2 and abs(losses[-1] - losses[-2]) < EPSILON:
-                log.info(f"EBM interactions converged at round {round_i}")
+                log.info(f"EBM interactions converged at {round_i}")
                 break
 
         log.info(f"EBM training complete. Final loss: {losses[-1]:.6f}")
@@ -438,7 +417,7 @@ class ExplainableBoostedTreeModel(BasalModel):
 
     # Interpretability helpers
     def get_feature_importance(self) -> Dict[int, float]:
-        """Mean |contribution| per main-effect feature, keyed by feature index."""
+        """ contribution per effect """
         return {
             j: float(np.mean(np.abs(effect["contributions"])))
             for j, effect in self.main_effects.items()
@@ -446,8 +425,7 @@ class ExplainableBoostedTreeModel(BasalModel):
 
     def get_shape_function(self, feature_index: int) -> Tuple[NDArray, NDArray]:
         """
-        Return (bin_centers, contributions) for a single feature's shape
-        function — useful for plotting the learned marginal effect.
+        return (centers, contributions) for a single feature's shape - plotting helper
         """
         effect = self.main_effects[feature_index]
         edges = effect["edges"]
@@ -465,8 +443,8 @@ class ExplainableBoostedTreeModel(BasalModel):
 
     def get_interaction_function(self, pair: Tuple[int, int]) -> dict:
         """
-        Return the full interaction dict for the given (j, k) pair,
-        containing "edges_j", "edges_k", "contributions", and
+        Return the full interaction dict for the (j, k) pair
+        "edges_j", "edges_k", "contributions", and
         "explained_variance".
         """
         return self.interactions[pair]

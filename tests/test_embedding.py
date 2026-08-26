@@ -1,16 +1,20 @@
 """
-Embeddings: rotary positional encoding and the exploratory embedding module.
+Embeddings: positional encodings and the exploratory embedding module.
 
 RoPE has strong properties worth asserting -- it must preserve vector norms,
 because it is a rotation, and the inner product between two positions must
 depend only on their separation. That relative-position property is the entire
 reason to use it.
+
+The sinusoid table is the additive counterpart, and its properties are the
+complements: it does not preserve norms, and what it must get right instead is
+that the offset it applies depends on position alone.
 """
 
 import numpy as np
 import pytest
 
-from ml_tools.models.embedding.positional import RopeEmbedding
+from ml_tools.models.embedding.positional import RopeEmbedding, SinusoidEmbedding
 from conftest import GRADIENT_TOLERANCE, input_gradient_error
 
 
@@ -21,6 +25,11 @@ DIMENSION = 6
 @pytest.fixture()
 def rope():
     return RopeEmbedding(sequence_length=SEQUENCE, embedding_dimension=DIMENSION)
+
+
+@pytest.fixture()
+def sinusoid():
+    return SinusoidEmbedding(sequence_length=SEQUENCE, embedding_dimension=DIMENSION)
 
 
 @pytest.fixture()
@@ -77,23 +86,21 @@ def test_rope_gradient(rope, embedded_batch):
 
 def test_rope_is_safe_for_the_optimizer(rope, embedded_batch):
     """
-    RoPE has nothing to learn, but it does report a `grad` entry. Its
-    update_weights takes **kwargs and ignores it, so a step is harmless -- that
-    is what matters for the optimizer.
+    RoPE has nothing to learn, so SGD should find no gradients to apply and
+    skip it entirely rather than stepping a fixed rotation.
     """
     from ml_tools.models.optimizers import SGD
 
     output = rope.forward(embedded_batch)
     rope.backward(np.ones_like(output))
+    before = rope.rope_array
     SGD(0.01).step([rope])
+    after = rope.rope_array
+
+    assert np.allclose(before[0], after[0])
+    assert np.allclose(before[1], after[1])
 
 
-@pytest.mark.xfail(
-    reason="RoPE is a fixed rotation with nothing to learn, but get_gradients "
-    "reports a `grad` key and num_parameters returns None instead of 0, so it "
-    "does not follow the parameterless-layer convention",
-    strict=True,
-)
 def test_rope_follows_the_parameterless_convention(rope, embedded_batch):
     output = rope.forward(embedded_batch)
     rope.backward(np.ones_like(output))
@@ -102,11 +109,55 @@ def test_rope_follows_the_parameterless_convention(rope, embedded_batch):
 
 
 def test_rope_rejects_an_odd_dimension():
-    """rotary pairs adjacent dimensions, so an odd width has a leftover"""
-    with pytest.raises(Exception):
-        RopeEmbedding(sequence_length=4, embedding_dimension=5).forward(
-            np.zeros((1, 4, 5))
-        )
+    """
+    Rotary pairs adjacent dimensions, so an odd width has a leftover. Caught at
+    construction, not on the first forward pass, where it used to surface as a
+    numpy broadcast error naming shapes the caller never supplied.
+    """
+    with pytest.raises(AssertionError):
+        RopeEmbedding(sequence_length=4, embedding_dimension=5)
+
+
+def test_rope_rejects_a_sequence_past_the_table(rope):
+    """the rotation table is built to a ceiling, and past it there are no rows"""
+    with pytest.raises(AssertionError):
+        rope.forward(np.zeros((1, SEQUENCE + 1, DIMENSION)))
+
+
+def test_rope_rejects_a_mismatched_width(rope):
+    with pytest.raises(AssertionError):
+        rope.forward(np.zeros((1, SEQUENCE, DIMENSION + 2)))
+
+
+def test_rope_accepts_a_short_sequence(rope):
+    """a shorter sequence is legal, it takes the leading rows of the table"""
+    short = np.random.default_rng(0).normal(size=(2, SEQUENCE - 3, DIMENSION))
+    assert rope.forward(short).shape == short.shape
+
+
+def test_rope_two_dimensional_matches_the_batched_path(rope, embedded_batch):
+    """
+    One code path serves both ranks by broadcasting, so a single sample must
+    come out the same whether or not it carries a batch axis.
+    """
+    batched = rope.forward(embedded_batch)
+    single = rope.forward(embedded_batch[0])
+    assert np.allclose(single, batched[0])
+
+
+def test_rope_table_is_not_reachable_for_mutation(rope):
+    """rope_array hands out copies, so a caller cannot corrupt the rotation"""
+    sine, cosine = rope.rope_array
+    sine[:] = 0.0
+    cosine[:] = 0.0
+    assert not np.allclose(rope.rope_array[0], 0.0)
+
+
+def test_rope_purge_keeps_the_rotation_table(rope, embedded_batch):
+    """the tables are constants, not activations -- purge must not drop them"""
+    before = rope.forward(embedded_batch)
+    rope.purge()
+    assert np.allclose(rope.forward(embedded_batch), before)
 
 
 def test_rope_interface(rope, embedded_batch):
@@ -114,6 +165,136 @@ def test_rope_interface(rope, embedded_batch):
     rope.backward(np.ones_like(output))
     rope.zero_gradients()
     rope.purge()
+
+
+# -------------    the fixed sinusoid table    ---------------------
+def test_sinusoid_preserves_shape(sinusoid, embedded_batch):
+    assert sinusoid.forward(embedded_batch).shape == embedded_batch.shape
+
+
+def test_sinusoid_is_purely_additive(sinusoid, embedded_batch):
+    """
+    The defining difference from RoPE: the offset depends on position alone, so
+    subtracting the output from the input must leave the same table for every
+    sample, whatever the content.
+    """
+    offset = sinusoid.forward(embedded_batch) - embedded_batch
+    assert np.allclose(offset, sinusoid.sinusoid_array)
+    assert np.allclose(offset[0], offset[1])
+
+
+def test_sinusoid_does_not_preserve_norms(sinusoid, embedded_batch):
+    """an addition is not a rotation -- asserted so the two do not get conflated"""
+    rotated = sinusoid.forward(embedded_batch)
+    assert not np.allclose(
+        np.linalg.norm(embedded_batch, axis=-1), np.linalg.norm(rotated, axis=-1)
+    )
+
+
+def test_sinusoid_varies_with_position(sinusoid):
+    """the same vector at two positions must not come out the same"""
+    repeated = np.tile(np.arange(DIMENSION, dtype=float), (1, SEQUENCE, 1))
+    encoded = sinusoid.forward(repeated)
+    assert not np.allclose(encoded[0, 0], encoded[0, 1])
+
+
+def test_sinusoid_table_is_bounded(sinusoid):
+    """sine and cosine, so unit amplitude -- the docstring's scaling advice"""
+    assert np.abs(sinusoid.sinusoid_array).max() <= 1.0
+
+
+def test_sinusoid_splits_sine_and_cosine_by_parity(sinusoid):
+    """even channels carry the sine, odd the cosine, on a shared ladder"""
+    table = sinusoid.sinusoid_array
+    assert np.allclose(table[0, 0::2], 0.0)
+    assert np.allclose(table[0, 1::2], 1.0)
+
+
+def test_sinusoid_shares_the_rope_frequency_ladder(sinusoid, rope):
+    """
+    Same inv_freq, different use: RoPE rotates by the angle, this adds its
+    sine and cosine. A drift between the two would mean one of them is wrong.
+    """
+    rope_sine, rope_cosine = rope.rope_array
+    table = sinusoid.sinusoid_array
+    assert np.allclose(table[:, 0::2], rope_sine)
+    assert np.allclose(table[:, 1::2], rope_cosine)
+
+
+@pytest.mark.slow
+def test_sinusoid_gradient(sinusoid, embedded_batch):
+    assert input_gradient_error(sinusoid, embedded_batch) < GRADIENT_TOLERANCE
+
+
+def test_sinusoid_gradient_passes_through_untouched(sinusoid, embedded_batch):
+    """adding a constant has an identity Jacobian"""
+    output = sinusoid.forward(embedded_batch)
+    upstream = np.random.default_rng(1).normal(size=output.shape)
+    assert np.allclose(sinusoid.backward(upstream), upstream)
+
+
+def test_sinusoid_follows_the_parameterless_convention(sinusoid, embedded_batch):
+    output = sinusoid.forward(embedded_batch)
+    sinusoid.backward(np.ones_like(output))
+    assert sinusoid.get_gradients() in ({}, None)
+    assert sinusoid.num_parameters == 0
+
+
+def test_sinusoid_is_safe_for_the_optimizer(sinusoid, embedded_batch):
+    from ml_tools.models.optimizers import SGD
+
+    output = sinusoid.forward(embedded_batch)
+    sinusoid.backward(np.ones_like(output))
+    before = sinusoid.sinusoid_array
+    SGD(0.01).step([sinusoid])
+    assert np.allclose(before, sinusoid.sinusoid_array)
+
+
+def test_sinusoid_rejects_an_odd_dimension():
+    """parity splits the channels, so an odd width has a leftover"""
+    with pytest.raises(AssertionError):
+        SinusoidEmbedding(sequence_length=4, embedding_dimension=5)
+
+
+def test_sinusoid_rejects_a_sequence_past_the_table(sinusoid):
+    with pytest.raises(AssertionError):
+        sinusoid.forward(np.zeros((1, SEQUENCE + 1, DIMENSION)))
+
+
+def test_sinusoid_rejects_a_mismatched_width(sinusoid):
+    with pytest.raises(AssertionError):
+        sinusoid.forward(np.zeros((1, SEQUENCE, DIMENSION + 2)))
+
+
+def test_sinusoid_accepts_a_short_sequence(sinusoid):
+    """a shorter sequence takes the leading rows of the table"""
+    short = np.random.default_rng(0).normal(size=(2, SEQUENCE - 3, DIMENSION))
+    assert sinusoid.forward(short).shape == short.shape
+
+
+def test_sinusoid_two_dimensional_matches_the_batched_path(sinusoid, embedded_batch):
+    batched = sinusoid.forward(embedded_batch)
+    single = sinusoid.forward(embedded_batch[0])
+    assert np.allclose(single, batched[0])
+
+
+def test_sinusoid_table_is_not_reachable_for_mutation(sinusoid):
+    table = sinusoid.sinusoid_array
+    table[:] = 0.0
+    assert not np.allclose(sinusoid.sinusoid_array, 0.0)
+
+
+def test_sinusoid_purge_keeps_the_table(sinusoid, embedded_batch):
+    before = sinusoid.forward(embedded_batch)
+    sinusoid.purge()
+    assert np.allclose(sinusoid.forward(embedded_batch), before)
+
+
+def test_sinusoid_interface(sinusoid, embedded_batch):
+    output = sinusoid.forward(embedded_batch)
+    sinusoid.backward(np.ones_like(output))
+    sinusoid.zero_gradients()
+    sinusoid.purge()
 
 
 # -------------    the exploratory embedding module    -------------

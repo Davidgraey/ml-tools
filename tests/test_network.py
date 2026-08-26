@@ -13,15 +13,20 @@ produces a network that trains, just not correctly, so it is checked against
 finite differences rather than by inspection.
 """
 
+import inspect
+
 import numpy as np
 import pytest
 
 from ml_tools.models.layers.layers import (
+    ANY_SHAPE,
     DropoutLayer,
     FullyConnectedLayer,
     NormalizeLayer,
+    shape_conflict,
 )
 from ml_tools.models.layers.layers import Layer
+from ml_tools.models.blocks import SpectreAttention
 from ml_tools.models.layers.operators import LatentStack
 from ml_tools.models.model_loss import MSELoss
 from ml_tools.models.neural_network import INPUT_NAME, NeuralNetwork, Node
@@ -318,6 +323,222 @@ def test_shapes_report_every_node(branching_network):
 
 def test_summary_shows_declared_shapes_without_data(branching_network):
     assert "(8,)" in branching_network.summary()
+
+
+def test_a_trailing_width_match_ignores_the_leading_axes():
+    """
+    The rule the whole check rests on: a declaration names trailing axes, and
+    the axes it does not name are free. A layer that cares only about its width
+    must take (batch, sequence, hidden) and (batch, hidden) alike.
+    """
+    assert shape_conflict((8, 4), (4,)) is None
+    assert shape_conflict((3, 8, 4), (4,)) is None
+    assert shape_conflict((8, 4), (5,)) is not None
+
+
+def test_a_shorter_shape_is_silent_rather_than_wrong():
+    """
+    Deliberately permissive. A source naming one axis says nothing about its
+    leading axes, so it might well arrive with the rank a sequence-pinned
+    consumer needs. Refusing here would false-alarm on most of the library.
+    """
+    assert shape_conflict((4,), (8, 4)) is None
+
+
+def test_a_named_leading_axis_still_conflicts():
+    """permissive about absent axes is not the same as permissive about wrong ones"""
+    conflict = shape_conflict((8, 4), (16, 4))
+    assert conflict is not None and "axis -2" in conflict
+
+
+def test_a_conflict_names_the_offending_axis():
+    conflict = shape_conflict((6,), (9,))
+    assert conflict is not None and "axis -1" in conflict
+
+
+def test_a_none_axis_is_not_a_claim():
+    assert shape_conflict((None,), (9,)) is None
+    assert shape_conflict((9,), (None,)) is None
+    assert shape_conflict(None, (9,)) is None
+
+
+def test_transposed_merge_sources_are_refused():
+    """
+    Both widths exist on the layer, just swapped. Checking every source against
+    the first declaration would wave this through, which is the reason the
+    comparison is positional.
+    """
+    net = NeuralNetwork()
+    left = net.connect(FullyConnectedLayer(4, 5, "linear"), net.input)
+    right = net.connect(FullyConnectedLayer(4, 3, "linear"), net.input)
+    with pytest.raises(ValueError, match="position 0"):
+        net.connect(FixedWidthMerge(3, 5), left, right)
+
+
+def test_more_sources_than_declared_inputs_is_refused():
+    """otherwise the surplus edges are wired but never compared against anything"""
+    net = NeuralNetwork()
+    first = net.connect(FullyConnectedLayer(4, 3, "linear"), net.input)
+    second = net.connect(FullyConnectedLayer(4, 3, "linear"), net.input)
+    with pytest.raises(ValueError, match="inputs, got 2"):
+        net.connect(NormalizeLayer(3), first, second)
+
+
+def test_a_multi_output_layer_is_refused():
+    """
+    A node stores whatever forward returned, so there is no way to say which
+    output an edge carries. Refused at the wiring line rather than silently
+    resolving to output zero.
+    """
+
+    class TwoOutputs(Layer):
+        def __init__(self):
+            super().__init__()
+            self.declare_shapes(inputs=((4,),), outputs=((4,), (4,)))
+
+        def forward(self, x):
+            return x, x
+
+        def backward(self, incoming_gradient):
+            return incoming_gradient
+
+        def update_weights(self, **kwargs) -> None:
+            pass
+
+        def purge(self) -> None:
+            pass
+
+        def zero_gradients(self) -> None:
+            pass
+
+    net = NeuralNetwork()
+    first = net.connect(FullyConnectedLayer(4, 4, "linear"), net.input)
+    with pytest.raises(ValueError, match="declares 2 outputs"):
+        net.connect(TwoOutputs(), first)
+
+
+def test_a_sequence_pinned_layer_checks_both_axes():
+    """SpectreAttention declares (sequence, hidden), so both are compared"""
+    net = NeuralNetwork(input_shape=(16, 8))
+    with pytest.raises(ValueError, match="axis -2"):
+        net.connect(SpectreAttention(12, 8), net.input)
+
+    net = NeuralNetwork(input_shape=(16, 8))
+    with pytest.raises(ValueError, match="axis -1"):
+        net.connect(SpectreAttention(16, 4), net.input)
+
+    net = NeuralNetwork(input_shape=(16, 8))
+    assert net.connect(SpectreAttention(16, 8), net.input) is not None
+
+
+# -------------    declarations agree with themselves    -----------
+def concrete_layers():
+    """
+    Every Layer subclass in the package that can be constructed with defaults.
+
+    Walked rather than listed, so a new layer is covered the moment it exists
+    instead of when somebody remembers to add it here.
+    """
+    import importlib
+    import pkgutil
+
+    import ml_tools.models as models
+
+    for info in pkgutil.walk_packages(models.__path__, f"{models.__name__}."):
+        try:
+            importlib.import_module(info.name)
+        except Exception:
+            continue
+
+    found = []
+    stack = [Layer]
+    while stack:
+        for subclass in stack.pop().__subclasses__():
+            stack.append(subclass)
+            if inspect.isabstract(subclass):
+                continue
+            found.append(subclass)
+    return found
+
+
+LAYER_ARGUMENTS = {
+    "FullyConnectedLayer": ((4, 6, "relu"), {}),
+    "NormalizeLayer": ((6,), {}),
+    "RMSNormLayer": ((6,), {}),
+    "DropoutLayer": ((), {}),
+    "FourierLayer": ((), {}),
+    "InverseFourierLayer": ((), {}),
+    "FrequencyFFT": ((8, 4), {}),
+    "LatentStack": ((), {}),
+    "FourierAttention": ((6, 6), {}),
+    "SpectreAttention": ((8, 6), {}),
+    "RopeEmbedding": ((8, 6), {}),
+    "SinusoidEmbedding": ((8, 6), {}),
+    "VotingBase": ((6, 4), {}),
+    "VotingWeight": ((6, 4), {}),
+    # VotingGate carries a hidden width the others do not
+    "VotingGate": ((6, 5, 4), {"top_k": 2}),
+}
+
+
+@pytest.mark.parametrize("layer_class", concrete_layers(), ids=lambda c: c.__name__)
+def test_every_layer_declares_shapes_consistently(layer_class):
+    """
+    A declaration is a claim a layer makes about itself, and the graph trusts
+    it. Two ways it can be wrong regardless of what the layer computes: fewer
+    declared inputs than forward requires, so an edge has nothing to check
+    against, and more than one output, which no node can carry.
+    """
+    recipe = LAYER_ARGUMENTS.get(layer_class.__name__)
+    if recipe is None:
+        pytest.skip(f"{layer_class.__name__} needs constructor arguments")
+    arguments, keywords = recipe
+    layer = layer_class(*arguments, **keywords)
+
+    declared_inputs = layer.shapes["input"]
+    declared_outputs = layer.shapes["output"]
+
+    assert len(declared_outputs) == 1, (
+        f"{layer_class.__name__} declares {len(declared_outputs)} outputs, but "
+        "a node carries one value"
+    )
+
+    parameters = list(inspect.signature(layer.forward).parameters.values())
+    required = sum(
+        1
+        for parameter in parameters
+        if parameter.kind
+        in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+        and parameter.name != "self"
+        and parameter.default is parameter.empty
+    )
+    assert len(declared_inputs) >= required, (
+        f"{layer_class.__name__}.forward requires {required} inputs but only "
+        f"{len(declared_inputs)} shapes are declared, so an edge would go "
+        "unchecked"
+    )
+    for shape in declared_inputs + declared_outputs:
+        assert isinstance(shape, tuple), (
+            f"{layer_class.__name__} declared {shape!r}, expected a tuple of "
+            "trailing axes"
+        )
+
+
+@pytest.mark.parametrize("layer_class", concrete_layers(), ids=lambda c: c.__name__)
+def test_every_layer_infers_exactly_one_output_shape(layer_class):
+    """
+    infer_output_shapes feeds Node.out_shape, so it has to return one shape per
+    node however many inputs arrive. A shape-preserving layer returning its
+    whole input tuple was the case that broke this.
+    """
+    recipe = LAYER_ARGUMENTS.get(layer_class.__name__)
+    if recipe is None:
+        pytest.skip(f"{layer_class.__name__} needs constructor arguments")
+    arguments, keywords = recipe
+    layer = layer_class(*arguments, **keywords)
+
+    incoming = tuple(ANY_SHAPE for _ in layer.shapes["input"])
+    assert len(layer.infer_output_shapes(incoming)) == 1
 
 
 # -------------    the output    -----------------------------------

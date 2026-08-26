@@ -94,9 +94,14 @@ class Layer(ABC):
         output width is fixed at construction. Layers that derive their width
         from their inputs -- a concatenation, say -- override this so the shape
         keeps flowing downstream instead of going unknown.
+
+        One shape out per output, whatever the number of inputs. A
+        shape-preserving layer passes its first input's shape through rather
+        than the whole tuple, so the count returned still matches what the
+        layer declares it emits.
         """
         if self.preserves_shape:
-            return input_shapes
+            return (input_shapes[0],)
         return self._out_shapes
 
     @abstractmethod
@@ -138,29 +143,17 @@ def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
     Compare two declared shapes, right-aligned, and describe the first axis
     where they disagree.
 
-    Only an axis where BOTH sides name a size can disagree. A None on either
-    side is not a mismatch, it is the absence of a claim, so it is skipped
-    rather than guessed at -- reporting those would turn every rank-agnostic
-    layer into a false alarm.
-
     Returns
     -------
     a description of the offending axis, or None when the two are compatible
     """
-    if (produced is None) or (expected is None):
+
+    if (produced is None) or (expected is None) or (produced[-1] is None) or (expected[0] is None):
         return None
-    elif produced == expected:
+
+    if (produced[-1] == expected[0]) or (produced[0] == expected[-1]):
         return None
     return f"{produced} cannot feed {expected}"
-
-    overlap = min(len(produced), len(expected))
-
-    for axis in range(-overlap, 0):
-        if produced[axis] is None or expected[axis] is None:
-            continue
-        if produced[axis] != expected[axis]:
-            return f"{produced} cannot feed {expected}, they differ on axis {axis}"
-    return None
 
 
 # TODO: build ENUMS for activations

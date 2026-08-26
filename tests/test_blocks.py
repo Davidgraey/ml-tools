@@ -176,12 +176,20 @@ def test_fourier_attention_interface(sequence_batch):
 # -------------    SpectreAttention    -----------------------------
 @pytest.mark.slow
 @pytest.mark.parametrize("sequence", PARITIES)
-def test_spectre_parameter_gradients(sequence):
-    """every projection plus the learnable per-frequency modReLU bias"""
+@pytest.mark.parametrize("num_heads", (1, 2))
+def test_spectre_parameter_gradients(sequence, num_heads):
+    """every projection plus the learnable per-head modReLU bias"""
     rng = np.random.default_rng(0)
     hidden = 4
     x_data = rng.normal(size=(3, sequence, hidden))
     targets = rng.normal(size=x_data.shape)
+
+    def make():
+        return promote(
+            SpectreAttention(
+                sequence_length=sequence, hidden_dim=hidden, num_heads=num_heads
+            )
+        )
 
     for parameter_name, reader in (
         ("fc_query", lambda b: b.fc_query.gradient_weights),
@@ -189,7 +197,7 @@ def test_spectre_parameter_gradients(sequence):
         ("fc_1", lambda b: b.fc_1.gradient_weights),
         ("fc_2", lambda b: b.fc_2.gradient_weights),
     ):
-        block = promote(SpectreAttention(sequence_length=sequence, hidden_dim=hidden))
+        block = make()
         error = block_parameter_error(
             block, x_data, targets,
             getattr(block, parameter_name).weights,
@@ -197,7 +205,7 @@ def test_spectre_parameter_gradients(sequence):
         )
         assert error < GRADIENT_TOLERANCE, parameter_name
 
-    block = promote(SpectreAttention(sequence_length=sequence, hidden_dim=hidden))
+    block = make()
     error = block_parameter_error(
         block, x_data, targets, block.activation_bias,
         lambda: block.gradient_bias,
@@ -207,17 +215,26 @@ def test_spectre_parameter_gradients(sequence):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("sequence", (7, 8))
-def test_spectre_band_tap_gradient(sequence):
-    """the optional Toeplitz gate, whose taps are complex"""
+@pytest.mark.parametrize("num_heads", (1, 2))
+def test_spectre_band_tap_gradient(sequence, num_heads):
+    """
+    The optional Toeplitz gate, whose taps are complex. The convolution is
+    depth-wise, so each head carries its own tap vector and the gradient has to
+    stay separated by head.
+    """
     rng = np.random.default_rng(0)
     hidden = 4
     x_data = rng.normal(size=(3, sequence, hidden))
     targets = rng.normal(size=x_data.shape)
 
     block = promote(
-        SpectreAttention(sequence_length=sequence, hidden_dim=hidden, band_radius=2)
+        SpectreAttention(
+            sequence_length=sequence, hidden_dim=hidden,
+            num_heads=num_heads, band_radius=2,
+        )
     )
-    block.band_taps = (rng.normal(size=5) + 1j * rng.normal(size=5)) * 0.3
+    shape = (num_heads, 5)
+    block.band_taps = (rng.normal(size=shape) + 1j * rng.normal(size=shape)) * 0.3
 
     def scalar():
         prediction = block.forward(x_data)
@@ -246,19 +263,70 @@ def test_spectre_input_gradient(sequence_batch):
     assert relative_error(analytic, numeric) < GRADIENT_TOLERANCE
 
 
-def test_spectre_preserves_shape(sequence_batch):
-    block = SpectreAttention(sequence_length=8, hidden_dim=4)
+@pytest.mark.parametrize("num_heads", (1, 2, 4))
+def test_spectre_preserves_shape(sequence_batch, num_heads):
+    block = SpectreAttention(sequence_length=8, hidden_dim=4, num_heads=num_heads)
     assert block.forward(sequence_batch).shape == sequence_batch.shape
 
 
-def test_spectre_gate_is_diagonal_across_channels():
+@pytest.mark.parametrize("num_heads", (1, 2, 4))
+def test_spectre_gate_is_diagonal_across_channels(num_heads):
     """
-    The paper's gate holds one value per frequency, broadcast over every
-    channel. A gate with a channel axis would be a different model.
+    The gate holds one value per head per frequency, broadcast over that head's
+    channels. A gate with a channel axis would be a different model.
+    """
+    block = SpectreAttention(sequence_length=8, hidden_dim=4, num_heads=num_heads)
+    block.forward(np.random.default_rng(0).normal(size=(3, 8, 4)))
+    assert block.gate.shape == (3, num_heads, block.num_frequencies)
+
+
+def test_spectre_single_head_is_unchanged_by_the_head_axis():
+    """
+    The default has to stay the layer it was before heads existed: one gate,
+    every channel gated by it.
     """
     block = SpectreAttention(sequence_length=8, hidden_dim=4)
-    block.forward(np.random.default_rng(0).normal(size=(3, 8, 4)))
-    assert block.gate.shape == (3, block.num_frequencies)
+    x_data = np.random.default_rng(0).normal(size=(3, 8, 4))
+    output = block.forward(x_data)
+
+    expected = np.fft.irfft(
+        block.value_transform * block.gate[:, 0, :, None], n=8, axis=1
+    )
+    assert np.allclose(output, expected)
+
+
+def test_spectre_rejects_heads_that_do_not_divide_the_channels():
+    with pytest.raises(AssertionError):
+        SpectreAttention(sequence_length=8, hidden_dim=6, num_heads=4)
+
+    with pytest.raises(AssertionError):
+        SpectreAttention(sequence_length=8, hidden_dim=4, num_heads=0)
+
+
+def test_spectre_heads_do_not_mix_channels():
+    """
+    Heads partition the channel axis, so zeroing one head's gate must silence
+    exactly that head's channels and leave the rest untouched.
+    """
+    num_heads = 2
+    block = SpectreAttention(sequence_length=8, hidden_dim=4, num_heads=num_heads)
+    x_data = np.random.default_rng(0).normal(size=(3, 8, 4))
+
+    baseline = block.forward(x_data)
+    gate = block.gate.copy()
+
+    gate[:, 0, :] = 0.0
+    block.gate = gate
+    silenced = np.fft.irfft(
+        block._merge_heads(
+            block._split_heads(block.value_transform) * block._align_gate(gate)
+        ),
+        n=8, axis=1,
+    )
+
+    head_dim = block.head_dim
+    assert np.allclose(silenced[..., :head_dim], 0.0)
+    assert np.allclose(silenced[..., head_dim:], baseline[..., head_dim:])
 
 
 @pytest.mark.parametrize(
@@ -275,9 +343,13 @@ def test_spectre_rejects_mismatched_input(shape, reason):
         block.forward(np.zeros(shape))
 
 
+@pytest.mark.parametrize("num_heads", (1, 2))
 @pytest.mark.parametrize("band_radius", (0, 2))
-def test_spectre_interface(band_radius):
-    block = SpectreAttention(sequence_length=8, hidden_dim=4, band_radius=band_radius)
+def test_spectre_interface(band_radius, num_heads):
+    block = SpectreAttention(
+        sequence_length=8, hidden_dim=4,
+        num_heads=num_heads, band_radius=band_radius,
+    )
     assert block.num_parameters > 0, "must be reportable before any backward pass"
 
     output = block.forward(np.random.default_rng(0).normal(size=(2, 8, 4)))
@@ -306,6 +378,10 @@ def test_spectre_rejects_a_degenerate_spread():
         lambda: FourierAttention(ni=8, no=8),
         lambda: SpectreAttention(sequence_length=9, hidden_dim=8),
         lambda: SpectreAttention(sequence_length=9, hidden_dim=8, band_radius=2),
+        lambda: SpectreAttention(sequence_length=9, hidden_dim=8, num_heads=4),
+        lambda: SpectreAttention(
+            sequence_length=9, hidden_dim=8, num_heads=4, band_radius=2
+        ),
     ),
 )
 def test_block_reduces_loss(make_block):

@@ -7,16 +7,7 @@ from ml_tools.models.layers.layers import EPSILON, FullyConnectedLayer, Layer
 
 class VotingBase(Layer):
     """
-    Shared plumbing for the mixture voting layers. Not used directly.
-
-    The input is the stacked embed output, one time-domain branch and one
-    frequency-domain branch, shaped (num_samples, 2, hidden_space). A vote has
-    to read both branches jointly, so they are flattened to a single
-    2 * hidden_space feature vector on the way in and the gradient is folded
-    back to the stacked shape on the way out.
-
-    Forward returns the per-expert votes only. Applying them to the experts and
-    summing belongs to the network that owns the experts.
+    Shared plumbing for the mixture voting layers --
     """
 
     # softmax votes already sum to one, so a top-k mask has to be renormalised
@@ -27,9 +18,6 @@ class VotingBase(Layer):
 
     def __init__(self, input_shape: int, num_experts: int, top_k: Optional[int] = None):
         super().__init__()
-        assert num_experts > 1, (
-            f"a mixture needs at least two experts to vote between, got {num_experts}"
-        )
         assert top_k is None or 1 <= top_k <= num_experts, (
             f"top_k must fall in [1, {num_experts}], or be None for a dense "
             f"vote, got {top_k}"

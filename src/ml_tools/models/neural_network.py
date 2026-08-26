@@ -25,6 +25,11 @@ source produces against what its consumer wants and refuse the edge on the spot
 several layers into the first forward pass.
 """
 
+# train() and eval() annotate their return as NeuralNetwork from inside the
+# class body, where the name does not exist yet. Deferring annotations is what
+# makes that legal, and without it the module raises NameError on import.
+from __future__ import annotations
+
 import inspect
 from typing import Iterable, Optional
 
@@ -65,10 +70,19 @@ class Node:
         self.consumers: list = []
 
         if layer is None:
-            self.out_shape = shape
+            self.in_shape = shape[0]
+            self.out_shape = shape[-1]
         else:
             incoming = tuple(source.out_shape for source in sources)
-            self.out_shape = layer.infer_output_shapes(incoming)[0]
+            resolved = layer.infer_output_shapes(incoming)
+            if len(resolved) != 1:
+                raise ValueError(
+                    f"{layer.__class__.__name__}.infer_output_shapes returned "
+                    f"{len(resolved)} shapes for one node. A node holds one "
+                    "value, so it must resolve to exactly one shape."
+                )
+            self.in_shape = shape[0]
+            self.out_shape = resolved[0]
 
         # Check once here instead of inspecting the signature on every forward pass.
         self.accepts_training = bool(layer) and (
@@ -81,6 +95,11 @@ class Node:
     @property
     def is_source(self) -> bool:
         return self.layer is None
+
+    @property
+    def shapes(self) -> dict[str, tuple]:
+        return {"input": self.in_shape,
+                "output": self.out_shape}
 
     def __hash__(self):
         return id(self)
@@ -194,7 +213,7 @@ class NeuralNetwork:
                     f"source {source.name!r} belongs to a different network"
                 )
 
-        self._check_output_shapes(layer, len(sources))
+        self._check_arity(layer, len(sources))
         self._check_shapes(layer, sources)
 
         label = name or self._auto_name(layer)
@@ -208,12 +227,31 @@ class NeuralNetwork:
         object.__setattr__(self, "_output", node)
         return node
 
-    def _check_output_shapes(self, layer: Layer, given: int) -> None:
+    def _check_arity(self, layer: Layer, given: int) -> None:
         """
-        Compare the source count against the layer's forward signature, so a
-        merge given the wrong number of inputs fails here rather than as a
-        positional-argument TypeError mid-forward.
+        Reconcile the edge count with the layer's forward signature and with
+        its declaration, so a merge given the wrong number of inputs fails here
+        rather than as a positional-argument TypeError mid-forward.
+
+        Three counts have to agree for a positional shape check to mean
+        anything: how many sources were passed, how many arguments forward
+        takes, and how many input shapes the layer declares. The signature and
+        the declaration are separate claims by the layer about itself, and a
+        layer can be wrong about either.
+
+        Outputs are checked here too. A node holds one value, since forward
+        stores what the layer returned under that node, so a layer declaring
+        several outputs has no way to say which one an edge carries.
         """
+        name = layer.__class__.__name__
+        emitted = len(layer.shapes["output"])
+        if emitted != 1:
+            raise ValueError(
+                f"{name} declares {emitted} outputs. A node carries one value, "
+                "so there is no way to select which output an edge takes. "
+                "Split the layer, or declare the one shape it emits."
+            )
+
         parameters = list(inspect.signature(layer.forward).parameters.values())
         positional = [
             parameter
@@ -222,42 +260,50 @@ class NeuralNetwork:
             in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
             and parameter.name != "self"
         ]
-        if any(parameter.kind == parameter.VAR_POSITIONAL for parameter in parameters):
-            return
-
-        required = sum(
-            1 for parameter in positional if parameter.default is parameter.empty
+        variadic = any(
+            parameter.kind == parameter.VAR_POSITIONAL for parameter in parameters
         )
-        if not (required <= given <= len(positional)):
+
+        if not variadic:
+            required = sum(
+                1 for parameter in positional if parameter.default is parameter.empty
+            )
+            if not (required <= given <= len(positional)):
+                raise ValueError(
+                    f"{name}.forward takes {required} to "
+                    f"{len(positional)} inputs, got {given}"
+                )
+
+        # optional forward arguments are not edges -- training_now and
+        # forced_activation are set by the graph, not wired to a source -- so
+        # the declaration is compared against the edges, not the signature
+        declared = len(layer.shapes["input"])
+        if given > declared:
             raise ValueError(
-                f"{layer.__class__.__name__}.forward takes {required} to "
-                f"{len(positional)} inputs, got {given}"
+                f"{name} was given {given} sources but declares {declared} "
+                "input shapes, so the extra ones would go unchecked. Declare "
+                "one shape per input."
             )
 
     def _check_shapes(self, layer: Layer, sources: tuple[Node, ...]) -> None:
         """
-        Compare what each source produces against what the layer says it takes.
+        Compare what each source produces against what the layer says it takes,
+        pairing them by position.
+
+        Position matters: a merge takes its sources in a fixed order, and
+        checking every one against the first declaration would pass a graph
+        whose inputs are transposed.
+
+        The source's resolved out_shape is used, not its declared output. A
+        shape-preserving layer declares no width of its own, so reading its
+        declaration would report None and silently pass every edge below it --
+        the resolved shape is the one that carries the width down the graph.
         """
         expected = layer.shapes["input"]
 
-        if isinstance(expected, tuple):
-            if isinstance(expected[0], tuple):
-                expected = expected[0]
-            expected = expected[0]
-
         for position, source in enumerate(sources):
-            # forward may accept more inputs than the layer
-            if source.layer is None:
-                upstream = source.out_shape
-            else:
-                upstream = source.layer.shapes["output"]
-
-            if isinstance(upstream, tuple):
-                if isinstance(upstream[-1], tuple):
-                    upstream = upstream[-1]
-                upstream = upstream[-1]
-            print(upstream, expected)
-            conflict = shape_conflict(upstream, expected)
+            wanted = expected[position] if position < len(expected) else ANY_SHAPE
+            conflict = shape_conflict(source.shapes["output"], wanted)
 
             if conflict:
                 raise ValueError(
@@ -303,13 +349,17 @@ class NeuralNetwork:
         )
         return self.connect(layer, *sources, name=name).name
 
-    def get_node(self, name: str) -> Node:
+    def node(self, name: str) -> Node:
         """fetch a node by label"""
         for node in self._nodes:
             if node.name == name:
                 return node
         known = [node.name for node in self._nodes]
         raise KeyError(f"no node named {name!r}. Known nodes: {known}")
+
+    def get_node(self, name: str) -> Node:
+        """as node(), under the older name"""
+        return self.node(name)
 
     # ------------- the output
     @property

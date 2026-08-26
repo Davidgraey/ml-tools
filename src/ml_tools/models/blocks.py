@@ -50,7 +50,6 @@ def irfft_adjoint(grad_time: NDArray, sequence_length: int, axis: int = 1) -> ND
     return out
 
 
-# FNet, https://arxiv.org/abs/2105.03824
 class FourierAttention(Layer):
     def __init__(self, ni: int, no: int, use_2d: bool = True):
         super().__init__()
@@ -148,42 +147,46 @@ class FourierAttention(Layer):
 class SpectreAttention(Layer):
     """
     SPECTRE mixing layer, https://arxiv.org/abs/2502.18394
-
-    Deviations from the paper, both deliberate:
-      - single head. The paper is per-head with heads concatenated.
-      - no positional phase. The paper only defines the phase rotation
-        exp(j 2 pi k t / n) for its decode path, where t is the absolute
-        decode step. It specifies nothing for the parallel training path,
-        so nothing is applied here.
-
-    Normalisation follows the paper: the forward rfft is unnormalised and the
-    1/n sits on the inverse only, which is numpy's default convention.
     """
 
     def __init__(self,
                  sequence_length: int,
                  hidden_dim: int,
+                 num_heads: int = 1,
                  band_radius: int = 0):
         """
         Parameters
         ----------
         sequence_length : tokens per sample, the axis the FFT runs over
         hidden_dim : channel width of the input
+        num_heads : gates learned in parallel, each over its own slice of the
+            channel axis. 1 recovers the single-head layer exactly.
         band_radius : radius r of the optional Toeplitz band update on the
-            gate. 0 disables it. r > 0 adds 2r+1 complex taps.
+            gate. 0 disables it. r > 0 adds 2r+1 complex taps per head.
         """
         super().__init__()
+        assert num_heads >= 1, f"num_heads must be at least 1, got {num_heads}"
+        assert hidden_dim % num_heads == 0, (
+            f"num_heads {num_heads} must divide hidden_dim {hidden_dim}. Heads "
+            "partition the channel axis, so a remainder would leave channels "
+            "ungated."
+        )
+
         self.sequence_length = sequence_length
         self.hidden_dim = hidden_dim
-        # the gate holds one entry per frequency of a fixed length transform,
-        # so the sequence axis is pinned here rather than left free
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        # the gate holds one entry per head per frequency of a fixed length
+        # transform, so the sequence axis is pinned here rather than left free
         self.declare_shapes(
             inputs=((sequence_length, hidden_dim),),
             outputs=((sequence_length, hidden_dim),),
         )
 
         self.num_frequencies = sequence_length // 2 + 1
-        self.activation_bias = np.zeros(self.num_frequencies, dtype=GLOBAL_DTYPE) - 0.1
+        self.activation_bias = np.zeros(
+            (num_heads, self.num_frequencies), dtype=GLOBAL_DTYPE
+        ) - 0.1
 
         self.fc_query = FullyConnectedLayer(ni=hidden_dim, no=hidden_dim, activation_type="linear")
         self.fc_values = FullyConnectedLayer(ni=hidden_dim, no=hidden_dim, activation_type="linear")
@@ -192,7 +195,11 @@ class SpectreAttention(Layer):
         self.norm_query = NormalizeLayer(ni=hidden_dim, shift_scale=False)
 
         self.fc_1 = FullyConnectedLayer(ni=hidden_dim, no=hidden_dim, activation_type="relu")
-        self.fc_2 = FullyConnectedLayer(ni=hidden_dim, no=2 * self.num_frequencies, activation_type="linear")
+        self.fc_2 = FullyConnectedLayer(
+            ni=hidden_dim,
+            no=2 * num_heads * self.num_frequencies,
+            activation_type="linear",
+        )
 
         assert band_radius >= 0, (
             f"band_radius must be zero or positive, got {band_radius}. A "
@@ -202,7 +209,10 @@ class SpectreAttention(Layer):
         self.band_radius = band_radius
         self.band_offsets = tuple(range(-band_radius, band_radius + 1))
         if band_radius:
-            self.band_taps = np.zeros(len(self.band_offsets), dtype=np.complex128)
+            # depth-wise, so the taps are per head and never mix across heads
+            self.band_taps = np.zeros(
+                (num_heads, len(self.band_offsets)), dtype=np.complex128
+            )
 
         self.activation: Callable = mod_relu
         self.activation_derivative: Callable = mod_relu_derivative
@@ -219,14 +229,35 @@ class SpectreAttention(Layer):
             out[...] = array
         return out
 
+    def _split_heads(self, spectrum: NDArray) -> NDArray:
+        """(batch, frequency, hidden) -> (batch, frequency, head, head_dim)"""
+        return spectrum.reshape(
+            *spectrum.shape[:2], self.num_heads, self.head_dim
+        )
+
+    def _merge_heads(self, spectrum: NDArray) -> NDArray:
+        """(batch, frequency, head, head_dim) -> (batch, frequency, hidden)"""
+        return spectrum.reshape(*spectrum.shape[:2], self.hidden_dim)
+
+    @staticmethod
+    def _align_gate(gate: NDArray) -> NDArray:
+        """
+        (batch, head, frequency) -> (batch, frequency, head, 1)
+
+        The gate is built with frequency last, because the band convolution and
+        the modReLU bias both run along that axis, but the values carry
+        frequency second. This is the transpose between the two.
+        """
+        return np.transpose(gate, (0, 2, 1))[..., None]
+
     def _band_update(self, gate: NDArray) -> NDArray:
         """
         Toeplitz band update from the paper, g <- g + (t * g), where * is a
-        convolution along the frequency axis with 2r+1 complex taps.
+        convolution along the frequency axis with 2r+1 complex taps per head.
         """
         banded = np.zeros_like(gate)
-        for tap, offset in zip(self.band_taps, self.band_offsets):
-            banded += tap * self._shift(gate, offset)
+        for index, offset in enumerate(self.band_offsets):
+            banded += self.band_taps[:, index, None] * self._shift(gate, offset)
         return gate + banded
 
     def forward(self, input_data: NDArray):
@@ -257,10 +288,12 @@ class SpectreAttention(Layer):
         self.seq_mu = np.mean(query_forward, axis=1)
         descriptor = self.norm_query(self.seq_mu)
 
-        # two layer MLP to the complex gate
+        # two layer MLP to the complex gate, one gate per head
         gate_projection = self.fc_2(self.fc_1(descriptor))
         g_real, g_imag = np.split(gate_projection, 2, axis=-1)
-        self.gate_raw = g_real + 1j * g_imag
+        self.gate_raw = (g_real + 1j * g_imag).reshape(
+            -1, self.num_heads, self.num_frequencies
+        )
 
         self.gate_activated = self.activation(self.gate_raw, self.activation_bias)
 
@@ -269,31 +302,45 @@ class SpectreAttention(Layer):
         else:
             self.gate = self.gate_activated
 
-        # diagonal spectral gating, one scalar per frequency across all channels
-        values_gated = self.value_transform * self.gate[..., None]
+        # diagonal gating, one scalar per frequency across each head's channels
+        values_gated = self._split_heads(self.value_transform) * self._align_gate(
+            self.gate
+        )
 
-        self.output = np.fft.irfft(values_gated, n=self.sequence_length, axis=1)
+        self.output = np.fft.irfft(
+            self._merge_heads(values_gated), n=self.sequence_length, axis=1
+        )
         return self.output
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         sequence = incoming_gradient.shape[1]
 
-        dvalues_gated = irfft_adjoint(
-            incoming_gradient, self.sequence_length, axis=1
+        dvalues_gated = self._split_heads(
+            irfft_adjoint(incoming_gradient, self.sequence_length, axis=1)
         )
+        value_heads = self._split_heads(self.value_transform)
 
         # gating is elementwise complex, so each side picks up the other's conjugate
-        dV_hat = dvalues_gated * np.conj(self.gate)[..., None]
-        dgate = np.sum(dvalues_gated * np.conj(self.value_transform), axis=2)
+        dV_hat = self._merge_heads(
+            dvalues_gated * np.conj(self._align_gate(self.gate))
+        )
+        # the gate is shared across a head's channels, so its gradient sums over them
+        dgate = np.transpose(
+            np.sum(dvalues_gated * np.conj(value_heads), axis=-1), (0, 2, 1)
+        )
 
         if self.band_radius:
-            self.gradient_band = np.array([
-                np.sum(dgate * np.conj(self._shift(self.gate_activated, offset)))
+            self.gradient_band = np.stack([
+                np.sum(
+                    dgate * np.conj(self._shift(self.gate_activated, offset)),
+                    axis=(0, 2),
+                )
                 for offset in self.band_offsets
-            ])
+            ], axis=-1)
             dgate_activated = dgate + sum(
-                np.conj(tap) * self._shift(dgate, -offset)
-                for tap, offset in zip(self.band_taps, self.band_offsets)
+                np.conj(self.band_taps[:, index, None])
+                * self._shift(dgate, -offset)
+                for index, offset in enumerate(self.band_offsets)
             )
         else:
             dgate_activated = dgate
@@ -302,8 +349,10 @@ class SpectreAttention(Layer):
             self.gate_raw, self.activation_bias, dgate_activated
         )
 
+        batch = dgate_raw.shape[0]
         dgate_projection = np.concatenate(
-            [dgate_raw.real, dgate_raw.imag], axis=-1
+            [dgate_raw.real.reshape(batch, -1), dgate_raw.imag.reshape(batch, -1)],
+            axis=-1,
         )
 
         dhidden = self.fc_2.backward(dgate_projection)
@@ -387,7 +436,7 @@ class SpectreAttention(Layer):
         band = f", band radius {self.band_radius}" if self.band_radius else ""
         return (
             f"SPECTRE mixer, sequence {self.sequence_length}, "
-            f"hidden {self.hidden_dim}{band}"
+            f"hidden {self.hidden_dim}, {self.num_heads} heads{band}"
         )
 
     def __repr__(self):
