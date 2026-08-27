@@ -1,6 +1,7 @@
 from numpy.typing import NDArray
 import numpy as np
 from typing import Callable
+from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON
 from ml_tools.models.activations import mod_relu, mod_relu_derivative
 from ml_tools.models.layers.layers import (
     GLOBAL_DTYPE,
@@ -9,8 +10,6 @@ from ml_tools.models.layers.layers import (
     FourierLayer,
     NormalizeLayer,
 )
-
-EPSILON = 1e-15
 
 
 # -------------    adjoints of the real FFT pair    ----------------
@@ -176,12 +175,11 @@ class SpectreAttention(Layer):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        # the gate holds one entry per head per frequency of a fixed length
-        # transform, so the sequence axis is pinned here rather than left free
-        self.declare_shapes(
-            inputs=((sequence_length, hidden_dim),),
-            outputs=((sequence_length, hidden_dim),),
-        )
+        # declared on the channel axis only, matching every other layer, so the
+        # graph's right-aligned edge check reads it. The sequence length is
+        # still fixed -- the gate has one entry per frequency of a fixed length
+        # transform -- but that is enforced in forward, where the data arrives.
+        self.declare_shapes(inputs=((hidden_dim,),), outputs=((hidden_dim,),))
 
         self.num_frequencies = sequence_length // 2 + 1
         self.activation_bias = np.zeros(
@@ -216,6 +214,10 @@ class SpectreAttention(Layer):
 
         self.activation: Callable = mod_relu
         self.activation_derivative: Callable = mod_relu_derivative
+
+        # seeded here so a gradient read before the first backward finds zeros
+        # rather than raising AttributeError
+        self.zero_gradients()
 
     @staticmethod
     def _shift(array: NDArray, offset: int) -> NDArray:
@@ -369,6 +371,18 @@ class SpectreAttention(Layer):
 
         return dinput_from_q + dinput_from_v
 
+    def get_weights(self) -> tuple:
+        weights = [
+            self.activation_bias,
+            self.fc_query.get_weights(),
+            self.fc_values.get_weights(),
+            self.fc_1.get_weights(),
+            self.fc_2.get_weights(),
+        ]
+        if self.band_radius:
+            weights.append(self.band_taps)
+        return tuple(weights)
+
     def get_gradients(self) -> dict[str, NDArray | dict]:
         gradients = {
             "gradient_bias": self.gradient_bias,
@@ -442,6 +456,314 @@ class SpectreAttention(Layer):
     def __repr__(self):
         return self.__str__()
 
+
+class CausalSpectreAttention(SpectreAttention):
+    """
+    causal SPECTRE with the Prefix-FFT cache, https://arxiv.org/abs/2502.18394
+
+    Forward is the parallel teacher-forced path, and is exact rather than an
+    approximation of the incremental one -- position t is reconstructed from
+    the prefix ending at t, which is the diagonal of the inverse transform.
+    Unlike the encoder it accepts any length up to the transform length, since
+    a shorter prefix is just the zero padded one. prefill and decode_step run
+    the same arithmetic a token at a time for generation.
+    """
+
+    def __init__(self,
+                 sequence_length: int,
+                 hidden_dim: int,
+                 num_heads: int = 1,
+                 band_radius: int = 0):
+        super().__init__(sequence_length, hidden_dim, num_heads, band_radius)
+
+        positions = np.arange(sequence_length)[:, None]
+        frequencies = np.arange(self.num_frequencies)[None, :]
+        self.twiddle = np.exp(
+            -2j * np.pi * frequencies * positions / sequence_length
+        )
+
+        # irfft folds the conjugate pairs back in
+        hermitian = np.full(self.num_frequencies, 2.0)
+        hermitian[0] = 1.0
+        if sequence_length % 2 == 0:  # evens == 1
+            hermitian[-1] = 1.0
+        self.hermitian = hermitian
+        self.inverse_basis = hermitian * np.conj(self.twiddle) / sequence_length
+
+        self.prefix_spectrum = None
+        self.prefix_counts = None
+        self.reset_cache()
+
+    # -------------    the gate, shared by both paths    ---------------
+    def _spectral_gate(self, descriptor: NDArray) -> NDArray:
+        """
+        descriptor (..., hidden)
+        gate (..., head, frequency)
+        """
+        leading = descriptor.shape[:-1]
+        projection = self.fc_2(self.fc_1(descriptor))
+        real_part, imaginary_part = np.split(projection, 2, axis=-1)
+
+        self.gate_raw = (real_part + 1j * imaginary_part).reshape(
+            -1, self.num_heads, self.num_frequencies
+        )
+        self.gate_activated = self.activation(self.gate_raw, self.activation_bias)
+        self.gate = (
+            self._band_update(self.gate_activated)
+            if self.band_radius
+            else self.gate_activated
+        )
+        return self.gate.reshape(*leading, self.num_heads, self.num_frequencies)
+
+    def _spectral_gate_backward(self, dgate: NDArray) -> NDArray:
+        """
+        d_gate (..., head, frequency)
+        d_descriptor (..., hidden)
+        """
+        leading = dgate.shape[:-2]
+        dgate = dgate.reshape(-1, self.num_heads, self.num_frequencies)
+
+        if self.band_radius:
+            self.gradient_band = np.stack([
+                np.sum(
+                    dgate * np.conj(self._shift(self.gate_activated, offset)),
+                    axis=(0, 2),
+                )
+                for offset in self.band_offsets
+            ], axis=-1)
+            dgate = dgate + sum(
+                np.conj(self.band_taps[:, index, None])
+                * self._shift(dgate, -offset)
+                for index, offset in enumerate(self.band_offsets)
+            )
+
+        self.gradient_bias, dgate_raw = self.activation_derivative(
+            self.gate_raw, self.activation_bias, dgate
+        )
+
+        rows = dgate_raw.shape[0]
+        width = self.num_heads * self.num_frequencies
+        dprojection = np.concatenate(
+            [dgate_raw.real.reshape(rows, width),
+             dgate_raw.imag.reshape(rows, width)],
+            axis=-1,
+        ).reshape(*leading, 2 * width)
+
+        return self.fc_1.backward(self.fc_2.backward(dprojection))
+
+    # -------------    prefix axis helpers    -------------------------
+    def _split_prefix(self, spectrum: NDArray) -> NDArray:
+        """
+        (batch, position, frequency, hidden)
+        returns
+        (..., head, head_dim)
+        """
+        return spectrum.reshape(
+            *spectrum.shape[:3], self.num_heads, self.head_dim
+        )
+
+    def _merge_prefix(self, spectrum: NDArray) -> NDArray:
+        """
+        (batch, position, frequency, head, head_dim)
+        returns
+        (..., hidden)
+        """
+        return spectrum.reshape(*spectrum.shape[:3], self.hidden_dim)
+
+    @staticmethod
+    def _align_prefix_gate(gate: NDArray) -> NDArray:
+        """
+        (batch, position, head, frequency)
+        Returns
+        (batch, position, frequency, head, 1)
+        """
+        return np.transpose(gate, (0, 1, 3, 2))[..., None]
+
+    # -------------    the parallel path
+    def _run_prefix(self, input_data: NDArray) -> tuple:
+        """
+        Every position's causal output with the running state the
+        cache needs
+        forward and prefill differ only in what they retain/pass along
+        """
+        length = input_data.shape[1]
+        query_forward = self.fc_query(input_data)
+        value_forward = self.fc_values(input_data)
+
+        spectrum = np.cumsum(
+            value_forward[:, :, None, :] * self.twiddle[:length][None, :, :, None],
+            axis=1,
+        )
+        counts = np.arange(1, length + 1, dtype=np.float64)
+        query_cumulative = np.cumsum(query_forward, axis=1)
+
+        gate = self._spectral_gate(
+            self.norm_query(query_cumulative / counts[None, :, None])
+        )
+        gated = self._merge_prefix(
+            self._split_prefix(spectrum) * self._align_prefix_gate(gate)
+        )
+
+        # only the diagonal is wanted: position t rebuilt from the prefix that
+        # ends at t (causal contract)
+        outputs = np.real(
+            np.sum(gated * self.inverse_basis[:length][None, :, :, None], axis=2)
+        )
+        return outputs, spectrum, query_cumulative, counts
+
+    def forward(self, input_data: NDArray) -> NDArray:
+        """
+        (batch, sequence, hidden)
+        teacher forced
+        """
+        assert input_data.ndim == 3, (
+            f"expected (batch, sequence, hidden), got shape {input_data.shape}"
+        )
+        assert 0 < input_data.shape[1] <= self.sequence_length, (
+            f"built for sequence_length {self.sequence_length}, got "
+            f"{input_data.shape[1]}. A shorter prefix is fine, since it is the "
+            "zero padded one, but the transform length is the ceiling."
+        )
+        assert input_data.shape[-1] == self.hidden_dim, (
+            f"built for hidden_dim {self.hidden_dim}, got {input_data.shape[-1]}"
+        )
+
+        self.input = input_data
+        (
+            self.output,
+            self.prefix_spectrum,
+            _,
+            self.prefix_counts,
+        ) = self._run_prefix(input_data)
+        return self.output
+
+    def backward(self, incoming_gradient: NDArray) -> NDArray:
+        assert self.prefix_spectrum is not None, (
+            "backward needs the state forward cached, and decode_step has "
+            "since overwritten it. decode_step shares the sub-layers and the "
+            "gate with the parallel path and carries no gradient of its own, "
+            "so it is inference only. Re-run forward before backward."
+        )
+        length = incoming_gradient.shape[1]
+
+        # adjoint of reading the diagonal of the inverse transform
+        dgated = self._split_prefix(
+            incoming_gradient[:, :, None, :]
+            * np.conj(self.inverse_basis[:length])[None, :, :, None]
+        )
+        gate = self.gate.reshape(
+            -1, length, self.num_heads, self.num_frequencies
+        )
+        spectrum_heads = self._split_prefix(self.prefix_spectrum)
+
+        dspectrum = self._merge_prefix(
+            dgated * np.conj(self._align_prefix_gate(gate))
+        )
+        dgate = np.transpose(
+            np.sum(dgated * np.conj(spectrum_heads), axis=-1), (0, 1, 3, 2)
+        )
+
+        dprefix_mean = self.norm_query.backward(self._spectral_gate_backward(dgate))
+
+        # a prefix sum run backwards : position m feeds every prefix from m on,
+        # so its gradient collects everything at or after it.
+        dquery = np.cumsum(
+            (dprefix_mean / self.prefix_counts[None, :, None])[:, ::-1], axis=1
+        )[:, ::-1]
+        dtwiddled = np.cumsum(dspectrum[:, ::-1], axis=1)[:, ::-1]
+        dvalues = np.real(
+            np.sum(
+                dtwiddled * np.conj(self.twiddle[:length])[None, :, :, None],
+                axis=2,
+            )
+        )
+
+        return self.fc_query.backward(dquery) + self.fc_values.backward(dvalues)
+
+    # -------------    the Prefix-FFT cache    ------------------------
+    def reset_cache(self) -> None:
+        """drop the cache, so the next decode starts a fresh sequence"""
+        self.cache_spectrum = None
+        self.cache_query_sum = None
+        self.cache_position = 0
+
+    def prefill(self, input_data: NDArray) -> NDArray:
+        outputs, spectrum, query_cumulative, _ = self._run_prefix(input_data)
+
+        self.cache_spectrum = spectrum[:, -1].copy()
+        self.cache_query_sum = query_cumulative[:, -1].copy()
+        self.cache_position = input_data.shape[1]
+        return outputs
+
+    def decode_step(self, token: NDArray) -> NDArray:
+        """
+        (batch, hidden), or (batch, 1, hidden), the newest / next position only
+
+        Returns that position's output at (batch, hidden)
+
+        inference only: this reuses the sub-layers' forward caches, so it
+        overwrites whatever the last training forward left there.
+        """
+        if token.ndim == 3:
+            assert token.shape[1] == 1, (
+                f"decode_step takes one position, got {token.shape[1]}. Use "
+                "prefill for a context."
+            )
+            token = token[:, 0]
+        assert token.shape[-1] == self.hidden_dim, (
+            f"built for hidden_dim {self.hidden_dim}, got {token.shape[-1]}"
+        )
+
+        position = self.cache_position
+        assert position < self.sequence_length, (
+            f"the cache is full at {self.sequence_length} positions. The gate "
+            "is tied to a fixed transform length, so generation cannot run "
+            "past it."
+        )
+
+        if self.cache_spectrum is None:
+            self.cache_spectrum = np.zeros(
+                (token.shape[0], self.num_frequencies, self.hidden_dim),
+                dtype=np.complex128,
+            )
+            self.cache_query_sum = np.zeros(
+                (token.shape[0], self.hidden_dim), dtype=np.float64
+            )
+
+        # the sub-layers and the gate are shared with the parallel path, so
+        # stepping here retires whatever the last forward left for backward
+        self.prefix_spectrum = None
+
+        self.cache_query_sum = self.cache_query_sum + self.fc_query(token)
+        self.cache_spectrum = self.cache_spectrum + (
+            self.fc_values(token)[:, None, :]
+            * self.twiddle[position][None, :, None]
+        )
+        self.cache_position = position + 1
+
+        gate = self._spectral_gate(
+            self.norm_query(self.cache_query_sum / self.cache_position)
+        )
+        gated = self._merge_heads(
+            self._split_heads(self.cache_spectrum) * self._align_gate(gate)
+        )
+        return np.real(
+            np.sum(gated * self.inverse_basis[position][None, :, None], axis=1)
+        )
+
+    def purge(self) -> None:
+        super().purge()
+        self.prefix_spectrum = None
+        self.prefix_counts = None
+        self.reset_cache()
+
+    def __str__(self):
+        band = f", band radius {self.band_radius}" if self.band_radius else ""
+        return (
+            f"causal SPECTRE mixer with prefix-FFT cache, sequence "
+            f"{self.sequence_length}, hidden {self.hidden_dim}, "
+            f"{self.num_heads} heads{band}"
+        )
 
 
 if __name__ == "__main__":

@@ -233,6 +233,59 @@ class VotingGate(VotingBase):
         )
 
 
+class PoolingLayer(Layer):
+    """
+    Mean pooling layer to compute the average across the sequence dimension.
+
+    Input shape: (batch, sequence, hidden)
+    Output shape: (batch, 1, hidden)
+    """
+    preserves_shape = False
+
+    def __init__(self):
+        super().__init__()
+        # Declare expected input/output shapes for the framework's pipeline
+        self.declare_shapes(
+            inputs=((None, None, None),),
+            outputs=((None, 1, None),)
+        )
+
+    def forward(self, incoming_x: NDArray) -> NDArray:
+        self.input = incoming_x  # Store for backward pass (matches framework pattern)
+        # Average across axis 1 (sequence dimension), keepdims to preserve structure
+        return incoming_x.mean(axis=1, keepdims=True)
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        if self.input is None:
+            return incoming_grad
+
+        seq_len = self.input.shape[1]
+        # Gradient of a mean operation is the incoming gradient divided by sequence length.
+        return incoming_grad / seq_len
+
+    def update_weights(self) -> None:
+        pass
+
+    def zero_gradients(self) -> None:
+        pass
+
+    def get_weights(self):
+        return None
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        return {}
+
+    @property
+    def num_parameters(self) -> int:
+        return 0
+
+    def __str__(self):
+        return "Layer of Sequence Mean Pooling (avg over sequence)"
+
+    def __repr__(self):
+        return self.__str__()
+
+
 if __name__ == "__main__":
     rng = np.random.default_rng(42)
     x = rng.normal(size=(5, 2, 6))

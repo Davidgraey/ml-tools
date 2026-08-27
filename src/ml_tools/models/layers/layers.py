@@ -1,13 +1,9 @@
 import numpy as np
 import ml_tools.models.activations as activations
+from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON
 from numpy.typing import NDArray
 from abc import ABC, abstractmethod
 from typing import Optional, Callable
-
-
-EPSILON = 1e-14
-# TODO: set the global float depth --
-GLOBAL_DTYPE = np.float32
 
 
 # -------------    weight initilization functions    ---------------
@@ -143,17 +139,29 @@ def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
     Compare two declared shapes, right-aligned, and describe the first axis
     where they disagree.
 
+    Shapes are in trailing-axis form, so they are matched from the last axis
+    backwards and only the overlap is checked. The extra leading axes of the
+    longer shape are the ones the shorter one leaves unspoken, so they are
+    unconstrained rather than wrong. None on either side is a wildcard.
+
     Returns
     -------
     a description of the offending axis, or None when the two are compatible
     """
-
-    if (produced is None) or (expected is None) or (produced[-1] is None) or (expected[0] is None):
+    if (produced is None) or (expected is None):
         return None
 
-    if (produced[-1] == expected[0]) or (produced[0] == expected[-1]):
-        return None
-    return f"{produced} cannot feed {expected}"
+    for offset, (made, wanted) in enumerate(
+        zip(reversed(produced), reversed(expected)), start=1
+    ):
+        if (made is None) or (wanted is None):
+            continue
+        if made != wanted:
+            return (
+                f"{produced} cannot feed {expected}, axis -{offset} "
+                f"is {made} against {wanted}"
+            )
+    return None
 
 
 # TODO: build ENUMS for activations
@@ -387,14 +395,12 @@ class DropoutLayer(Layer):
         return self.__str__()
 
 
-# numpy-ml ref:
-# https://github.com/ddbourgin/numpy-ml/blob/master/numpy_ml/neural_nets/layers/layers.py#L1634-L1803
 class NormalizeLayer(Layer):
-    def __init__(self, ni: int, shift_scale: bool = True, eps: float = 1e-5):
+    def __init__(self, ni: int, shift_scale: bool = True, eps: float = 1e-6):
         super().__init__()
         self.ni = ni
-        self.shift_scale = shift_scale
         self.eps = eps
+        self.shift_scale = shift_scale
         self.declare_shapes(inputs=((ni,),), outputs=((ni,),))
 
         if shift_scale:
@@ -490,14 +496,13 @@ class NormalizeLayer(Layer):
         return self.__str__()
 
 
-# https://arxiv.org/abs/1910.07467
 class RMSNormLayer(Layer):
     """
     Root-mean-square norm over the last axis. No mean subtraction and no
     shift, so the only parameter is a learnable per-feature scale.
     """
 
-    def __init__(self, ni: int, eps: float = 1e-8):
+    def __init__(self, ni: int, eps: float = 1e-6):
         super().__init__()
         self.ni = ni
         self.eps = eps
