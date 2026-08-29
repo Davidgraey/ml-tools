@@ -1,7 +1,7 @@
 """
-Trainable hierarchical wavelet feature encoding for one dimensional signals.
+trainable hierarchical wavelet feature encoding for one dimensional signals.
 
-A wavelet packet decomposition, with the filter taps learned rather than fixed.
+wavelet packet decomposition, with the filter taps learned rather than fixed.
 The cascade in wavelet_layers.py splits only the approximation, so its bands
 come out logarithmically spaced -- fine detail at the top, everything coarse
 crammed into one band at the bottom. This splits both halves at every level, so

@@ -315,9 +315,7 @@ class SpectreAttention(Layer):
             self.gate
         )
 
-        # residual around the mixing. The gate is multiplicative in the
-        # frequency domain, so without it a head that closes drops its channels
-        # entirely rather than passing them through
+        # residual AROUND the mixing --
         self.output = input_data + np.fft.irfft(
             self._merge_heads(values_gated), n=self.sequence_length, axis=1
         )

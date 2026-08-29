@@ -14,15 +14,6 @@ things follow from that:
     exist, so there is no forward reference to close a loop with
   * insertion order is therefore already a topological order, and the forward
     pass is a walk down the list
-
-Names still exist, but only as labels for reading a summary or fetching a node
-after the fact. Nothing about the graph's structure depends on them.
-
-Shapes are checked as the graph is built. Every layer declares the trailing
-axes it accepts and emits (`layer.shapes`), so `connect` can compare what a
-source produces against what its consumer wants and refuse the edge on the spot
--- a width mismatch is a ValueError at the wiring line, not a dot-product error
-several layers into the first forward pass.
 """
 
 # train() and eval() annotate their return as NeuralNetwork from inside the
@@ -38,23 +29,24 @@ from numpy.typing import NDArray
 
 from ml_tools.models.layers.layers import ANY_SHAPE, Layer, shape_conflict
 
-
-# the label carried by the graph's source node. Structure does not depend on it
-# -- it exists so summaries and add() have something to say.
 INPUT_NAME = "input"
-
 
 class Node:
     """
-    One step in the graph: a layer, and references to the nodes feeding it.
+    one vertex in the graph: a layer, and references (edges) to the nodes feeding it.
 
-    A node with no layer is a source -- the graph input. Nodes are compared and
-    hashed by identity, so the same node passed to two consumers is one shared
-    producer, which is what makes a fan-out visible in the code that builds it.
+    nodes are compared and hashed by identity, so the same node passed to two consumers is
+    one shared producer, which is what makes a fan-out visible in the code that builds it.
 
-    Each node also carries the trailing shape it produces, resolved from its
-    sources at construction. That is what the next node's check is made
-    against, so a width flows down the graph as it is wired.
+    Shapes, logic, and processes are held in the Layer objects that the Node wraps.
+
+    Network
+        Node(Layer) -- Node(Layer) --> Node(Layer)
+
+
+    Each node also carries the shape it produces for downstream / outbound edges
+    comes from the sources at construction
+    That is what the next node's check is made against, so an array width flows down the graph as it is wired and checked on connect
     """
 
     def __init__(
@@ -79,7 +71,7 @@ class Node:
                 raise ValueError(
                     f"{layer.__class__.__name__}.infer_output_shapes returned "
                     f"{len(resolved)} shapes for one node. A node holds one "
-                    "value, so it must resolve to exactly one shape."
+                    "value, so it must yield one shape"
                 )
             self.in_shape = shape[0]
             self.out_shape = resolved[0]
@@ -119,7 +111,7 @@ class Node:
 
 class NeuralNetwork:
     """
-    A directed acyclic graph of layers.
+    A directed acyclic graph of layer connections D(AG)
 
     connect the DAG by passing nodes:
 
@@ -213,7 +205,7 @@ class NeuralNetwork:
                     f"source {source.name!r} belongs to a different network"
                 )
 
-        self._check_arity(layer, len(sources))
+        self._check_graph(layer, len(sources))
         self._check_shapes(layer, sources)
 
         label = name or self._auto_name(layer)
@@ -227,29 +219,22 @@ class NeuralNetwork:
         object.__setattr__(self, "_output", node)
         return node
 
-    def _check_arity(self, layer: Layer, given: int) -> None:
+    def _check_graph(self, layer: Layer, given: int) -> None:
         """
-        Reconcile the edge count with the layer's forward signature and with
-        its declaration, so a merge given the wrong number of inputs fails here
-        rather than as a positional-argument TypeError mid-forward.
+        comapre the edge count against its the layer's forward signature and declared shapes
 
-        Three counts have to agree for a positional shape check to mean
-        anything: how many sources were passed, how many arguments forward
-        takes, and how many input shapes the layer declares. The signature and
-        the declaration are separate claims by the layer about itself, and a
-        layer can be wrong about either.
+        Three counts have to agree
+        - how many sources were passed
+        - how many args forward takes
+        - how many input shapes the layer declares
 
-        Outputs are checked here too. A node holds one value, since forward
-        stores what the layer returned under that node, so a layer declaring
-        several outputs has no way to say which one an edge carries.
+        no returns, just erroring -- designed to fail when constructing, not passing data.
         """
         name = layer.__class__.__name__
         emitted = len(layer.shapes["output"])
         if emitted != 1:
             raise ValueError(
-                f"{name} declares {emitted} outputs. A node carries one value, "
-                "so there is no way to select which output an edge takes. "
-                "Split the layer, or declare the one shape it emits."
+                f"{name} declares {emitted} outputs. A node carries one value"
             )
 
         parameters = list(inspect.signature(layer.forward).parameters.values())
@@ -274,15 +259,14 @@ class NeuralNetwork:
                     f"{len(positional)} inputs, got {given}"
                 )
 
-        # optional forward arguments are not edges -- training_now and
-        # forced_activation are set by the graph, not wired to a source -- so
-        # the declaration is compared against the edges, not the signature
+        # ***optional forward arguments are not edges***
+        # the declaration is compared against the edges
         declared = len(layer.shapes["input"])
         if given > declared:
             raise ValueError(
                 f"{name} was given {given} sources but declares {declared} "
                 "input shapes, so the extra ones would go unchecked. Declare "
-                "one shape per input."
+                "one shape per input!"
             )
 
     def _check_shapes(self, layer: Layer, sources: tuple[Node, ...]) -> None:
@@ -579,63 +563,3 @@ class NeuralNetwork:
             f"{self.__class__.__name__}({len(self)} nodes, "
             f"{self.num_parameters} parameters)"
         )
-
-
-if __name__ == "__main__":
-    from ml_tools.models.layers.layers import (
-        DropoutLayer,
-        FullyConnectedLayer,
-        NormalizeLayer,
-    )
-    from ml_tools.models.layers.operators import LatentStack
-    from ml_tools.models.model_loss import MSELoss
-    from ml_tools.models.optimizers import SGD
-    from ml_tools.generators import RandomDatasetGenerator
-
-    generator = RandomDatasetGenerator(random_seed=42)
-    x_data, y_data, _ = generator.generate(
-        "regression", num_samples=600, num_features=6, noise_scale=0.5
-    )
-    y_data = y_data.reshape(-1, 1)
-
-    # the input shape is declared, so the first edge is checked like the rest
-    net = NeuralNetwork(name="two_branch", input_shape=(6,))
-
-    features = net.input
-    wide = net.connect(FullyConnectedLayer(6, 12, "relu"), features, name="wide")
-    wide = net.connect(NormalizeLayer(12, shift_scale=True), wide, name="wide_norm")
-    # `features` used a second time, so the fan-out is visible right here
-    narrow = net.connect(FullyConnectedLayer(6, 4, "tanh"), features, name="narrow")
-
-    merged = net.connect(LatentStack(), wide, narrow, name="merge")
-    merged = net.connect(DropoutLayer(dropout_prob=0.1), merged, name="drop")
-    merged = net.connect(FullyConnectedLayer(16, 8, "swish"), merged, name="head")
-    net.output = net.connect(
-        FullyConnectedLayer(8, 1, "linear", is_output=True), merged, name="out"
-    )
-
-    print(net.summary(x_data))
-    print(f"\nedges: {net.edges()}")
-    print(f"merge shapes: {net.shapes()['merge']}")
-
-    try:
-        net.connect(FullyConnectedLayer(9, 3, "relu"), net.node("merge"))
-    except ValueError as refused:
-        print(f"refused: {refused}")
-
-    loss = MSELoss()
-    optimizer = SGD(0.01)
-
-    net.train()
-    first = None
-    for _ in range(300):
-        prediction = net.forward(x_data)
-        value = loss(prediction, y_data)
-        if first is None:
-            first = value
-        net.backward(loss.backward())
-        optimizer.step(net.layers)
-
-    print(f"\ntraining loss {first:.4f} -> {value:.4f}")
-    net.eval()
-    print(f"eval loss (dropout off) {loss(net.forward(x_data), y_data):.4f}")

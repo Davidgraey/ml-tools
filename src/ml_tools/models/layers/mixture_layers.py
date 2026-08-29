@@ -253,15 +253,15 @@ class PoolingLayer(Layer):
     def forward(self, incoming_x: NDArray) -> NDArray:
         self.input = incoming_x  # Store for backward pass (matches framework pattern)
         # Average across axis 1 (sequence dimension), keepdims to preserve structure
-        return incoming_x.mean(axis=1)
+        return incoming_x.mean(axis=1, keepdims=True)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         if self.input is None:
             return incoming_grad
 
         seq_len = self.input.shape[1]
-        # Gradient of a mean operation is the incoming gradient divided by sequence length.
-        return incoming_grad / seq_len
+        #  grad mean is incoming_grad/seq_len, broadcast back to every position that was averaged over
+        return np.broadcast_to(incoming_grad / seq_len, self.input.shape).copy()
 
     def update_weights(self) -> None:
         pass
@@ -287,38 +287,3 @@ class PoolingLayer(Layer):
 
     def __repr__(self):
         return self.__str__()
-
-
-if __name__ == "__main__":
-    rng = np.random.default_rng(42)
-    x = rng.normal(size=(5, 2, 6))
-    upstream = rng.normal(size=(5, 4))
-
-    for gate in (
-        VotingWeight(input_shape=6, num_experts=4),
-        VotingWeight(input_shape=6, num_experts=4, top_k=2),
-        VotingGate(input_shape=6, hidden_size=8, num_experts=4),
-        VotingGate(input_shape=6, hidden_size=8, num_experts=4, top_k=2),
-    ):
-        for layer in gate.stack:
-            layer.weights = layer.weights.astype(np.float64)
-            layer.bias = layer.bias.astype(np.float64)
-
-        votes = gate.forward(x)
-        analytic = gate.backward(upstream.copy())
-
-        numeric = np.zeros_like(x)
-        for index in np.ndindex(x.shape):
-            original = x[index]
-            x[index] = original + 1e-6
-            plus = (gate.forward(x) * upstream).sum()
-            x[index] = original - 1e-6
-            minus = (gate.forward(x) * upstream).sum()
-            x[index] = original
-            numeric[index] = (plus - minus) / 2e-6
-
-        print(
-            f"{gate} | {gate.num_parameters} params | vote sums "
-            f"{np.round(votes.sum(axis=-1), 3)} | input grad error "
-            f"{np.abs(analytic - numeric).max():.2e}"
-        )

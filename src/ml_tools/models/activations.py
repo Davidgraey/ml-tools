@@ -29,26 +29,6 @@ def sigmoid(x_array: NDArray) -> NDArray:
     return result
 
 
-# def _sig_pos(x):
-#     return 1 / (1 + np.exp(-x))
-#
-#
-# def _sig_neg(x):
-#     return np.exp(x) / (1 + np.exp(x))
-#
-# @activation
-# def sigmoid(x):
-#     '''
-#     Returns results of Sigmoid activation function
-#     **********ARGUMENTS**********
-#     :param x: incoming values in numpy array
-#     **********RETURNS**********
-#     :return: evaluation (single val for input_sample (row) of x)
-#     '''
-#
-#     return np.piecewise(x, [x > 0], [_sig_pos, _sig_neg])
-
-
 @activation
 def swish(x: NDArray):
     """

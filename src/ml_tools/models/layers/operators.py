@@ -73,11 +73,15 @@ class LatentSum(Layer):
     sum two arrays together, element-wise
 
     """
-    def __init__(self):
+    def __init__(self, broadcast_axis: Optional[int] = None):
         super().__init__()
         self.input_1: Optional[NDArray] = None
         self.input_2: Optional[NDArray] = None
         self.output: Optional[NDArray] = None
+
+        self.broadcast_axis = broadcast_axis
+        self._expanded_dim = None
+
 
         # Gradients calculated during backward pass
         self.gradient_input_1: Optional[NDArray] = None
@@ -87,6 +91,17 @@ class LatentSum(Layer):
 
         self.declare_shapes(inputs=(ANY_SHAPE, ANY_SHAPE), outputs=(ANY_SHAPE,))
 
+
+    @staticmethod
+    def _reduce_to_shape(grad: NDArray, target_shape: tuple) -> NDArray:
+        """ sum the gradients down to target_shape wherever we have to broadcas t"""
+        while grad.ndim > len(target_shape):
+            grad = grad.sum(axis=0)
+        for i, dim in enumerate(target_shape):
+            if dim == 1 and grad.shape[i] != 1:
+                grad = grad.sum(axis=i, keepdims=True)
+        return grad
+
     def forward(self,
                 input_1: NDArray,
                 input_2: NDArray) -> NDArray:
@@ -95,10 +110,19 @@ class LatentSum(Layer):
         """
         self.in_shape_1 = input_1.shape
         self.in_shape_2 = input_2.shape
+        ndim1, ndim2 = len(self.in_shape_1), len(self.in_shape_2)
+        axis = self.broadcast_axis if self.broadcast_axis is not None else 1
 
-        # Assert that input shapes are broadcastable
         try:
-            sum_array = input_1 + input_2
+            if ndim1 < ndim2:
+                sum_array = np.expand_dims(input_1, axis) + input_2
+                self._expanded_dim = (1, axis)
+            elif ndim1 > ndim2:
+                sum_array = input_1 + np.expand_dims(input_2, axis)
+                self._expanded_dim = (2, axis)
+            else:
+                sum_array = input_1 + input_2
+                self._expanded_dim = None
         except ValueError as e:
             raise RuntimeError(f"SummingLayer: Inputs not broadcastable. {e}")
 
@@ -123,10 +147,20 @@ class LatentSum(Layer):
         -------
         Tuple[NDArray, NDArray]
         """
-        # Derivative of sum function is 1 for all inputs.
-        # Therefore, gradients flow back unchanged (identity).
-        self.gradient_input_1 = incoming_grad
-        self.gradient_input_2 = incoming_grad
+        if self._expanded_dim is not None:
+            which, axis = self._expanded_dim
+            if which == 1:
+                grad_1 = incoming_grad.sum(axis=axis)
+                grad_2 = incoming_grad
+            else:
+                grad_1 = incoming_grad
+                grad_2 = incoming_grad.sum(axis=axis)
+        else:
+            grad_1 = incoming_grad
+            grad_2 = incoming_grad
+
+        self.gradient_input_1 = self._reduce_to_shape(grad_1, self.in_shape_1)
+        self.gradient_input_2 = self._reduce_to_shape(grad_2, self.in_shape_2)
 
         return self.gradient_input_1, self.gradient_input_2
 
@@ -137,15 +171,13 @@ class LatentSum(Layer):
         pass
 
     def purge(self) -> None:
-        """
-        Resets all layer state.
-        """
         self.input_1 = None
         self.input_2 = None
         self.output = None
         self.gradient_input_1 = None
         self.gradient_input_2 = None
         self.gradient = None
+        self._expanded_dim = None
 
     def get_weights(self):
         return None
@@ -179,30 +211,3 @@ class LatentSum(Layer):
 
     def __repr__(self):
         return f"{self}"
-
-
-
-
-if __name__ == "__main__":
-    a1 = np.array([1, 2, 3, 4, 5, 6])
-    b1 = np.array([6, 5, 4, 3, 2, 1])
-    a2 = np.array([[1, 2, 3], [4, 5, 6]])
-    b2 = np.array([[6, 5, 4], [3, 2, 1]])
-    a3 = np.array([[[1], [2], [3]], [[4], [5], [6]], [[7], [8], [9]]])
-    b3 = np.array([[[6], [5], [4]], [[3], [2], [1]], [[0], [-1], [-2]]])
-
-    stacker = LatentStack()
-
-    outs = stacker.forward(a1, b1)
-    [print(t.shape) for t in outs]
-    print(f"1D output: {outs.shape}")
-
-    stacker.purge()
-    outs = stacker.forward(a2, b2)
-    [print(t.shape) for t in outs]
-    print(f"2D output: {outs.shape}")
-
-    stacker.purge()
-    outs = stacker.forward(a3, b3)
-    [print(t.shape) for t in outs]
-    print(f"3D output: {outs.shape}")
