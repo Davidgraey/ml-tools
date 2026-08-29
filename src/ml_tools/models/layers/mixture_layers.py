@@ -253,7 +253,7 @@ class PoolingLayer(Layer):
     def forward(self, incoming_x: NDArray) -> NDArray:
         self.input = incoming_x  # Store for backward pass (matches framework pattern)
         # Average across axis 1 (sequence dimension), keepdims to preserve structure
-        return incoming_x.mean(axis=1, keepdims=True)
+        return incoming_x.mean(axis=1)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         if self.input is None:
@@ -274,6 +274,9 @@ class PoolingLayer(Layer):
 
     def get_gradients(self) -> dict[str, NDArray]:
         return {}
+
+    def purge(self):
+        pass
 
     @property
     def num_parameters(self) -> int:
