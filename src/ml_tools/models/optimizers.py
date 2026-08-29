@@ -49,25 +49,27 @@ class SGD(Optimizer):
         self.do_clipping = clip_gradients  # TODO: fix this
 
 
+    def _scale(self, value):
+        """
+        Gradient dictionaries nest as deep as the layers do -- a block holding a
+        block holding a layer -- so the scaling recurses rather than assuming
+        one level.
+        """
+        if isinstance(value, dict):
+            return {key: self._scale(sub) for key, sub in value.items()}
+        return self.learning_rate * value
+
     def step(self, layers: list[Layer]) -> None:
 
         for layer in layers:
-            layer_gradients = {}
             delta_grads = layer.get_gradients()
-            if (delta_grads) is None or (delta_grads == {}):
+            if not delta_grads:
                 continue
-            for subkey, subv in delta_grads.items():
-                if isinstance(subv, dict):  # multidimensional "layer" block
-                    layer_gradients.update(
-                        {subkey: {k: self.learning_rate * v
-                                  for k, v in subv.items()}}
-                    )
-
-                else:  # single-dimensional "layer"
-                    layer_gradients.update({subkey: self.learning_rate *subv})
 
             # matching keys via unpacking delta gradients
-            layer.update_weights(**layer_gradients)
+            layer.update_weights(
+                **{key: self._scale(sub) for key, sub in delta_grads.items()}
+            )
 
 
 # ADAM

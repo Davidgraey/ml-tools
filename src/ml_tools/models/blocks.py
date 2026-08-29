@@ -3,6 +3,7 @@ import numpy as np
 from typing import Callable
 from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON
 from ml_tools.models.activations import mod_relu, mod_relu_derivative
+from ml_tools.models.draft_heads import CategoricalHead, DraftHead
 from ml_tools.models.layers.layers import (
     GLOBAL_DTYPE,
     Layer,
@@ -146,6 +147,11 @@ class FourierAttention(Layer):
 class SpectreAttention(Layer):
     """
     SPECTRE mixing layer, https://arxiv.org/abs/2502.18394
+
+    Residual: the layer returns its input plus the mixing, so it is a block
+    rather than a bare transform. CausalSpectreAttention overrides forward and
+    backward to run the prefix path and carries the same residual there, so both
+    classes behave the same way around their mixing.
     """
 
     def __init__(self,
@@ -309,7 +315,10 @@ class SpectreAttention(Layer):
             self.gate
         )
 
-        self.output = np.fft.irfft(
+        # residual around the mixing. The gate is multiplicative in the
+        # frequency domain, so without it a head that closes drops its channels
+        # entirely rather than passing them through
+        self.output = input_data + np.fft.irfft(
             self._merge_heads(values_gated), n=self.sequence_length, axis=1
         )
         return self.output
@@ -369,7 +378,9 @@ class SpectreAttention(Layer):
         dvalues = rfft_adjoint(dV_hat, self.sequence_length, axis=1)
         dinput_from_v = self.fc_values.backward(dvalues)
 
-        return dinput_from_q + dinput_from_v
+        # the residual's own path: the identity carries the gradient straight
+        # through alongside the two projections
+        return dinput_from_q + dinput_from_v + incoming_gradient
 
     def get_weights(self) -> tuple:
         weights = [
@@ -467,6 +478,14 @@ class CausalSpectreAttention(SpectreAttention):
     Unlike the encoder it accepts any length up to the transform length, since
     a shorter prefix is just the zero padded one. prefill and decode_step run
     the same arithmetic a token at a time for generation.
+
+    Residual, as in the parent: the layer returns its input plus the mixing.
+    It sits inside _run_prefix and decode_step rather than in forward, so all
+    three entry points agree on what the layer's output is.
+
+    The drafting path in DFlashSpectreAttention has its own, around the block
+    MLP. Its mixer slots are learned constants rather than positions of an input
+    sequence, so there is no input there to carry forward.
     """
 
     def __init__(self,
@@ -605,8 +624,9 @@ class CausalSpectreAttention(SpectreAttention):
         )
 
         # only the diagonal is wanted: position t rebuilt from the prefix that
-        # ends at t (causal contract)
-        outputs = np.real(
+        # ends at t (causal contract). The residual rides here rather than in
+        # forward so that prefill returns the same thing forward would
+        outputs = input_data + np.real(
             np.sum(gated * self.inverse_basis[:length][None, :, :, None], axis=2)
         )
         return outputs, spectrum, query_cumulative, counts
@@ -678,7 +698,12 @@ class CausalSpectreAttention(SpectreAttention):
             )
         )
 
-        return self.fc_query.backward(dquery) + self.fc_values.backward(dvalues)
+        # the residual's own path, matching the parallel layer's
+        return (
+            self.fc_query.backward(dquery)
+            + self.fc_values.backward(dvalues)
+            + incoming_gradient
+        )
 
     # -------------    the Prefix-FFT cache    ------------------------
     def reset_cache(self) -> None:
@@ -747,7 +772,9 @@ class CausalSpectreAttention(SpectreAttention):
         gated = self._merge_heads(
             self._split_heads(self.cache_spectrum) * self._align_gate(gate)
         )
-        return np.real(
+        # the same residual the parallel path applies, or stepping the cache
+        # would disagree with forward at the position it just consumed
+        return token + np.real(
             np.sum(gated * self.inverse_basis[position][None, :, None], axis=1)
         )
 
@@ -766,70 +793,1018 @@ class CausalSpectreAttention(SpectreAttention):
         )
 
 
+class DynamicCausalConv:
+    """
+    Grouped causal convolution with a content-dependent kernel, the local
+    mixing DFlash2 wraps around a draft sublayer.
+
+    One projection of the sublayer's input produces two kernels, one for the
+    input and one for the output. Each is a learned base kernel shared across
+    positions plus a dynamic part that all channels in a group share, so the
+    kernel adapts to content without paying a projection per channel.
+
+    Causal and block local. The taps reach backwards only, and zero fill at the
+    start rather than wrapping, so a draft block never convolves in the block
+    before it.
+
+    Not a Layer: it is used in two phases around a sublayer rather than in one
+    shot, so it does not honour the single forward, single backward contract.
+    """
+
+    def __init__(self, hidden_dim: int, kernel_size: int = 2, group_size: int = 16):
+        assert kernel_size >= 1, f"need at least one tap, got {kernel_size}"
+        assert hidden_dim % group_size == 0, (
+            f"conv_group_size {group_size} must divide hidden_dim {hidden_dim}. "
+            "Groups partition the channel axis, so a remainder would leave "
+            "channels without a dynamic kernel."
+        )
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+        self.group_size = group_size
+        self.num_groups = hidden_dim // group_size
+
+        # identity at initialisation, so the wrapper starts as a no-op and the
+        # drafter is not handed a scrambled block before it has learned anything
+        self.base_input = np.zeros((kernel_size, hidden_dim), dtype=GLOBAL_DTYPE)
+        self.base_output = np.zeros((kernel_size, hidden_dim), dtype=GLOBAL_DTYPE)
+        self.base_input[0] = 1.0
+        self.base_output[0] = 1.0
+
+        self.fc_kernel = FullyConnectedLayer(
+            ni=hidden_dim,
+            no=2 * kernel_size * self.num_groups,
+            activation_type="linear",
+        )
+        self.zero_gradients()
+
+    @staticmethod
+    def _lag(array: NDArray, tap: int) -> NDArray:
+        """x[t - tap] along the position axis, zero filled at the block start"""
+        out = np.zeros_like(array)
+        if tap == 0:
+            out[...] = array
+        else:
+            out[:, tap:] = array[:, :-tap]
+        return out
+
+    @staticmethod
+    def _lead(array: NDArray, tap: int) -> NDArray:
+        """the adjoint of _lag, x[t + tap], zero filled at the block end"""
+        out = np.zeros_like(array)
+        if tap == 0:
+            out[...] = array
+        else:
+            out[:, :-tap] = array[:, tap:]
+        return out
+
+    def _expand(self, dynamic: NDArray) -> NDArray:
+        """(batch, position, tap, group) -> (batch, position, tap, hidden)"""
+        return np.repeat(dynamic, self.group_size, axis=-1)
+
+    def _convolve(self, data: NDArray, base: NDArray, dynamic: NDArray) -> NDArray:
+        kernel = base[None, None] + self._expand(dynamic)
+        return sum(
+            kernel[:, :, tap] * self._lag(data, tap)
+            for tap in range(self.kernel_size)
+        )
+
+    def _convolve_backward(
+        self, incoming: NDArray, data: NDArray, base: NDArray, dynamic: NDArray
+    ) -> tuple[NDArray, NDArray, NDArray]:
+        kernel = base[None, None] + self._expand(dynamic)
+        taps = range(self.kernel_size)
+
+        dkernel = np.stack(
+            [incoming * self._lag(data, tap) for tap in taps], axis=2
+        )
+        dbase = dkernel.sum(axis=(0, 1))
+        ddynamic = dkernel.reshape(
+            *dkernel.shape[:3], self.num_groups, self.group_size
+        ).sum(axis=-1)
+        ddata = sum(
+            self._lead(kernel[:, :, tap] * incoming, tap) for tap in taps
+        )
+        return ddata, dbase, ddynamic
+
+    def forward_input(self, data: NDArray) -> NDArray:
+        """convolve the sublayer's input, and derive both kernels from it"""
+        self.input = data
+        width = self.kernel_size * self.num_groups
+        projection = self.fc_kernel(data)
+        self.dynamic_input = projection[..., :width].reshape(
+            *data.shape[:-1], self.kernel_size, self.num_groups
+        )
+        self.dynamic_output = projection[..., width:].reshape(
+            *data.shape[:-1], self.kernel_size, self.num_groups
+        )
+        return self._convolve(data, self.base_input, self.dynamic_input)
+
+    def forward_output(self, data: NDArray) -> NDArray:
+        """convolve the sublayer's output, reusing the kernels already derived"""
+        self.sublayer_output = data
+        return self._convolve(data, self.base_output, self.dynamic_output)
+
+    def backward_output(self, incoming: NDArray) -> NDArray:
+        """called first, being the later of the two in the forward direction"""
+        ddata, self.gradient_base_output, self._ddynamic_output = (
+            self._convolve_backward(
+                incoming,
+                self.sublayer_output,
+                self.base_output,
+                self.dynamic_output,
+            )
+        )
+        return ddata
+
+    def backward_input(self, incoming: NDArray) -> NDArray:
+        """
+        Both kernels were projected from this conv's input, so the gradient
+        arriving here is joined by the one the output kernel sent back before
+        it reaches the projection.
+        """
+        ddata, self.gradient_base_input, ddynamic_input = self._convolve_backward(
+            incoming, self.input, self.base_input, self.dynamic_input
+        )
+
+        leading = self.input.shape[:-1]
+        dprojection = np.concatenate(
+            [
+                ddynamic_input.reshape(*leading, -1),
+                self._ddynamic_output.reshape(*leading, -1),
+            ],
+            axis=-1,
+        )
+        return ddata + self.fc_kernel.backward(dprojection)
+
+    def get_gradients(self) -> dict:
+        return {
+            "gradient_base_input": self.gradient_base_input,
+            "gradient_base_output": self.gradient_base_output,
+            "fc_kernel": self.fc_kernel.get_gradients(),
+        }
+
+    def update_weights(
+        self,
+        gradient_base_input: NDArray,
+        gradient_base_output: NDArray,
+        fc_kernel: dict,
+    ) -> None:
+        self.base_input -= gradient_base_input
+        self.base_output -= gradient_base_output
+        self.fc_kernel.update_weights(**fc_kernel)
+
+    def zero_gradients(self) -> None:
+        self.gradient_base_input = np.zeros_like(self.base_input)
+        self.gradient_base_output = np.zeros_like(self.base_output)
+        self._ddynamic_output = None
+        self.fc_kernel.zero_gradients()
+
+    def purge(self) -> None:
+        self.input = None
+        self.sublayer_output = None
+        self.dynamic_input = None
+        self.dynamic_output = None
+        self._ddynamic_output = None
+        self.fc_kernel.purge()
+
+    @property
+    def num_parameters(self) -> int:
+        return (
+            self.base_input.size
+            + self.base_output.size
+            + self.fc_kernel.num_parameters
+        )
+
+    def __str__(self):
+        return (
+            f"dynamic causal conv, {self.kernel_size} taps over "
+            f"{self.hidden_dim} channels in groups of {self.group_size}"
+        )
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class DFlashSpectreAttention(CausalSpectreAttention):
+    """
+    DFlash2 style block drafting on a SPECTRE mixer,
+    https://arxiv.org/abs/2602.06036
+
+    DFlash drafts a whole block of tokens in one pass instead of stepping a
+    small autoregressive model, and conditions that block on features taken
+    from the target rather than re-reading the context. Both parts land
+    naturally here.
+
+    Where DFlash injects target hidden states into the draft's KV cache, this
+    injects the context into the Prefix-FFT cache. The cache already is the
+    context, summarised in K complex numbers per channel rather than one
+    key-value pair per token, so the draft is conditioned on the full prefix at
+    a cost that does not grow with it.
+
+    Where DFlash gives the block a non-causal mask so every slot sees every
+    other, all block slots here share one spectrum -- the cached context plus
+    every mask slot's contribution -- and differ only in the position they read
+    out at. One spectrum, one gate, one pass, and the block is bidirectional
+    within itself while the context stays strictly causal.
+
+    From DFlash2: a dynamic grouped causal convolution wraps the block MLP so
+    neighbouring slots exchange local information, and a low-rank
+    predecessor-conditioned selector reranks the top-k unary candidates into a
+    coherent path.
+
+    Two departures worth knowing. The mask slots are parameterised by their
+    already-projected values, since a learned vector followed by a fixed linear
+    map is just a learned vector. And the convolution wraps only the MLP, not
+    the mixer -- the mixer's per-slot input is a learned constant, where a
+    convolution would be redundant.
+    """
+
+    # the base constructor seeds gradients through zero_gradients, which is
+    # overridden here, so it runs once before the draft parts exist. This says
+    # whether they do.
+    _draft_built: bool = False
+
+    def __init__(self,
+                 sequence_length: int,
+                 hidden_dim: int,
+                 vocab_size: int | None = None,
+                 num_heads: int = 1,
+                 band_radius: int = 0,
+                 block_size: int = 8,
+                 conv_kernel_size: int = 2,
+                 conv_group_size: int = 16,
+                 selector_rank: int = 256,
+                 selector_top_k: int = 16,
+                 sample_from_anchor: bool = False,
+                 head: DraftHead | None = None):
+        super().__init__(sequence_length, hidden_dim, num_heads, band_radius)
+
+        assert 1 <= block_size <= sequence_length, (
+            f"block_size {block_size} must fit inside the transform length "
+            f"{sequence_length}"
+        )
+        assert (head is None) != (vocab_size is None), (
+            "pass either a head or a vocab_size. vocab_size is shorthand for a "
+            "CategoricalHead built with the selector arguments here; a head of "
+            "your own carries its own."
+        )
+        self.block_size = block_size
+
+        # the mask slots, held already projected into value and query space
+        scale = 1.0 / np.sqrt(hidden_dim)
+        self.mask_values = (
+            self.RNG.normal(scale=scale, size=(block_size, hidden_dim))
+        ).astype(GLOBAL_DTYPE)
+        self.mask_query = (
+            self.RNG.normal(scale=scale, size=(block_size, hidden_dim))
+        ).astype(GLOBAL_DTYPE)
+
+        # built from this block's own stream, so the shorthand initialises
+        # exactly as it did when these parameters were declared inline
+        if head is None:
+            head = CategoricalHead(
+                hidden_dim, block_size, vocab_size,
+                selector_rank=selector_rank, selector_top_k=selector_top_k,
+                sample_from_anchor=sample_from_anchor, rng=self.RNG,
+            )
+        assert (head.hidden_dim, head.block_size) == (hidden_dim, block_size), (
+            f"head is built for hidden {head.hidden_dim} and block "
+            f"{head.block_size}, this drafter for {hidden_dim} and {block_size}"
+        )
+        self.head = head
+
+        self.conv_mlp = DynamicCausalConv(
+            hidden_dim, kernel_size=conv_kernel_size, group_size=conv_group_size
+        )
+        self.fc_block_a = FullyConnectedLayer(hidden_dim, 2 * hidden_dim, "relu")
+        self.fc_block_b = FullyConnectedLayer(2 * hidden_dim, hidden_dim, "linear")
+        self.fc_unary = FullyConnectedLayer(hidden_dim, head.width, "linear")
+
+        self._draft_built = True
+        self.zero_gradients()
+
+    @property
+    def vocab_size(self) -> int | None:
+        """the head's vocabulary, where it has one"""
+        return getattr(self.head, "vocab_size", None)
+
+    # -------------    the block draft    -----------------------------
+    def _block_positions(self, anchors: NDArray) -> NDArray:
+        """anchor t drafts the block that starts at t + 1"""
+        return anchors[:, None] + 1 + np.arange(self.block_size)[None, :]
+
+    def _draft_head(self, block_hidden: NDArray) -> NDArray:
+        """
+        The per-slot head: a conv wrapped MLP with a residual, then the unary
+        projection. Flattened over batch and anchor, so the convolution runs
+        along the block axis and stops at its edges.
+        """
+        self._head_shape = block_hidden.shape
+        flat = block_hidden.reshape(-1, self.block_size, self.hidden_dim)
+
+        self._head_input = flat
+        pre = self.conv_mlp.forward_input(flat)
+        post = self.conv_mlp.forward_output(self.fc_block_b(self.fc_block_a(pre)))
+        self._head_output = flat + post
+
+        return self.fc_unary(self._head_output).reshape(
+            *self._head_shape[:-1], self.head.width
+        )
+
+    def _draft_head_backward(self, dlogits: NDArray) -> NDArray:
+        dhidden = self.fc_unary.backward(
+            dlogits.reshape(-1, self.block_size, self.head.width)
+        )
+        dpre = self.fc_block_a.backward(
+            self.fc_block_b.backward(self.conv_mlp.backward_output(dhidden))
+        )
+        dflat = dhidden + self.conv_mlp.backward_input(dpre)
+        return dflat.reshape(self._head_shape)
+
+    def draft_forward(self, input_data: NDArray) -> NDArray:
+        """
+        Teacher forced drafting for training: at every anchor whose block fits,
+        draft the whole block in one pass.
+
+        Returns unary logits at (batch, anchor, block_size, vocab). Anchor a
+        predicts the tokens at positions a + 1 .. a + block_size.
+        """
+        assert input_data.ndim == 3, (
+            f"expected (batch, sequence, hidden), got {input_data.shape}"
+        )
+        length = input_data.shape[1]
+        anchors = length - self.block_size
+        assert anchors >= 1, (
+            f"a sequence of {length} leaves no room for a block of "
+            f"{self.block_size} after an anchor"
+        )
+
+        self.input = input_data
+        self.num_anchors = anchors
+        query_forward = self.fc_query(input_data)
+        value_forward = self.fc_values(input_data)
+
+        self.prefix_spectrum = np.cumsum(
+            value_forward[:, :, None, :] * self.twiddle[:length][None, :, :, None],
+            axis=1,
+        )[:, :anchors]
+        query_cumulative = np.cumsum(query_forward, axis=1)[:, :anchors]
+
+        self.block_pos = self._block_positions(np.arange(anchors))
+        block_twiddle = self.twiddle[self.block_pos]
+        self.block_basis = self.inverse_basis[self.block_pos]
+
+        # every slot contributes to one shared spectrum, which is what makes the
+        # block bidirectional within itself
+        spectrum = self.prefix_spectrum + np.einsum(
+            "jh,ajk->akh", self.mask_values, block_twiddle
+        )[None]
+
+        self.prefix_counts = (
+            np.arange(1, anchors + 1, dtype=np.float64) + self.block_size
+        )
+        gate = self._spectral_gate(
+            self.norm_query(
+                (query_cumulative + self.mask_query.sum(axis=0))
+                / self.prefix_counts[None, :, None]
+            )
+        )
+
+        self.block_spectrum = spectrum
+        gated = self._merge_prefix(
+            self._split_prefix(spectrum) * self._align_prefix_gate(gate)
+        )
+        block_hidden = np.real(
+            np.einsum("bakh,ajk->bajh", gated, self.block_basis)
+        )
+        return self._draft_head(block_hidden)
+
+    def draft_backward(self, dlogits: NDArray) -> NDArray:
+        assert self.prefix_spectrum is not None, (
+            "draft_backward needs the state draft_forward cached, and it has "
+            "since been overwritten. Re-run draft_forward."
+        )
+        dblock = self._draft_head_backward(dlogits)
+
+        dgated = self._split_prefix(
+            np.einsum("bajh,ajk->bakh", dblock, np.conj(self.block_basis))
+        )
+        gate = self.gate.reshape(
+            -1, self.num_anchors, self.num_heads, self.num_frequencies
+        )
+        dspectrum = self._merge_prefix(
+            dgated * np.conj(self._align_prefix_gate(gate))
+        )
+        dgate = np.transpose(
+            np.sum(
+                dgated * np.conj(self._split_prefix(self.block_spectrum)), axis=-1
+            ),
+            (0, 1, 3, 2),
+        )
+
+        self.gradient_mask_values = np.real(
+            np.einsum(
+                "bakh,ajk->jh", dspectrum, np.conj(self.twiddle[self.block_pos])
+            )
+        )
+
+        dmean = self.norm_query.backward(self._spectral_gate_backward(dgate))
+        dmean = dmean / self.prefix_counts[None, :, None]
+        self.gradient_mask_query = np.repeat(
+            dmean.sum(axis=(0, 1))[None], self.block_size, axis=0
+        )
+
+        length = self.input.shape[1]
+        dquery = np.zeros(self.input.shape, dtype=np.float64)
+        dquery[:, : self.num_anchors] = np.cumsum(dmean[:, ::-1], axis=1)[:, ::-1]
+
+        dtwiddled = np.zeros(
+            (*self.input.shape[:2], self.num_frequencies, self.hidden_dim),
+            dtype=np.complex128,
+        )
+        dtwiddled[:, : self.num_anchors] = np.cumsum(dspectrum[:, ::-1], axis=1)[
+            :, ::-1
+        ]
+        dvalues = np.real(
+            np.sum(
+                dtwiddled * np.conj(self.twiddle[:length])[None, :, :, None],
+                axis=2,
+            )
+        )
+
+        return self.fc_query.backward(dquery) + self.fc_values.backward(dvalues)
+
+    def draft_block(self) -> tuple[NDArray, NDArray]:
+        """
+        One-pass block draft from the Prefix-FFT cache, for generation.
+
+        Returns (unary logits, per-slot hidden) at (batch, block_size, ...).
+        The cache is read, never advanced -- verification decides how many of
+        these tokens are real, and only then are they absorbed.
+        """
+        assert self.cache_spectrum is not None, (
+            "the cache is empty. Run prefill or decode_step before drafting."
+        )
+        position = self.cache_position
+        assert position + self.block_size <= self.sequence_length, (
+            f"a block of {self.block_size} from position {position} runs past "
+            f"the transform length {self.sequence_length}"
+        )
+
+        block_pos = self._block_positions(np.array([position - 1]))
+        spectrum = self.cache_spectrum + np.einsum(
+            "jh,ajk->kh", self.mask_values, self.twiddle[block_pos]
+        )[None]
+
+        gate = self._spectral_gate(
+            self.norm_query(
+                (self.cache_query_sum + self.mask_query.sum(axis=0))
+                / (position + self.block_size)
+            )
+        )
+        gated = self._merge_heads(
+            self._split_heads(spectrum) * self._align_gate(gate)
+        )
+        block_hidden = np.real(
+            np.einsum("bkh,ajk->bjh", gated, self.inverse_basis[block_pos])
+        )
+        logits = self._draft_head(block_hidden)
+        return logits, self._head_output.reshape(block_hidden.shape)
+
+    # -------------    delegated to the head    -----------------------
+    def select_path(self,
+                    prediction: NDArray,
+                    hidden: NDArray,
+                    anchor: NDArray) -> NDArray:
+        """
+        Walk one drafted block into a coherent path.
+
+        What the walk is depends on the head: reranking the unary top-k for a
+        vocabulary, refining each slot against its predecessor for real values.
+        Either way the draft model ran once and only the walk over block_size
+        slots is sequential.
+        """
+        return self.head.propose(prediction, hidden, anchor)
+
+    def select_forward(self,
+                       prediction: NDArray,
+                       hidden: NDArray,
+                       predecessors: NDArray,
+                       targets: NDArray) -> tuple[float, NDArray, NDArray]:
+        """
+        Teacher forced training of the walk, which is where its sequential
+        nature goes away: the predecessor at each slot is taken from the target
+        sequence rather than from the walk's own output, so every slot trains in
+        parallel.
+
+        Returns the cost and the two upstream gradients. Adding those to the
+        unary head's own trains the two jointly; discarding them trains the
+        walk alongside a unary head that stays exactly a decoder's.
+        """
+        return self.head.refine_forward(prediction, hidden, predecessors, targets)
+
+    def propose(self, anchor: NDArray) -> NDArray:
+        """draft a block off the cache and walk it into a path"""
+        prediction, hidden = self.draft_block()
+        return self.select_path(prediction, hidden, anchor)
+
+    def accept_length(self, draft: NDArray, verified: NDArray) -> NDArray:
+        """
+        The longest valid prefix, per row. DFlash verifies the whole block at
+        once and keeps tokens up to the first disagreement.
+
+        Only what counts as agreeing belongs to the head -- exact equality for a
+        vocabulary, a tolerance for real values. Taking the longest agreeing
+        prefix does not, so it lives here and is shared.
+        """
+        agree = self.head.accepted(draft, verified)
+        return np.argmin(
+            np.concatenate(
+                [agree, np.zeros((agree.shape[0], 1), dtype=bool)], axis=1
+            ),
+            axis=1,
+        )
+
+    # -------------    the training objective    ----------------------
+    @property
+    def draft_hidden(self) -> NDArray:
+        """the per-slot hidden from the last draft, what the selector reads"""
+        return self._head_output
+
+    @staticmethod
+    def block_targets(sequence: NDArray,
+                      block_size: int,
+                      shift: int = 1) -> NDArray:
+        """
+        The sliding window of labels that lines up with draft_forward.
+
+        Anchor a predicts positions a + 1 .. a + block_size, so shift 1 gives
+        what each slot should emit, and shift 0 gives the value before it, the
+        predecessor the walk conditions on.
+
+        Head agnostic: this indexes axis 1 and touches nothing else, so a
+        (batch, length) stream of token ids and a (batch, length, channels)
+        stream of real values both come back with a block axis inserted.
+        """
+        anchors = sequence.shape[1] - block_size
+        offsets = np.arange(shift, block_size + shift)
+        return sequence[:, np.arange(anchors)[:, None] + offsets[None, :]]
+
+    def block_loss(self, prediction: NDArray, targets: NDArray) -> tuple[float, NDArray]:
+        """
+        The head's mean cost over every slot of every block, and its gradient.
+
+        Whatever the head, block_size 1 reduces this to the ordinary one step
+        objective -- a decoder's cross entropy, or a plain heteroscedastic
+        regression loss -- which is the cheapest check that the block machinery
+        changed the shape of the objective and not the objective.
+        """
+        return self.head.loss(prediction, targets)
+
+    # -------------    bookkeeping    ---------------------------------
+    def get_gradients(self) -> dict:
+        gradients = super().get_gradients()
+        gradients.update({
+            "gradient_mask_values": self.gradient_mask_values,
+            "gradient_mask_query": self.gradient_mask_query,
+            "conv_mlp": self.conv_mlp.get_gradients(),
+            "fc_block_a": self.fc_block_a.get_gradients(),
+            "fc_block_b": self.fc_block_b.get_gradients(),
+            "fc_unary": self.fc_unary.get_gradients(),
+            "head": self.head.get_gradients(),
+        })
+        return gradients
+
+    def update_weights(self,
+                       gradient_mask_values: NDArray,
+                       gradient_mask_query: NDArray,
+                       conv_mlp: dict,
+                       fc_block_a: dict,
+                       fc_block_b: dict,
+                       fc_unary: dict,
+                       head: dict,
+                       **inherited) -> None:
+        super().update_weights(**inherited)
+        self.mask_values -= gradient_mask_values
+        self.mask_query -= gradient_mask_query
+        self.conv_mlp.update_weights(**conv_mlp)
+        self.fc_block_a.update_weights(**fc_block_a)
+        self.fc_block_b.update_weights(**fc_block_b)
+        self.fc_unary.update_weights(**fc_unary)
+        self.head.update_weights(**head)
+
+    def zero_gradients(self) -> None:
+        super().zero_gradients()
+        if not self._draft_built:
+            return
+        self.gradient_mask_values = np.zeros_like(self.mask_values)
+        self.gradient_mask_query = np.zeros_like(self.mask_query)
+        self.conv_mlp.zero_gradients()
+        self.head.zero_gradients()
+        for layer in (self.fc_block_a, self.fc_block_b, self.fc_unary):
+            layer.zero_gradients()
+
+    def purge(self) -> None:
+        super().purge()
+        self.block_spectrum = None
+        self.block_basis = None
+        self.block_pos = None
+        self.num_anchors = None
+        self._head_input = None
+        self._head_output = None
+        self.conv_mlp.purge()
+        self.head.purge()
+        for layer in (self.fc_block_a, self.fc_block_b, self.fc_unary):
+            layer.purge()
+
+    @property
+    def num_parameters(self) -> int:
+        return (
+            super().num_parameters
+            + self.mask_values.size
+            + self.mask_query.size
+            + self.conv_mlp.num_parameters
+            + self.fc_block_a.num_parameters
+            + self.fc_block_b.num_parameters
+            + self.fc_unary.num_parameters
+            + self.head.num_parameters
+        )
+
+    def __str__(self):
+        band = f", band radius {self.band_radius}" if self.band_radius else ""
+        return (
+            f"DFlash2 SPECTRE drafter, block {self.block_size}, sequence "
+            f"{self.sequence_length}, hidden {self.hidden_dim}, "
+            f"{self.num_heads} heads, {self.head}{band}"
+        )
+
+
 if __name__ == "__main__":
+    """
+    A very shallow causal LM over spectral decoders, then DFlash speculative
+    decoding on top of it.
+
+    Three things are worth watching. The LM carries no positional encoding --
+    the mixer's twiddle factors already are the position. The drafter is trained
+    against the target's own greedy output rather than against the data, because
+    acceptance measures agreement with the target and where the target is
+    confidently wrong the drafter should be wrong in the same way. And the
+    decoded text is asserted identical to plain greedy decoding on every trial:
+    categorical speculation is exact, so the only thing it buys is fewer target
+    calls, and that is the number reported.
+    """
     from ml_tools.models.optimizers import SGD
-    from ml_tools.models.model_loss import MSELoss
-    import matplotlib.pyplot as plt
-    from ml_tools.generators.periodic_signal_gen import (
-        make_multifreq_dataset,
-        make_phase_mix_dataset
+
+    VOCAB, HIDDEN, LENGTH = 8, 32, 32
+    DEPTH, MIXER_HEADS = 2, 4
+    BLOCK = 5
+    NOISE = 0.05
+    PROMPT, HORIZON = 3, 24
+    DRAFT_FEATURE_RMS = 0.3
+
+    RNG = np.random.default_rng(0)
+    TABLE = RNG.integers(0, VOCAB, size=(VOCAB, VOCAB))
+
+
+    def sample_language(count, rng):
+        """
+        A second order chain: the next symbol is fixed by the previous two, apart
+        from a noise floor. Second order on purpose -- a block drafter has to commit
+        to several symbols at once, so the slots have to agree with each other.
+        """
+        ids = np.zeros((count, LENGTH), dtype=np.int64)
+        ids[:, :2] = rng.integers(0, VOCAB, size=(count, 2))
+        for step in range(2, LENGTH):
+            follow = TABLE[ids[:, step - 2], ids[:, step - 1]]
+            noisy = rng.random(count) < NOISE
+            ids[:, step] = np.where(noisy, rng.integers(0, VOCAB, size=count), follow)
+        return ids
+
+
+    class TokenEmbedding:
+        """a lookup table, and the scatter that is its gradient"""
+
+        def __init__(self, vocab_size, hidden_dim, rng):
+            self.table = rng.normal(scale=0.1, size=(vocab_size, hidden_dim))
+            self.ids = None
+            self.zero_gradients()
+
+        def forward(self, ids):
+            self.ids = ids
+            return self.table[ids]
+
+        def backward(self, incoming):
+            np.add.at(
+                self.gradient_table,
+                self.ids.reshape(-1),
+                incoming.reshape(-1, incoming.shape[-1]),
+            )
+
+        def get_gradients(self):
+            return {"gradient_table": self.gradient_table}
+
+        def update_weights(self, gradient_table):
+            self.table -= gradient_table
+
+        def zero_gradients(self):
+            self.gradient_table = np.zeros_like(self.table)
+
+        def purge(self):
+            self.ids = None
+
+        @property
+        def num_parameters(self):
+            return self.table.size
+
+
+    class SpectralDecoder:
+        """
+        One causal decoder layer: spectral token mixing, then a position wise MLP,
+        each around a residual.
+
+        Only the MLP's residual is written here. The mixer carries its own, so
+        adding one around it would count the input twice.
+
+        CausalSpectreAttention is the mixer alone -- its own fc_1 and fc_2 produce
+        the complex gate, not a feed forward over tokens -- so the MLP belongs here.
+        """
+
+        def __init__(self, sequence_length, hidden_dim, num_heads):
+            self.mixer = CausalSpectreAttention(
+                sequence_length, hidden_dim, num_heads
+            )
+            self.up = FullyConnectedLayer(hidden_dim, 2 * hidden_dim, "relu")
+            self.down = FullyConnectedLayer(2 * hidden_dim, hidden_dim, "linear")
+
+        def forward(self, hidden):
+            self.mixed = self.mixer.forward(hidden)
+            return self.mixed + self.down(self.up(self.mixed))
+
+        def backward(self, incoming):
+            dmixed = incoming + self.up.backward(self.down.backward(incoming))
+            return self.mixer.backward(dmixed)
+
+        @property
+        def parts(self):
+            return [self.mixer, self.up, self.down]
+
+
+    class ShallowCausalLM:
+        """
+        Embedding, a couple of spectral decoders, and an unembedding.
+
+        No positional encoding anywhere: the mixer's twiddle factors are the
+        position, so a token's place in the sequence is already in the transform.
+        """
+
+        def __init__(self, sequence_length, hidden_dim, vocab_size, depth,
+                     num_heads, rng):
+            self.embedding = TokenEmbedding(vocab_size, hidden_dim, rng)
+            self.decoders = [
+                SpectralDecoder(sequence_length, hidden_dim, num_heads)
+                for _ in range(depth)
+            ]
+            self.unembedding = FullyConnectedLayer(hidden_dim, vocab_size, "linear")
+            # a zeroed output projection starts the model at the uniform
+            # distribution, so the first loss is ln(vocab) rather than whatever the
+            # residual stream's scale happens to make it
+            self.unembedding.weights[...] = 0.0
+
+        def forward(self, ids):
+            hidden = self.embedding.forward(ids)
+            for decoder in self.decoders:
+                hidden = decoder.forward(hidden)
+            return self.unembedding(hidden), hidden
+
+        def backward(self, dlogits):
+            gradient = self.unembedding.backward(dlogits)
+            for decoder in reversed(self.decoders):
+                gradient = decoder.backward(gradient)
+            self.embedding.backward(gradient)
+
+        @property
+        def parts(self):
+            pieces = [self.embedding, self.unembedding]
+            for decoder in self.decoders:
+                pieces.extend(decoder.parts)
+            return pieces
+
+        @property
+        def num_parameters(self):
+            return sum(part.num_parameters for part in self.parts)
+
+
+    def features(hidden):
+        """
+        Rescale the target's hidden states to a fixed RMS before the drafter reads
+        them.
+
+        Two reasons, and the second is the sharp one. The residual stream carries
+        whatever scale training leaves it at, and the drafter would inherit it. And
+        the drafter's block readout grows with the prefix: its prefix spectrum is a
+        plain cumulative sum, and only the gate's query is divided by the count, so
+        a unit RMS input here gives a block hidden with a standard deviation in the
+        tens and gradients to match. Fixing the input scale keeps that in range.
+
+        Applied identically in training and in decoding, so the drafter never sees
+        two different input scales.
+        """
+        scale = np.sqrt((hidden ** 2).mean(axis=-1, keepdims=True) + 1e-6)
+        return hidden * (DRAFT_FEATURE_RMS / scale)
+
+
+    def next_token_loss(logits, ids):
+        """teacher forced cross entropy, and the gradient padded back out"""
+        cost, trimmed = CategoricalHead.loss(logits[:, :-1], ids[:, 1:])
+        dlogits = np.zeros_like(logits)
+        dlogits[:, :-1] = trimmed
+        return cost, dlogits
+
+
+    def train_target(model, steps, batch, learning_rate):
+        optimizer = SGD(learning_rate=learning_rate)
+        rng = np.random.default_rng(1)
+        first = last = None
+        for step in range(steps):
+            ids = sample_language(batch, rng)
+            logits, _ = model.forward(ids)
+            last, dlogits = next_token_loss(logits, ids)
+            for part in model.parts:
+                part.zero_gradients()
+            model.backward(dlogits)
+            optimizer.step(model.parts)
+            first = first if first is not None else last
+            if step % 40 == 0 or step == steps - 1:
+                print(f"       step {step:3d}  next token CE {last:.4f}")
+        return first, last
+
+
+    def target_stream(model, ids):
+        """
+        What the target would emit at every position, and the hidden states the
+        drafter reads.
+
+        The drafter is trained against these, not against the data: acceptance
+        measures agreement with the target, and where the target is confidently
+        wrong the drafter should be wrong the same way.
+        """
+        logits, hidden = model.forward(ids)
+        greedy = np.argmax(logits, axis=-1)
+        stream = np.concatenate([ids[:, :1], greedy[:, :-1]], axis=1)
+        return stream, features(hidden)
+
+
+    def train_drafter(model, drafter, steps, batch, learning_rate):
+        optimizer = SGD(learning_rate=learning_rate)
+        rng = np.random.default_rng(2)
+        first = last = None
+        for step in range(steps):
+            ids = sample_language(batch, rng)
+            stream, hidden = target_stream(model, ids)
+            labels = drafter.block_targets(stream, BLOCK, 1)
+            predecessors = drafter.block_targets(stream, BLOCK, 0)
+
+            prediction = drafter.draft_forward(hidden)
+            last, dlogits = drafter.block_loss(prediction, labels)
+            drafter.zero_gradients()
+            _, drefine, _ = drafter.select_forward(
+                prediction, drafter.draft_hidden, predecessors, labels
+            )
+            drafter.draft_backward(dlogits + drefine)
+            optimizer.step([drafter])
+            first = first if first is not None else last
+            if step % 40 == 0 or step == steps - 1:
+                print(f"       step {step:3d}  block CE {last:.4f}")
+        return first, last
+
+
+    def greedy_decode(model, prompt, horizon):
+        """one target call per token, the thing speculation has to beat"""
+        ids = prompt.copy()
+        calls = 0
+        while ids.shape[1] < horizon:
+            logits, _ = model.forward(ids)
+            calls += 1
+            ids = np.concatenate(
+                [ids, np.argmax(logits[:, -1:], axis=-1)], axis=1
+            )
+        return ids, calls
+
+
+    def speculative_decode(model, drafter, prompt, horizon):
+        """
+        Draft a block, verify it in one target pass, keep the agreeing prefix plus
+        one bonus token.
+
+        The bonus is what makes this worth doing: the target's token at the first
+        disagreement is conditioned only on tokens that were accepted, so it is
+        correct and free. A fully accepted block of BLOCK - 1 drafted tokens
+        therefore commits BLOCK of them.
+
+        The drafter's cache stops one position short of the committed sequence,
+        because the newest committed token is the bonus and the verifying pass never
+        saw it. That is exactly what sample_from_anchor False is for: slot 0
+        re-predicts the token already known at the cache's edge and is dropped,
+        anchoring the walk without spending a slot.
+        """
+        ids = prompt.copy()
+        _, hidden = model.forward(ids)
+        calls = 1
+        runs = []
+
+        while ids.shape[1] < horizon:
+            length = ids.shape[1]
+            drafter.reset_cache()
+            drafter.prefill(features(hidden[:, :length - 1]))
+            draft = drafter.propose(ids[:, length - 2])
+            width = draft.shape[1]
+
+            logits, hidden = model.forward(
+                np.concatenate([ids, draft], axis=1)
+            )
+            calls += 1
+            verified = np.argmax(
+                logits[:, length - 1:length - 1 + width], axis=-1
+            )
+            taken = int(drafter.accept_length(draft, verified)[0])
+
+            ids = np.concatenate(
+                [ids, draft[:, :taken], verified[:, taken:taken + 1]], axis=1
+            )
+            hidden = hidden[:, :ids.shape[1] - 1]
+            runs.append(taken + 1)
+
+        return ids, calls, runs
+
+
+    print("=" * 68)
+    print("a shallow causal LM over spectral decoders, then DFlash speculation")
+    print("=" * 68)
+    target = ShallowCausalLM(LENGTH, HIDDEN, VOCAB, DEPTH, MIXER_HEADS,
+                             np.random.default_rng(3))
+    print(f"   target: {DEPTH} spectral decoders, {target.num_parameters:,} "
+          f"parameters, vocab {VOCAB}")
+    print(f"   uniform CE would be ln(vocab) = {np.log(VOCAB):.4f}")
+    print("   training the target:")
+    train_target(target, steps=400, batch=32, learning_rate=0.02)
+
+    holdout = sample_language(64, np.random.default_rng(99))
+    logits, _ = target.forward(holdout)
+    agreement = (np.argmax(logits[:, :-1], -1) == holdout[:, 1:]).mean()
+    print(f"   target next token accuracy on held out data {agreement:.1%}")
+    print()
+
+    drafter = DFlashSpectreAttention(
+        sequence_length=LENGTH, hidden_dim=HIDDEN, vocab_size=VOCAB,
+        num_heads=MIXER_HEADS, block_size=BLOCK, selector_rank=32,
+        selector_top_k=8,
     )
+    drafter.fc_unary.weights[...] = 0.0
+    drafter.zero_gradients()
+    print(f"   drafter: {drafter}")
+    print(f"   {drafter.num_parameters:,} parameters, "
+          f"{drafter.num_parameters / target.num_parameters:.2f}x the target")
+    print("   training the drafter on the target's own output:")
+    train_drafter(target, drafter, steps=400, batch=32, learning_rate=0.05)
+    print()
 
+    print("   decoding:")
+    greedy_calls = speculative_calls = 0
+    greedy_tokens = speculative_tokens = 0
+    runs = []
+    for trial in range(16):
+        prompt = sample_language(1, np.random.default_rng(500 + trial))[:, :PROMPT]
+        plain, plain_calls = greedy_decode(target, prompt, HORIZON)
+        fast, fast_calls, fast_runs = speculative_decode(
+            target, drafter, prompt, HORIZON
+        )
 
-    # x, y = make_phase_mix_dataset(50, 128, 3, 11)
-    # loss = MSELoss()
-    # optimizer = SGD(2e-4)
-    #
-    # attn = FourierAttention(ni=128, no=128, use_2d=True)
-    # # attn2 = FourierAttention(ni=512, no=512, use_2d=True)
-    # # attn3 = FourierAttention(ni=512, no=512, use_2d=True)
-    #
-    # all_loss = []
-    # for _ in range(5000):
-    #     out = attn.forward(x)
-    #     # out = attn3(attn2(attn(x)))
-    #     _l = loss.forward(out, y)
-    #     if _ % 10 == 0:
-    #         print(_l.item())
-    #     all_loss.append(_l.item())
-    #     grad = loss.backward()
-    #     # attn.backward(attn2.backward(attn3.backward(grad)))
-    #     # optimizer.step([attn, attn2, attn3])
-    #     attn.backward(grad)
-    #     optimizer.step([attn])
-    #
-    # plt.plot(all_loss)
-    # plt.show()
+        assert np.array_equal(plain[:, :HORIZON], fast[:, :HORIZON]), (
+            f"trial {trial}: speculation changed the output"
+        )
+        greedy_calls += plain_calls
+        speculative_calls += fast_calls
+        greedy_tokens += plain.shape[1] - PROMPT
+        speculative_tokens += fast.shape[1] - PROMPT
+        runs.extend(fast_runs)
 
-    import matplotlib.pyplot as plt
-
-    np.random.seed(0)
-
-    seq_len = 64
-    hidden_dim = 128
-
-    x, y = make_multifreq_dataset(batch_size=16, seq_len=seq_len, hidden_dim=hidden_dim)
-    loss = MSELoss()
-    optimizer = SGD(0.02)
-    all_loss = []
-
-    model = SpectreAttention(sequence_length=seq_len, hidden_dim=hidden_dim)
-
-    for _ in range(500):
-        out = model.forward(x)
-        _l = loss.forward(out, y)
-
-        if _ % 50 == 0:
-            print(_l.item())
-            plt.plot(y[0, :, 0], label="target")
-            plt.plot(out[0, :, 0], label="spectre")
-            plt.legend()
-            plt.show()
-        all_loss.append(_l.item())
-        grad = loss.backward()
-
-        _g = model.backward(grad)
-        optimizer.step([model])
-
-    plt.plot(all_loss)
-    plt.show()
+    runs = np.array(runs)
+    print(f"   16 prompts of {PROMPT}, decoded to at least {HORIZON} tokens")
+    print(f"   outputs identical over the horizon, asserted on every trial")
+    print()
+    print(f"   greedy       {greedy_calls:4d} target calls for {greedy_tokens} "
+          f"tokens, {greedy_tokens / greedy_calls:.2f} per call")
+    print(f"   speculative  {speculative_calls:4d} target calls for "
+          f"{speculative_tokens} tokens, "
+          f"{speculative_tokens / speculative_calls:.2f} per call")
+    print(f"                {len(runs)} verifications plus 16 prefills")
+    print()
+    print(f"   committed per verification: mean {runs.mean():.2f} of a possible "
+          f"{BLOCK}")
+    for length in range(1, BLOCK + 1):
+        share = (runs == length).mean()
+        print(f"       {length} token{'s' if length > 1 else ' '}  "
+              f"{'#' * round(share * 40):40s} {share:5.1%}")
+    print()
+    print(f"   {greedy_calls / speculative_calls:.2f}x fewer target calls for "
+          f"the same output")
