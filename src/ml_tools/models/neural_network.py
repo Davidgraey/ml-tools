@@ -78,7 +78,11 @@ class Node:
 
         # Check once here instead of inspecting the signature on every forward pass.
         self.accepts_training = bool(layer) and (
-            "training_now" in inspect.signature(layer.forward).parameters
+                "training_now" in inspect.signature(layer.forward).parameters
+        )
+        # flag for allowing the mask
+        self.accepts_mask = bool(layer) and (
+                "mask" in inspect.signature(layer.forward).parameters
         )
 
         for source in sources:
@@ -352,6 +356,7 @@ class NeuralNetwork:
             raise ValueError("the network has no layers")
         return self._output
 
+    # TODO: this is likely overengineered.
     @output.setter
     def output(self, node: Node) -> None:
         if not isinstance(node, Node):
@@ -379,9 +384,15 @@ class NeuralNetwork:
             self._registered.append(layer)
 
     # ------------- the passes
-    def forward(self, x_data: NDArray) -> NDArray:
+    def forward(self,
+                x_data: NDArray,
+                mask: Optional[NDArray] = None) -> NDArray:
         """
         forward pass -- taking the insertion order or navigating the node-to-node process
+
+        mask : optional (batch, sequence) array, 1 where a position is real
+            content and 0 where it is padding. Delivered to whichever layers
+            declare a `mask` parameter; every other layer is unaffected.
         """
         output = self.output
         values = {self._input: x_data}
@@ -390,12 +401,12 @@ class NeuralNetwork:
             if node.is_source:
                 continue
             arguments = [values[source] for source in node.sources]
+            extra = {}
             if node.accepts_training:
-                values[node] = node.layer.forward(
-                    *arguments, training_now=self.training
-                )
-            else:
-                values[node] = node.layer.forward(*arguments)
+                extra["training_now"] = self.training
+            if node.accepts_mask:
+                extra["mask"] = mask
+            values[node] = node.layer.forward(*arguments, **extra)
 
         object.__setattr__(
             self, "activations", {node.name: value for node, value in values.items()}

@@ -211,3 +211,69 @@ class LatentSum(Layer):
 
     def __repr__(self):
         return f"{self}"
+
+
+class ShiftRight(Layer):
+    """
+    Shift a sequence right by one position along the sequence axis, so
+    position t sees position t-1's value instead of its own -- the standard
+    teacher-forcing input for an autoregressive decoder.
+    """
+
+    preserves_shape = True
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.start_token: NDArray = np.zeros((1, 1, hidden_dim))
+        self.declare_shapes(inputs=((hidden_dim,),), outputs=((hidden_dim,),))
+        self.zero_gradients()
+
+    def forward(self, input_data: NDArray) -> NDArray:
+        """
+        input_data : (batch, sequence, hidden)
+        """
+        assert input_data.ndim == 3, (
+            f"expected (batch, sequence, hidden), got shape {input_data.shape}"
+        )
+        assert input_data.shape[-1] == self.hidden_dim, (
+            f"built for hidden_dim {self.hidden_dim}, got {input_data.shape[-1]}"
+        )
+        batch = input_data.shape[0]
+        start = np.broadcast_to(self.start_token, (batch, 1, self.hidden_dim))
+        self.output = np.concatenate([start, input_data[:, :-1, :]], axis=1)
+        return self.output
+
+    def backward(self, incoming_gradient: NDArray) -> NDArray:
+        self.gradient_start_token = incoming_gradient[:, :1, :].sum(
+            axis=0, keepdims=True
+        )
+        # -1?
+        grad_input = np.zeros_like(incoming_gradient)
+        grad_input[:, :-1, :] = incoming_gradient[:, 1:, :]
+        return grad_input
+
+    def update_weights(self, gradient_start_token: NDArray) -> None:
+        self.start_token -= gradient_start_token
+
+    def zero_gradients(self) -> None:
+        self.gradient_start_token = np.zeros_like(self.start_token)
+
+    def get_weights(self):
+        return self.start_token
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        return {"gradient_start_token": self.gradient_start_token}
+
+    def purge(self) -> None:
+        self.output = None
+
+    @property
+    def num_parameters(self) -> int:
+        return self.start_token.size
+
+    def __str__(self):
+        return f"ShiftRight, hidden {self.hidden_dim}"
+
+    def __repr__(self):
+        return self.__str__()

@@ -22,9 +22,54 @@ class Loss(ABC):
     def __init__(self):
         self.targets = None
         self.prediction = None
+        self.mask_column = None
+        self.valid_elements = None
+
+    @staticmethod
+    def _mask_column(mask: Optional[NDArray], reference: NDArray) -> Optional[NDArray]:
+        """
+        Normalize a mask to broadcast against an elementwise array.
+
+        Parameters
+        ----------
+        mask : (..., 1) or (...,) with 1 for real content, 0 for padding
+        reference : the elementwise array the mask will multiply
+
+        Returns
+        -------
+        (..., 1) mask, or None if mask is None
+        """
+        if mask is None:
+            return None
+        positions = mask[..., 0] if mask.ndim == reference.ndim else mask
+        return positions[..., None]
+
+    @staticmethod
+    def _position_mask(mask: Optional[NDArray], reference: NDArray) -> Optional[NDArray]:
+        """
+        Normalize a mask to match an already-reduced, per-position array.
+
+        Parameters
+        ----------
+        mask : (..., 1) or (...,) with 1 for real content, 0 for padding
+        reference : an array one axis narrower than the raw prediction,
+            e.g. a per-position loss after reducing over the class axis
+
+        Returns
+        -------
+        mask matching reference's shape, or None if mask is None
+        """
+        if mask is None:
+            return None
+        positions = mask[..., 0] if mask.ndim == reference.ndim + 1 else mask
+        return positions.astype(reference.dtype)
+
+    @staticmethod
+    def _valid_elements(mask_column: NDArray, reference: NDArray) -> float:
+        return max(mask_column.sum() * reference.shape[-1], 1.0)
 
     @abstractmethod
-    def forward(self, prediction: NDArray, targets: NDArray) -> float | NDArray:
+    def forward(self, prediction: NDArray, targets: NDArray, mask: Optional[NDArray] = None) -> float | NDArray:
         pass
 
     @abstractmethod
@@ -34,71 +79,101 @@ class Loss(ABC):
         """
         pass
 
-    def __call__(self, predictions: NDArray, targets: NDArray) -> float | NDArray:
-         return self.forward(predictions, targets)
+    def __call__(self, predictions: NDArray, targets: NDArray, mask: Optional[NDArray] = None) -> float | NDArray:
+        return self.forward(predictions, targets, mask)
 
 
 class DifferenceLoss(Loss):
-    def forward(self, prediction, targets):
+    def forward(self, prediction, targets, mask: Optional[NDArray] = None):
         self.prediction = prediction
         self.targets = targets
-        return np.abs(targets - prediction)
+        diff = np.abs(targets - prediction)
+        self.mask_column = self._mask_column(mask, diff)
+        return diff * self.mask_column if self.mask_column is not None else diff
 
     def backward(self):
-        return np.sign(self.prediction - self.targets)
+        grad = np.sign(self.prediction - self.targets)
+        return grad * self.mask_column if self.mask_column is not None else grad
 
 
 class MSELoss(Loss):
-    def forward(self, prediction, targets):
+    def forward(self, prediction, targets, mask: Optional[NDArray] = None):
         self.prediction = prediction
         self.targets = targets
         diff = prediction - targets
+        self.mask_column = self._mask_column(mask, diff)
+
+        if self.mask_column is not None:
+            self.valid_elements = self._valid_elements(self.mask_column, diff)
+            return np.sum((diff ** 2) * self.mask_column) / self.valid_elements
         return np.mean(diff ** 2)
-        # return 0.5 * np.mean(diff ** 2)
 
     def backward(self):
         """forward means over every element, so the reduction is size not shape[0]"""
         diff = self.prediction - self.targets
+        if self.mask_column is not None:
+            return (2 / self.valid_elements) * diff * self.mask_column
         return (2 / self.prediction.size) * diff
 
 
 class RMSELoss(Loss):
-    def forward(self, prediction, targets):
+    def forward(self, prediction, targets, mask: Optional[NDArray] = None):
         self.prediction = prediction
         self.targets = targets
         diff = prediction - targets
-        self.rmse = np.sqrt(np.mean(diff ** 2))
+        self.mask_column = self._mask_column(mask, diff)
+
+        if self.mask_column is not None:
+            self.valid_elements = self._valid_elements(self.mask_column, diff)
+            self.rmse = np.sqrt(np.sum((diff ** 2) * self.mask_column) / self.valid_elements)
+        else:
+            self.rmse = np.sqrt(np.mean(diff ** 2))
         return self.rmse
 
     def backward(self):
         diff = self.prediction - self.targets
+        if self.mask_column is not None:
+            return diff * self.mask_column / (self.valid_elements * (self.rmse + EPSILON))
         N = diff.size
         return diff / (N * (self.rmse + EPSILON))
 
 
-    class SSELoss(Loss):
-        def forward(self, prediction, targets):
-            self.prediction = prediction
-            self.targets = targets
-            return np.sum((prediction - targets) ** 2)
+class SSELoss(Loss):
+    def forward(self, prediction, targets, mask: Optional[NDArray] = None):
+        self.prediction = prediction
+        self.targets = targets
+        diff = prediction - targets
+        self.mask_column = self._mask_column(mask, diff)
+        if self.mask_column is not None:
+            return np.sum((diff ** 2) * self.mask_column)
+        return np.sum(diff ** 2)
 
-        def backward(self):
-            return 2 * (self.prediction - self.targets)
+    def backward(self):
+        grad = 2 * (self.prediction - self.targets)
+        return grad * self.mask_column if self.mask_column is not None else grad
 
 
 class MAELoss(Loss):
-    def forward(self, prediction, targets):
+    def forward(self, prediction, targets, mask: Optional[NDArray] = None):
         self.prediction = prediction
         self.targets = targets
-        return np.mean(np.abs(prediction - targets))
+        diff = prediction - targets
+        self.mask_column = self._mask_column(mask, diff)
+
+        if self.mask_column is not None:
+            self.valid_elements = self._valid_elements(self.mask_column, diff)
+            return np.sum(np.abs(diff) * self.mask_column) / self.valid_elements
+        return np.mean(np.abs(diff))
 
     def backward(self):
         diff = self.prediction - self.targets
+        if self.mask_column is not None:
+            return np.sign(diff) * self.mask_column / self.valid_elements
         return np.sign(diff) / diff.size
 
 
 class CosineLoss(Loss):
-    def forward(self, prediction, targets):
+    def forward(self, prediction, targets, mask: Optional[NDArray] = None):
         self.prediction = prediction
         self.targets = targets
 
@@ -107,7 +182,15 @@ class CosineLoss(Loss):
         norm_t = np.linalg.norm(targets, axis=-1)
 
         self.cos = dot / (norm_p * norm_t + 1e-8)
-        return np.mean(1 - self.cos)
+        per_position = 1 - self.cos
+        self.position_mask = self._position_mask(mask, per_position)
+
+        if self.position_mask is not None:
+            self.valid_elements = max(self.position_mask.sum(), 1.0)
+            return np.sum(per_position * self.position_mask) / self.valid_elements
+
+        self.valid_elements = per_position.size
+        return np.sum(per_position) / self.valid_elements
 
     def backward(self):
         p = self.prediction
@@ -120,7 +203,9 @@ class CosineLoss(Loss):
             p * np.sum(p * t, axis=-1, keepdims=True) / (norm_p**3 * norm_t)
             - t / (norm_p * norm_t)
         )
-        return grad / p.shape[0]
+        if self.position_mask is not None:
+            grad = grad * self.position_mask[..., None]
+        return grad / self.valid_elements
 
 
 class CrossEntropyLoss(Loss):
@@ -128,7 +213,7 @@ class CrossEntropyLoss(Loss):
         super().__init__()
         self.task = task
 
-    def forward(self, prediction, targets):
+    def forward(self, prediction, targets, mask: Optional[NDArray] = None):
         self.prediction = prediction
         self.targets = targets
 
@@ -136,8 +221,12 @@ class CrossEntropyLoss(Loss):
             shifted = prediction - np.max(prediction, axis=-1, keepdims=True)
             log_sum_exp = np.log(np.sum(np.exp(shifted), axis=-1))
             cls = np.argmax(targets, axis=-1)
-            correct = shifted[np.arange(prediction.shape[0]), cls]
+            correct = np.take_along_axis(shifted, cls[..., None], axis=-1)[..., 0]
             loss = -correct + log_sum_exp
+            self.reduce_mask = self._position_mask(mask, loss)
+            self.valid_elements = (
+                max(self.reduce_mask.sum(), 1.0) if self.reduce_mask is not None else loss.size
+            )
 
         elif self.task == ClassificationTask.BINARY:
             loss = (
@@ -145,309 +234,67 @@ class CrossEntropyLoss(Loss):
                 - targets * prediction
                 + np.log(1 + np.exp(-np.abs(prediction)))
             )
+            self.reduce_mask = self._mask_column(mask, loss)
+            self.valid_elements = (
+                self._valid_elements(self.reduce_mask, loss) if self.reduce_mask is not None else loss.size
+            )
 
         elif self.task == ClassificationTask.MULTILABEL:
             log_sum_exp = np.log(1 + np.exp(prediction))
             loss = log_sum_exp - targets * prediction
+            self.reduce_mask = self._mask_column(mask, loss)
+            self.valid_elements = (
+                self._valid_elements(self.reduce_mask, loss) if self.reduce_mask is not None else loss.size
+            )
 
+        if self.reduce_mask is not None:
+            return np.sum(loss * self.reduce_mask) / self.valid_elements
         return np.mean(loss)
 
     def backward(self):
         """
         dL / d(logits). forward() consumes logits and applies its own
         log-softmax / log-sigmoid, so the squashing belongs here too.
-        Reduction matches forward: mean over samples for multinomial,
-        mean over every element for the elementwise tasks.
         """
         if self.task == ClassificationTask.MULTINOMIAL:
-            probs = softmax(self.prediction)
-            return (probs - self.targets) / self.targets.shape[0]
+            grad = softmax(self.prediction) - self.targets
+            if self.reduce_mask is not None:
+                grad = grad * self.reduce_mask[..., None]
+            return grad / self.valid_elements
 
-        probs = sigmoid(self.prediction)
-        return (probs - self.targets) / self.targets.size
+        grad = sigmoid(self.prediction) - self.targets
+        if self.reduce_mask is not None:
+            grad = grad * self.reduce_mask
+        return grad / self.valid_elements
 
-    def __call__(self, predictions: NDArray, targets: NDArray):
-         return self.forward(predictions, targets)
+    def __call__(self, predictions: NDArray, targets: NDArray, mask: Optional[NDArray] = None):
+        return self.forward(predictions, targets, mask)
 
 
 class MultiHeadLoss(Loss):
-    """
-    h  = fc1.forward(x)
-
-    y1_hat = fc2.forward(h)
-    y2_hat = fc3.forward(h)
-
-    L = loss.forward(
-        preds=[y1_hat, y2_hat],
-        targets=[y1, y2]
-    )
-    # BACKPROPIGATION =========
-    # loss --> heads
-    g_y1, g_y2 = loss.backward()
-
-    # heads --> shared
-    g_h1 = fc2.backward(g_y1)
-    g_h2 = fc3.backward(g_y2)
-
-    # merge aka sum gradients from both heads
-    g_h = g_h1 + g_h2
-
-    # input
-    fc1.backward(g_h)
-    """
     def __init__(self, losses: list[Loss], weights=None):
         super().__init__()
         self.losses = losses
-        # if we're reweighting the losses:
         self.weights = weights or [1.0] * len(losses)
 
-    def forward(self, predictions: NDArray, targets):
+    def forward(self, predictions: NDArray, targets, mask: Optional[list] = None):
         self.predictions = predictions
         self.targets = targets
+        masks = mask if mask is not None else [None] * len(self.losses)
 
         total = 0.0
         self.last_losses = []
-
-        for w, loss, yhat, y in zip(self.weights, self.losses, predictions, targets):
-            L = loss.forward(yhat, y)
+        for w, loss, yhat, y, m in zip(self.weights, self.losses, predictions, targets, masks):
+            L = loss.forward(yhat, y, m)
             self.last_losses.append(L)
             total += w * L
-
         return total
 
     def backward(self):
-        grads = []
+        return [w * loss.backward() for w, loss in zip(self.weights, self.losses)]
 
-        for w, loss in zip(self.weights, self.losses):
-            grads.append(w * loss.backward())
-
-        return grads
-
-    def __call__(self, predictions: NDArray, targets: NDArray):
-         return self.forward(predictions, targets)
-
-# TODO: retire the functions in favor of OOP version
-@loss_func
-def difference(
-    prediction: NDArray,
-    targets: NDArray,
-    axis: int = 0,
-    reduction: Optional[Reductions] = None,
-    task: Optional[ClassificationTask] = None,
-) -> NDArray:
-    """
-    Calculate the difference between prediction and targets; with reduction
-
-    Parameters
-    ----------
-    prediction : input array, should be of shape [n_respondents, number_items]
-    targets :
-    axis :
-    reduction :
-
-    Returns
-    -------
-    array of transformed values as numpy array, with the same shape as prediction input
-    """
-    diff = np.abs(targets - prediction)
-    if reduction == "mean":
-        return np.mean(diff, axis=axis)
-    elif reduction == "sum":
-        return np.sum(diff, axis=axis)
-    return diff
-
-
-@loss_func
-def mse(
-    prediction: NDArray,
-    targets: NDArray,
-    axis: int = 0,
-    reduction: Optional[Reductions] = None,
-    task: Optional[ClassificationTask] = None,
-) -> float | NDArray:
-    """
-    MEAN SQUARED ERRORS FOR REGRESSION MODELS
-    Parameters
-    ----------
-    prediction : numpy array of predictions (outputs)
-    targets : True or Target values - dimensionally match prediction
-
-    Returns
-    -------
-    evaluation of error / loss
-    """
-    # constant adjusted loss to make derivative clearner
-    return 0.5 * np.mean((prediction - targets) ** 2)
-
-
-@loss_func
-def rmse(
-    prediction: NDArray,
-    targets: NDArray,
-    axis: int = 0,
-    reduction: Optional[Reductions] = None,
-    task: Optional[ClassificationTask] = None,
-) -> NDArray:
-    """
-    Calculate the root-mean-square of the data -
-
-    Parameters
-    ----------
-    prediction : input array, should be of shape [n_respondents, number_items]
-    targets :
-    axis :
-    reduction :
-
-    Returns
-    -------
-    array of transformed values as numpy array, with the same shape as prediction input
-    """
-    rmse = np.sqrt(np.mean((targets - prediction) ** 2, axis=axis))
-    if reduction == "mean":
-        return np.mean(rmse)
-    elif reduction == "sum":
-        return np.sum(rmse)
-    return rmse
-
-
-@loss_func
-def sse(
-    prediction: NDArray,
-    targets: NDArray,
-    axis: int = 0,
-    reduction: Optional[Reductions] = None,
-    task: Optional[ClassificationTask] = None,
-) -> NDArray:
-    """
-    Calculate the sum of squared errors
-
-    Parameters
-    ----------
-    prediction : input array, should be of shape [n_respondents, number_items]
-    targets :
-    axis :
-    reduction :
-
-    Returns
-    -------
-    array of transformed values as numpy array, with the same shape as prediction input
-    """
-    rmse = np.sum((targets - prediction) ** 2, axis=axis)
-    if reduction == "mean":
-        return np.mean(rmse)
-    elif reduction == "sum":
-        return np.sum(rmse)
-    return rmse
-
-
-@loss_func
-def mae(
-    prediction: NDArray,
-    targets: NDArray,
-    axis: int = 0,
-    reduction: Optional[Reductions] = None,
-    task: Optional[ClassificationTask] = None,
-) -> NDArray:
-    """
-    Calculate the mean-absolute-error of the data -
-
-    Parameters
-    ----------
-    prediction : input array, should be of shape [n_respondents, number_items]
-    targets :
-    axis :
-    reduction :
-
-    Returns
-    -------
-    array of transformed values as numpy array, with the same shape as prediction input
-    """
-    mae = np.mean(np.abs((targets - prediction), axis=axis))
-    if reduction == "mean":
-        return np.mean(mae)
-    elif reduction == "sum":
-        return np.sum(mae)
-    return mae
-
-
-@loss_func
-def cosine_error(
-    prediction: NDArray,
-    targets: NDArray,
-    axis: int = 0,
-    reduction: Optional[Reductions] = None,
-    task: Optional[ClassificationTask] = None,
-) -> NDArray:
-    """
-    squared error for cosine distance loss
-
-    Parameters
-    ----------
-    prediction : input array, should be of shape [n_respondents, number_items]
-    targets :
-    axis :
-    reduction :
-
-    Returns
-    -------
-    array of transformed values as numpy array, with the same shape as prediction input
-    """
-    cos = cosine_distance(prediction, targets)
-    if reduction == "mean":
-        return np.mean(cos)
-    elif reduction == "sum":
-        return np.sum(cos)
-    return cos
-
-
-@loss_func
-def cross_entropy(
-    prediction: NDArray,
-    targets: NDArray,
-    reduction: Optional[Reductions] = None,
-    task: Optional[ClassificationTask] = None,
-) -> float | NDArray:
-    """
-    CROSS ENTROPY - stabalized versions to accept logit values
-    Assumes that targets are one-hot encoded vector [0, 0, 1, 0]
-    Parameters
-    ----------
-    prediction : numpy.ndarray  the forward-pass logit values
-    targets : numpy.ndarray   Assumes that targets are one-hot encoded vector [0, 0, 1, 0]Assumes that targets are one-hot
-    encoded vector [0, 0, 1, 0]
-    task : ClassificationTask enum
-
-    Returns
-    -------
-    numpy.float64
-    """
-    #  multilabel, multinomial classification with prediction ------
-    if task == ClassificationTask.MULTILABEL:
-        log_sum_exp = np.log(1 + np.exp(prediction))
-        loss = log_sum_exp - targets * prediction
-
-    #  categorical cross-entropy with stabilization -- using log-softmax of the prediction -------
-    elif task == ClassificationTask.MULTINOMIAL:
-        # shift our values (0-ceiling) for numeric stability
-        shifted_logits = prediction - np.max(prediction, axis=-1, keepdims=True)
-        # log-sum-exp for numerical stability
-        log_sum_exp = np.log(np.sum(np.exp(shifted_logits), axis=-1))
-        # targets becomes a mask to select the true class logit
-        # class_logits = shifted_logits[targets.astype(bool)]
-        # loss = -class_logits + log_sum_exp
-        cls = np.argmax(targets, axis=-1)
-        correct = shifted_logits[np.arange(prediction.shape[0]), cls]
-        loss = -correct + log_sum_exp
-
-    # Binary cross-entropy -- logit stabilizing for neg and positive --------
-    elif task == ClassificationTask.BINARY:
-        loss = (
-            np.maximum(0, prediction)
-            - (targets * prediction)
-            + np.log(1 + np.exp(-np.abs(prediction)))
-        )
-
-    return np.mean(loss)
+    def __call__(self, predictions: NDArray, targets: NDArray, mask: Optional[list] = None):
+        return self.forward(predictions, targets, mask)
 
 
 # ------------------------------------------------------------------

@@ -1,6 +1,6 @@
 from numpy.typing import NDArray
 import numpy as np
-from typing import Callable
+from typing import Callable, Optional
 from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON
 from ml_tools.models.activations import mod_relu, mod_relu_derivative
 from ml_tools.models.draft_heads import CategoricalHead, DraftHead
@@ -260,7 +260,7 @@ class SpectreAttention(Layer):
 
     def _band_update(self, gate: NDArray) -> NDArray:
         """
-        Toeplitz band update from the paper, g <- g + (t * g), where * is a
+        toeplitz band update from the paper, g <- g + (t * g), where * is a
         convolution along the frequency axis with 2r+1 complex taps per head.
         """
         banded = np.zeros_like(gate)
@@ -268,9 +268,12 @@ class SpectreAttention(Layer):
             banded += self.band_taps[:, index, None] * self._shift(gate, offset)
         return gate + banded
 
-    def forward(self, input_data: NDArray):
+    def forward(self, input_data: NDArray, mask: Optional[NDArray] = None):
         """
         input_data: (batch, sequence, hidden)
+        mask : (batch, sequence), 1 where a position is real content and 0
+            where it is padding. None treats every position as real, matching
+            the previous unmasked behavior.
         """
         assert input_data.ndim == 3, (
             f"expected (batch, sequence, hidden), got shape {input_data.shape}"
@@ -285,15 +288,23 @@ class SpectreAttention(Layer):
         )
 
         self.input = input_data
+        self.mask = (
+            mask.astype(GLOBAL_DTYPE) if mask is not None
+            else np.ones(input_data.shape[:2], dtype=GLOBAL_DTYPE)
+        )
+        # counts is the denom; it should always needs to be a minimum of 1
+        self.counts = np.maximum(self.mask.sum(axis=1, keepdims=True), 1.0)
+        mask_column = self.mask[..., None]
 
         query_forward = self.fc_query(input_data)
-        value_forward = self.fc_values(input_data)
+        value_forward = self.fc_values(input_data) * mask_column
 
-        # rfft along the SEQUENCE axis, cached for the backward pass
+        # rfft along the SEQUENCE axis, cached for the backward pass. Padded
+        # positions are zeroed above, so they contribute nothing to the mix.
         self.value_transform = np.fft.rfft(value_forward, axis=1)
 
-        # pool the query over the sequence, then LN over the feature axis
-        self.seq_mu = np.mean(query_forward, axis=1)
+        # pool the query over real positions only, then LN over the feature axis
+        self.seq_mu = (query_forward * mask_column).sum(axis=1) / self.counts
         descriptor = self.norm_query(self.seq_mu)
 
         # two layer MLP to the complex gate, one gate per head
@@ -310,7 +321,6 @@ class SpectreAttention(Layer):
         else:
             self.gate = self.gate_activated
 
-        # diagonal gating, one scalar per frequency across each head's channels
         values_gated = self._split_heads(self.value_transform) * self._align_gate(
             self.gate
         )
@@ -323,6 +333,7 @@ class SpectreAttention(Layer):
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         sequence = incoming_gradient.shape[1]
+        mask_column = self.mask[..., None]
 
         dvalues_gated = self._split_heads(
             irfft_adjoint(incoming_gradient, self.sequence_length, axis=1)
@@ -343,7 +354,7 @@ class SpectreAttention(Layer):
                 np.sum(
                     dgate * np.conj(self._shift(self.gate_activated, offset)),
                     axis=(0, 2),
-                )
+                    )
                 for offset in self.band_offsets
             ], axis=-1)
             dgate_activated = dgate + sum(
@@ -368,12 +379,15 @@ class SpectreAttention(Layer):
         ddescriptor = self.fc_1.backward(dhidden)
         dseq_mu = self.norm_query.backward(ddescriptor)
 
-        # the pool was a mean, so the gradient spreads evenly back over the sequence
-        dquery = np.repeat(dseq_mu[:, None, :], sequence, axis=1) / sequence
+        # the pool was a masked mean, so the gradient spreads only to the real
+        # positions that contributed to it, each getting its 1/count share
+        dquery = mask_column * (dseq_mu[:, None, :] / self.counts[..., None])
 
         dinput_from_q = self.fc_query.backward(dquery)
 
-        dvalues = rfft_adjoint(dV_hat, self.sequence_length, axis=1)
+        # the value path was masked before the FFT, so the same mask gates
+        # its gradient back to fc_values
+        dvalues = rfft_adjoint(dV_hat, self.sequence_length, axis=1) * mask_column
         dinput_from_v = self.fc_values.backward(dvalues)
 
         # the residual's own path: the identity carries the gradient straight
@@ -412,6 +426,8 @@ class SpectreAttention(Layer):
         self.gate_activated = None
         self.gate = None
         self.output = None
+        self.mask = None
+        self.counts = None
         self.norm_query.purge()
         self.fc_query.purge()
         self.fc_values.purge()
@@ -470,22 +486,10 @@ class CausalSpectreAttention(SpectreAttention):
     """
     causal SPECTRE with the Prefix-FFT cache, https://arxiv.org/abs/2502.18394
 
-    Forward is the parallel teacher-forced path, and is exact rather than an
-    approximation of the incremental one -- position t is reconstructed from
-    the prefix ending at t, which is the diagonal of the inverse transform.
-    Unlike the encoder it accepts any length up to the transform length, since
-    a shorter prefix is just the zero padded one. prefill and decode_step run
-    the same arithmetic a token at a time for generation.
-
-    Residual, as in the parent: the layer returns its input plus the mixing.
-    It sits inside _run_prefix and decode_step rather than in forward, so all
-    three entry points agree on what the layer's output is.
-
-    The drafting path in DFlashSpectreAttention has its own, around the block
-    MLP. Its mixer slots are learned constants rather than positions of an input
-    sequence, so there is no input there to carry forward.
+    forward is the parallel teacher-forced path; position t is reconstructed from
+    the prefix-cache ending at t, which is the diagonal of the inverse
+    prefill and decode_step run the same operations a token at a time for generation.
     """
-
     def __init__(self,
                  sequence_length: int,
                  hidden_dim: int,
