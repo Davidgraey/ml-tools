@@ -494,22 +494,46 @@ class CausalSpectreAttention(SpectreAttention):
                  sequence_length: int,
                  hidden_dim: int,
                  num_heads: int = 1,
-                 band_radius: int = 0):
+                 band_radius: int = 0,
+                 max_frequency: Optional[int] = None):
         super().__init__(sequence_length, hidden_dim, num_heads, band_radius)
+
+        super().__init__(sequence_length, hidden_dim, num_heads, band_radius)
+
+        full_frequencies = self.num_frequencies
+        if max_frequency is not None and max_frequency < full_frequencies:
+            self.num_frequencies = max_frequency
+            # the gate's width is tied to num_frequencies, so the projection
+            # and its bias -- sized by the parent for the full spectrum --
+            # need rebuilding at the truncated width
+            self.activation_bias = np.zeros(
+                (num_heads, self.num_frequencies), dtype=GLOBAL_DTYPE
+            ) - 0.1
+            self.fc_2 = FullyConnectedLayer(
+                ni=hidden_dim,
+                no=2 * num_heads * self.num_frequencies,
+                activation_type="linear",
+            )
+            self.zero_gradients()  # reseed gradient_bias/fc_2 at the new shape
 
         positions = np.arange(sequence_length)[:, None]
         frequencies = np.arange(self.num_frequencies)[None, :]
         self.twiddle = np.exp(
             -2j * np.pi * frequencies * positions / sequence_length
-        )
+        ).astype(np.complex64)
 
-        # irfft folds the conjugate pairs back in
+        # irfft folds the conjugate pairs back in. The Nyquist correction
+        # only applies at the true last bin -- if we truncated, the kept bin
+        # at index -1 is an ordinary frequency, not Nyquist, so it keeps the
+        # standard factor of 2 rather than being corrected to 1
         hermitian = np.full(self.num_frequencies, 2.0)
         hermitian[0] = 1.0
-        if sequence_length % 2 == 0:  # evens == 1
+        if sequence_length % 2 == 0 and self.num_frequencies == full_frequencies:
             hermitian[-1] = 1.0
         self.hermitian = hermitian
-        self.inverse_basis = hermitian * np.conj(self.twiddle) / sequence_length
+        self.inverse_basis = (
+                hermitian * np.conj(self.twiddle) / sequence_length
+        ).astype(np.complex64)
 
         self.prefix_spectrum = None
         self.prefix_counts = None

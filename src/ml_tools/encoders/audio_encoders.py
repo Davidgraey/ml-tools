@@ -11,6 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 from typing import Optional
 from scipy.io import wavfile
+from scipy.signal import decimate
 import matplotlib.pyplot as plt
 
 from ml_tools.encoders.encoders import Processor
@@ -18,6 +19,79 @@ from ml_tools.utilities import rolling_windows_nd, standardize_data
 
 
 EPSILON = 1e-12
+
+
+def downsample_sequence(
+    data: NDArray, factor: int, mask: Optional[NDArray] = None
+) -> tuple[NDArray, Optional[NDArray]]:
+    """
+    Downsample one step along the sequence axis, with anti-aliasing.
+
+    Parameters
+    ----------
+    data : (batch, sequence, hidden)
+    factor : integer decimation factor. scipy recommends chaining factors of
+        13 or less rather than using one large factor.
+    mask : optional (batch, sequence) or (batch, sequence, 1), 1 for real
+        content, 0 for padding. A downsampled position is marked real if any
+        of the original positions it covers were real -- with right-padding,
+        that is exactly the positions before the true length.
+
+    Returns
+    -------
+    downsampled data, and the corresponding downsampled mask (or None)
+    """
+    assert data.ndim == 3, f"expected (batch, sequence, hidden), got {data.shape}"
+    assert factor >= 1, "factor must be a positive integer"
+
+    if factor == 1:
+        return data, mask
+
+    downsampled = decimate(data, factor, axis=1, zero_phase=True)
+
+    if mask is None:
+        return downsampled, None
+
+    positions = mask[..., 0] if mask.ndim == 3 else mask
+    sequence = positions.shape[1]
+    pad = (-sequence) % factor
+    if pad:
+        positions = np.pad(positions, ((0, 0), (0, pad)))
+    blocks = positions.reshape(positions.shape[0], -1, factor)
+    downsampled_mask = (blocks.sum(axis=-1) > 0).astype(mask.dtype)
+    downsampled_mask = downsampled_mask[:, :downsampled.shape[1]]
+
+    return downsampled, downsampled_mask
+
+
+def progressive_downsample(
+    data: NDArray, factors: list[int], mask: Optional[NDArray] = None
+) -> list[tuple[NDArray, Optional[NDArray]]]:
+    """
+    Build a resolution pyramid by chaining downsample_sequence.
+
+    Each level downsamples the PREVIOUS level's output rather than the
+    original data by a cumulative factor -- matching scipy's own guidance to
+    chain moderate factors, and reusing each level's filtering for the next.
+
+    Parameters
+    ----------
+    data : (batch, sequence, hidden)
+    factors : per-level downsampling factor, e.g. [2, 2, 2] for a
+        1x -> 1/2x -> 1/4x -> 1/8x pyramid
+    mask : optional (batch, sequence) or (batch, sequence, 1)
+
+    Returns
+    -------
+    list of (data, mask) pairs, from index 0 (full resolution) through the
+    last entry (most downsampled)
+    """
+    levels = [(data, mask)]
+    current_data, current_mask = data, mask
+    for factor in factors:
+        current_data, current_mask = downsample_sequence(current_data, factor, current_mask)
+        levels.append((current_data, current_mask))
+    return levels
 
 
 def read_wav(

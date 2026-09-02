@@ -20,6 +20,7 @@ things follow from that:
 # class body, where the name does not exist yet. Deferring annotations is what
 # makes that legal, and without it the module raises NameError on import.
 from __future__ import annotations
+import time
 
 import inspect
 from typing import Iterable, Optional
@@ -156,6 +157,7 @@ class NeuralNetwork:
         object.__setattr__(self, "_output", None)
         object.__setattr__(self, "training", True)
         object.__setattr__(self, "activations", {})
+        object.__setattr__(self, "_timings", {})
         object.__setattr__(self, "name", name or self.__class__.__name__)
 
         source = Node(INPUT_NAME, shape=tuple(input_shape))
@@ -263,7 +265,7 @@ class NeuralNetwork:
                     f"{len(positional)} inputs, got {given}"
                 )
 
-        # ***optional forward arguments are not edges***
+        # optional forward arguments are not edges
         # the declaration is compared against the edges
         declared = len(layer.shapes["input"])
         if given > declared:
@@ -394,6 +396,7 @@ class NeuralNetwork:
             content and 0 where it is padding. Delivered to whichever layers
             declare a `mask` parameter; every other layer is unaffected.
         """
+        start = time.perf_counter()
         output = self.output
         values = {self._input: x_data}
 
@@ -401,12 +404,15 @@ class NeuralNetwork:
             if node.is_source:
                 continue
             arguments = [values[source] for source in node.sources]
-            extra = {}
+            start = time.perf_counter()
             if node.accepts_training:
-                extra["training_now"] = self.training
-            if node.accepts_mask:
-                extra["mask"] = mask
-            values[node] = node.layer.forward(*arguments, **extra)
+                values[node] = node.layer.forward(
+                    *arguments, training_now=self.training
+                )
+            else:
+                values[node] = node.layer.forward(*arguments)
+            self._record_timing(node.name, "forward", time.perf_counter() - start)
+
 
         object.__setattr__(
             self, "activations", {node.name: value for node, value in values.items()}
@@ -417,6 +423,7 @@ class NeuralNetwork:
         """
         Navigate the gradient back through the graph
         """
+        start = time.perf_counter()
         gradients = {self.output: incoming_gradient}
 
         for node in reversed(self._nodes):
@@ -425,6 +432,7 @@ class NeuralNetwork:
                 continue
 
             returned = node.layer.backward(gradients.pop(node))
+            self._record_timing(node.name, "backward", time.perf_counter() - start)
             parts = returned if len(node.sources) > 1 else (returned,)
 
             if len(parts) != len(node.sources):
@@ -443,6 +451,50 @@ class NeuralNetwork:
 
     def __call__(self, x_data: NDArray) -> NDArray:
         return self.forward(x_data)
+
+    def _record_timing(self, name: str, phase: str, elapsed: float) -> None:
+        entry = self._timings.setdefault(
+            name, {"forward_total": 0.0, "forward_calls": 0,
+                   "backward_total": 0.0, "backward_calls": 0}
+        )
+        entry[f"{phase}_total"] += elapsed
+        entry[f"{phase}_calls"] += 1
+
+    def reset_timings(self) -> None:
+        """clear accumulated per-node timing, e.g. between epochs"""
+        object.__setattr__(self, "_timings", {})
+
+    def timing_summary(self, top: Optional[int] = None) -> str:
+        """
+        Per-node timing, sorted by total forward+backward time descending.
+
+        Parameters
+        ----------
+        top : only show this many nodes; None shows every timed node
+        """
+        rows = [
+            (name, entry["forward_total"], entry["forward_calls"],
+             entry["backward_total"], entry["backward_calls"])
+            for name, entry in self._timings.items()
+        ]
+        rows.sort(key=lambda row: row[1] + row[3], reverse=True)
+        if top is not None:
+            rows = rows[:top]
+
+        width = max((len(name) for name, *_ in rows), default=4)
+        lines = [f"{self.name}: per-node timing"]
+        lines.append(
+            f"  {'node'.ljust(width)}  {'fwd avg (ms)':>13} {'fwd total (s)':>14} "
+            f"{'bwd avg (ms)':>13} {'bwd total (s)':>14}"
+        )
+        for name, fwd_total, fwd_calls, bwd_total, bwd_calls in rows:
+            fwd_avg = (fwd_total / fwd_calls * 1000) if fwd_calls else 0.0
+            bwd_avg = (bwd_total / bwd_calls * 1000) if bwd_calls else 0.0
+            lines.append(
+                f"  {name.ljust(width)}  {fwd_avg:13.3f} {fwd_total:14.4f} "
+                f"{bwd_avg:13.3f} {bwd_total:14.4f}"
+            )
+        return "\n".join(lines)
 
     # ------------- inspection
     def edges(self) -> list[tuple[str, str]]:
