@@ -10,7 +10,7 @@ class VotingBase(Layer):
     Shared plumbing for the mixture voting layers --
     """
 
-    # softmax votes already sum to one, so a top-k mask has to be renormalised
+    # softmax votes already sum to one, so a top-k mask has to be renormalized
     # to stay a distribution. Independent sigmoid votes never summed to one and
     # must not be.
     renormalize: bool = False
@@ -23,10 +23,7 @@ class VotingBase(Layer):
             f"vote, got {top_k}"
         )
         assert not (self.renormalize and top_k == 1), (
-            "top_k=1 on a renormalised vote is untrainable: the one surviving "
-            "vote is divided by itself, so the layer emits a constant one and "
-            "its gradient is exactly zero. Use top_k >= 2, or a VotingWeight, "
-            "whose votes are independent and so are never renormalised."
+            "top_k=1 on a renormalised vote is untrainable, increase topk"
         )
         self.input_shape = input_shape
         self.num_experts = num_experts
@@ -271,6 +268,7 @@ class PoolingLayer(Layer):
 
     def get_weights(self):
         return None
+    
 
     def get_gradients(self) -> dict[str, NDArray]:
         return {}

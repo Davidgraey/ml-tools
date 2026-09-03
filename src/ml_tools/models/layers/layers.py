@@ -1,9 +1,11 @@
 import numpy as np
 import ml_tools.models.activations as activations
-from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON
+from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON, ANY_SHAPE
 from numpy.typing import NDArray
 from abc import ABC, abstractmethod
 from typing import Optional, Callable
+import warnings
+import inspect
 
 
 # -------------    weight initilization functions    ---------------
@@ -30,108 +32,6 @@ weight_init = {
     "tanh": xavier,
     "softmax": xavier,
 }
-
-
-# Real-to-real spectral transform, cas(t) = cos(t) + sin(t), which is
-# Re(X) - Im(X) of the ordinary DFT.
-def hartley(x_array: NDArray, axis: int = -1) -> NDArray:
-    x_freq = np.fft.fft(x_array, axis=axis)
-    return x_freq.real - x_freq.imag
-
-
-def hartley_2d(x_array: NDArray, axes: tuple = (-2, -1)) -> NDArray:
-    x_freq = np.fft.fft2(x_array, axes=axes)
-    return x_freq.real - x_freq.imag
-
-
-# ------------------------------------------------------------------
-ANY_SHAPE = (None,)
-
-
-class Layer(ABC):
-    # set by layers whose output is their input at the same shape. They have no
-    # width of their own to declare, so they pass the incoming one through
-    # instead of dropping it and blinding everything downstream.
-    preserves_shape: bool = False
-
-    def __init__(self):
-        super().__init__()
-        self.RNG = np.random.RandomState(42)
-        self.declare_shapes()
-
-    def declare_shapes(self, inputs=(ANY_SHAPE,), outputs=(ANY_SHAPE,)) -> None:
-        """
-        Record what this layer accepts and emits, in trailing-axis form.
-
-        Called from __init__ once the layer's widths are known. Both arguments
-        are tuples OF shapes, one per positional argument of forward, so a merge
-        layer declares two inputs and a split layer two outputs.
-        """
-        self._in_shapes = tuple(inputs)
-        self._out_shapes = tuple(outputs)
-
-    @property
-    def shapes(self) -> dict[str, tuple[tuple, ...]]:
-        """
-        The layer's declared input and output shapes.
-
-        Declared, not observed: these are known at construction, before any
-        data flows, which is what lets the graph check an edge at the line that
-        wires it rather than on the first forward pass. None marks an axis the
-        layer leaves free.
-        """
-        return {"input": self._in_shapes, "output": self._out_shapes}
-
-    def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
-        """
-        Resolve the output shapes given what actually arrives.
-
-        The default is the declaration, which is right for every layer whose
-        output width is fixed at construction. Layers that derive their width
-        from their inputs -- a concatenation, say -- override this so the shape
-        keeps flowing downstream instead of going unknown.
-
-        One shape out per output, whatever the number of inputs. A
-        shape-preserving layer passes its first input's shape through rather
-        than the whole tuple, so the count returned still matches what the
-        layer declares it emits.
-        """
-        if self.preserves_shape:
-            return (input_shapes[0],)
-        return self._out_shapes
-
-    @abstractmethod
-    def forward(self, x: NDArray) -> NDArray:
-        pass
-
-    @abstractmethod
-    def backward(self, x: NDArray) -> NDArray:
-        pass
-
-    def get_weights(self) -> NDArray:
-        pass
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        pass
-
-    @abstractmethod
-    def update_weights(self, **kwargs) -> None:
-        pass
-
-    @abstractmethod
-    def purge(self) -> None:
-        pass
-
-    @abstractmethod
-    def zero_gradients(self) -> None:
-        pass
-
-    @property
-    def num_parameters(self) -> int:
-        pass
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
 
 
 def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
@@ -162,6 +62,143 @@ def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
                 f"is {made} against {wanted}"
             )
     return None
+
+
+# ------------------------------------------------------------------
+class Layer(ABC):
+    preserves_shape: bool = False
+
+    def __init__(self):
+        super().__init__()
+        self.RNG = np.random.RandomState(42)
+        self.declare_shapes()
+        registry_name: Optional[str] = None
+        _registry: dict[str, type] = {}
+
+        # TODO: confirm this behavioral works with new or renames
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__(**kwargs)
+            name = cls.registry_name or cls.__name__
+            if name in Layer._registry and Layer._registry[name] is not cls:
+                warnings.warn(f"layer name {name} redefined; keeping the latest class")
+            Layer._registry[name] = cls
+
+    def declare_shapes(self, inputs=(ANY_SHAPE,), outputs=(ANY_SHAPE,)) -> None:
+        """
+        record what this layer accepts and emits; via trailing-axis
+        """
+        self._in_shapes = tuple(inputs)
+        self._out_shapes = tuple(outputs)
+
+    @property
+    def shapes(self) -> dict[str, tuple[tuple, ...]]:
+        """
+        The layer's declared (NOT OBSERVED) input and output shapes.
+        """
+        return {"input": self._in_shapes, "output": self._out_shapes}
+
+    def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
+        """
+        resolve the output shapes given what actually arrives
+        """
+        if self.preserves_shape:
+            return (input_shapes[0],)
+        return self._out_shapes
+
+    @abstractmethod
+    def forward(self, x: NDArray) -> NDArray:
+        pass
+
+    @abstractmethod
+    def backward(self, x: NDArray) -> NDArray:
+        pass
+
+    @abstractmethod
+    def get_weights(self, for_serialize: bool) -> NDArray|dict[str, dict]:
+        pass
+
+    def set_weights(self, weights: dict) -> None:
+        if not isinstance(weights, dict):
+            raise NotImplementedError(
+                f"{self.__class__.__name__} has weights but hasn't "
+                "implemented set_weights processes restore them"
+            )
+
+    @abstractmethod
+    def get_gradients(self) -> dict[str, NDArray]:
+        pass
+
+    def get_config(self) -> dict:
+        """
+        Reviews the class signature for set values
+        """
+        parameters = inspect.signature(self.__class__.__init__).parameters
+        return {
+            name: getattr(self, name)
+            for name in parameters
+            if name != "self" and hasattr(self, name)
+        }
+
+    @abstractmethod
+    def update_weights(self, **kwargs) -> None:
+        pass
+
+    @abstractmethod
+    def purge(self) -> None:
+        pass
+
+    @abstractmethod
+    def zero_gradients(self) -> None:
+        pass
+
+    @property
+    def num_parameters(self) -> int:
+        pass
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def serialize(self) -> dict:
+        """
+        package identity, hyperparameters, and weights into a plain dict
+        config and weights are kept as separate keys deliberately
+
+        config is what has to keep working if this class's constructor changes later
+        weights are just arrays with no dependency on the class at all
+        """
+        return {
+            "type": self.registry_name or self.__class__.__name__,
+            "config": self.get_config(),
+            "weights": self.get_weights(for_serialize=True),
+        }
+
+    @classmethod
+    def deserialize(cls, serialized_dict: dict) -> "Layer":
+        """
+        rebuild a layer from serialize() output
+
+        Saved config is filtered against the CURRENT constructor's accepted in case of changes
+
+        """
+        layer_cls = cls._registry.get(serialized_dict["type"])
+        if layer_cls is None:
+            raise KeyError(f"no layer registered as {serialized_dict['type']!r}. Known: {sorted(cls._registry)}")
+
+        accepted = inspect.signature(layer_cls.__init__).parameters
+        config = {k: v for k, v in serialized_dict["config"].items() if k in accepted}
+        # identify any keys / params that are different - lost or changed
+        dropped = set(serialized_dict["config"]) - set(config)
+
+        if dropped:
+            warnings.warn(f"{serialized_dict['type']}: dropping saved config keys: {sorted(dropped)}")
+
+        layer = layer_cls(**config)
+
+        try:
+            layer.set_weights(serialized_dict["weights"])
+        except (ValueError, NotImplementedError) as error:
+            warnings.warn(f"{serialized_dict['type']}: could not instantiate weights -- {error}")
+        return layer
 
 
 # TODO: build ENUMS for activations
@@ -293,8 +330,15 @@ class FullyConnectedLayer(Layer):
         self.gradient_weights = None
         self.gradient_bias = None
 
-    def get_weights(self):
+    def get_weights(self, for_serialize: bool = False):
+        if for_serialize:
+            return {"bias": self.bias, "weights": self.weights}
         return np.concatenate([self.bias.ravel(), self.weights.ravel()])
+
+    def set_weights(self, weights: dict) -> None:
+        if weights is not None:
+            self.bias = np.asarray(weights["bias"], dtype=GLOBAL_DTYPE)
+            self.weights = np.asarray(weights["weights"], dtype=GLOBAL_DTYPE)
 
     def get_gradients(self) -> dict[str, NDArray]:
         return {
@@ -317,8 +361,6 @@ class FullyConnectedLayer(Layer):
         return f"{self.shape}, using {self.activation}"
 
 
-# TODO: FUTURE - add below layer types : As we add more layer types, we will have to change our cascade assembly
-# construction slightly to better differentiate type.
 class DropoutLayer(Layer):
     """Hinton style or simple bool mask Dropout layer with scaling outputs"""
 
@@ -363,6 +405,9 @@ class DropoutLayer(Layer):
     def update_weights(self) -> None:
         pass
 
+    def set_weights(self, weights: dict) -> None:
+        pass
+
     def purge(self) -> None:
         """
         resets values tracked during training to zero - an inplace func
@@ -371,7 +416,9 @@ class DropoutLayer(Layer):
         self.mask = None
         self.gradient = np.empty(shape=(1, 1))
 
-    def get_weights(self):
+    def get_weights(self, for_serialize: bool = False):
+        if for_serialize:
+            return {}
         return None
 
     def get_gradients(self)  -> dict[str, NDArray]:
@@ -465,7 +512,9 @@ class NormalizeLayer(Layer):
         self.gradient_beta = None
         self.gradient_gamma = None
 
-    def get_weights(self) -> tuple[NDArray, NDArray]:
+    def get_weights(self, for_serialize: bool = False):
+        if for_serialize:
+            return {"shift_beta": self.shift_beta, "scale_gamma": self.scale_gamma}
         return (self.shift_beta, self.scale_gamma)
 
     def get_gradients(self) -> dict[str, NDArray]:
@@ -475,6 +524,12 @@ class NormalizeLayer(Layer):
             "gradient_beta": self.gradient_beta,
             "gradient_gamma": self.gradient_gamma,
         }
+
+    def set_weights(self, weights: dict) -> None:
+        if weights is not None:
+
+            self.shift_beta = np.asarray(weights["shift_beta"], dtype=GLOBAL_DTYPE)
+            self.scale_gamma = np.asarray(weights["scale_gamma"], dtype=GLOBAL_DTYPE)
 
     @property
     def num_parameters(self) -> int:
@@ -547,8 +602,14 @@ class RMSNormLayer(Layer):
         self.rms = None
         self.gradient_gamma = None
 
-    def get_weights(self) -> NDArray:
+    def get_weights(self, for_serialize: bool = False) -> NDArray:
+        if for_serialize:
+            return {"scale_gamma": self.scale_gamma}
         return self.scale_gamma
+
+    def set_weights(self, weights: dict) -> None:
+        if weights is not None:
+            self.scale_gamma = np.asarray(weights["scale_gamma"], dtype=GLOBAL_DTYPE)
 
     def get_gradients(self) -> dict[str, NDArray]:
         return {"gradient_gamma": self.gradient_gamma}
@@ -566,298 +627,79 @@ class RMSNormLayer(Layer):
     def __repr__(self):
         return self.__str__()
 
+class PersistentMemory(Layer):
+    """
+    Learned, fixed-width context that is persisted
+    per SPECTRE's persistent-memory extension
 
-class FrequencyFFT(Layer):
-    def __init__(self, max_sequence_length: int, window_size: int):
-        """
-        Seting up a process for FFT transformations of windows of audio data - expecting data of 1 size batch,
-        Preprocessing assumed: sliding windows or patches.
-        shape -> (number_of_windows, samples per window)
+    holds M, shape (num_memory, hidden_dim), trained jointly with the model.
 
-        We utilize a blackamn kernel to "ease in and out" -- frequency jumps from non-zero starts can give artifacts. Common for FFT / DFT application
+    Forward takes no input and backward does not propagate further
+    Used internally by SpectreAttention/ CausalSpectreAttention.
+    it folds its contribution directly into the frequency-domain quantities
+    they already accumulate.
+    """
 
-        The transform is a discrete Hartley, not Re(fft). Re(fft) is blind to
-        the circularly-odd part of the window, so phase information is lost
-        and distinct windows collapse to the same output. Hartley is full rank
-        and stays in real arithmetic, at the cost of a window_size wide output
-        rather than window_size // 2 + 1.
-        Parameters
-        ----------
-        max_sequence_length : the MAXIMUM supported sequence length - (windows)
-        window_size : the number of samples in a window
-        """
+    preserves_shape = False
+
+    def __init__(self, num_memory: int, hidden_dim: int):
         super().__init__()
-        self.max_sequence_length: int = max_sequence_length
-        self.window_size: int = window_size
-        self.window_kernel: NDArray = np.blackman(window_size)
-        # (windows, samples per window), the window count left free since the
-        # constructor only fixes its ceiling
-        self.declare_shapes(
-            inputs=((window_size,),), outputs=((window_size,),)
-        )
+        assert num_memory >= 0, "num_memory must be zero or positive"
+        self.num_memory = num_memory
+        self.hidden_dim = hidden_dim
+        self.declare_shapes(inputs=(), outputs=((hidden_dim,),))
 
-    def forward(self, incoming_x: NDArray) -> NDArray:
+
+        self.memory = xavier(self.RNG, ni=num_memory, no=hidden_dim).astype(GLOBAL_DTYPE)
+
+        self.zero_gradients()
+
+    def forward(self) -> NDArray:
+        """returns the current memory bank; there is no input to consume"""
+        return self.memory
+
+    def backward(self, incoming_gradient: NDArray) -> None:
         """
-        Forward process for the Hartley transform
-        Parameters
-        ----------
-        incoming_x : Numpy array of (number_of_windows, samples per window)
-
-        Returns
-        -------
-        the Hartley transform of windowed_data, same width as the window
+        assigns (not accumulates) the gradient, matching every other layer's
+        per-call overwrite convention -- the owning attention layer sums any
+        multiple contributions (query path, value path) before calling this
+        once, rather than relying on repeated calls to add up correctly
         """
-        self.in_shape = incoming_x.shape
-
-        assert self.in_shape[0] <= self.max_sequence_length, f"Shapes don't match in {self}"
-        assert self.in_shape[-1] == self.window_size, (
-            f"last axis must equal window_size {self.window_size}, "
-            f"got {self.in_shape[-1]}"
-        )
-
-        self.input = incoming_x.reshape(-1, self.in_shape[-1])
-        self.output = hartley(self.window_kernel * self.input, axis=-1)
-
-        return self.output.reshape(self.in_shape)
-
-    def backward(self, incoming_grad: NDArray) -> NDArray:
-        """
-        Hartley is its own adjoint, so the backward pass is the same
-        transform followed by the same window weighting.
-        """
-        _grad = incoming_grad.reshape(-1, self.in_shape[-1])
-
-        grad = self.window_kernel * hartley(_grad, axis=-1)
-        return grad.reshape(self.in_shape)
-
-    def purge(self) -> None:
-        self.input = None
-        self.output = None
-
-    def get_weights(self):
+        self.gradient_memory = incoming_gradient
         return None
 
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {}
+    def update_weights(self, gradient_memory: NDArray) -> None:
+        self.memory -= gradient_memory
+
+    def purge(self) -> None:
+        pass
 
     def zero_gradients(self) -> None:
-        pass
+        self.gradient_memory = np.zeros_like(self.memory)
 
-    def update_weights(self, **kwargs) -> None:
-        pass
+    def get_weights(self, for_serialization: bool = False) -> NDArray:
+        if for_serialization:
+            return {"memory": self.memory}
+        return self.memory
+
+    def set_weights(self, weights: dict) -> None:
+        if weights is not None:
+            self.memory = np.asarray(weights["memory"], dtype=GLOBAL_DTYPE)
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        if self.num_memory == 0:
+            return {}
+        return {"gradient_memory": self.gradient_memory}
 
     @property
     def num_parameters(self) -> int:
-        return 0
+        return self.memory.size
 
+    def __str__(self):
+        return f"PersistentMemory, {self.num_memory} slots over {self.hidden_dim}"
 
-class FourierLayer(Layer):
-    #  https://ieeexplore.ieee.org/document/9616294
-    preserves_shape = True
-
-    def __init__(self, use_2d:bool = True):
-        super().__init__()
-        self.use_2d = use_2d
-
-        if use_2d == True:
-            self.fft_axes = (-2, -1)
-        else:
-            self.fft_axes = -1
-
-    def forward(self, incoming_x: NDArray) -> NDArray:
-        """
-        Hartley rather than Re(fft). Re(fft) drops the circularly-odd part
-        of the input, so it is rank deficient and cannot be inverted by
-        InverseFourierLayer. Hartley keeps every component in real space
-        and preserves the input shape on both branches.
-        """
-        self.input = incoming_x
-
-        if not self.use_2d:
-            self.output = hartley(incoming_x, axis=self.fft_axes)
-
-        elif self.use_2d:
-            self.output = hartley_2d(incoming_x, axes=self.fft_axes)
-
-        return self.output
-
-    def backward(self, incoming_grad: NDArray) -> NDArray:
-        """Hartley is symmetric, so the adjoint is the same transform."""
-        if not self.use_2d:
-            self.gradient = hartley(incoming_grad, axis=self.fft_axes)
-        elif self.use_2d:
-            self.gradient = hartley_2d(incoming_grad, axes=self.fft_axes)
-
-        return self.gradient
-
-    def purge(self) -> None:
-        self.input = None
-        self.output = None
-        self.gradient = None
-
-    def get_weights(self):
-        return None
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {} # TODO: return? self.gradient
-
-    def zero_gradients(self) -> None:
-        pass
-
-    def update_weights(self, **kwargs) -> None:
-        pass
-
-    @property
-    def num_parameters(self) -> int:
-        return 0
-
-
-class InverseFourierLayer(Layer):
-    # https://arxiv.org/pdf/2502.18394
-    preserves_shape = True
-
-    def __init__(self, use_2d:bool = True):
-        super().__init__()
-        self.use_2d = use_2d
-
-        if use_2d == True:
-            self.fft_axes = (-2, -1)
-        else:
-            self.fft_axes = -1
-
-    def forward(self, incoming_x: NDArray) -> NDArray:
-        """
-        Hartley is its own inverse up to 1/N, so the inverse direction is
-        the same transform carrying that scale. Stacking this on top of
-        FourierLayer reconstructs the input exactly.
-        """
-        self.input = incoming_x
-        self.scale = self._scale(incoming_x.shape)
-
-        if not self.use_2d:
-            self.output = hartley(incoming_x, axis=self.fft_axes) / self.scale
-
-        elif self.use_2d:
-            self.output = hartley_2d(incoming_x, axes=self.fft_axes) / self.scale
-
-        return self.output
-
-    def backward(self, incoming_grad: NDArray) -> NDArray:
-        """Symmetric transform, so the adjoint carries the same 1/N."""
-        if not self.use_2d:
-            self.gradient = hartley(incoming_grad, axis=self.fft_axes) / self.scale
-        elif self.use_2d:
-            self.gradient = hartley_2d(incoming_grad, axes=self.fft_axes) / self.scale
-
-        return self.gradient
-
-    def _scale(self, shape: tuple) -> int:
-        if self.use_2d:
-            return shape[-2] * shape[-1]
-        return shape[-1]
-
-    def purge(self) -> None:
-        self.input = None
-        self.output = None
-        self.gradient = None
-
-    def get_weights(self):
-        return None
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {} # TODO: return? self.gradient
-
-    def zero_gradients(self) -> None:
-        pass
-
-    def update_weights(self, **kwargs) -> None:
-        pass
-
-    @property
-    def num_parameters(self) -> int:
-        return 0
-
-
-#
-#
-# # ====== ==================================================================
-# # TODO: WIP below
-#
-#
-# class EmbeddingLayer(Layer):
-#     def __init__(
-#         self, ni: int, cardinality: int, embedding_dim: int, trainable: bool = True
-#     ):
-#         super().__init__()
-#         self.ni: int = ni
-#         self.cardinality: int = cardinality
-#         self.embedding_dim: int = embedding_dim
-#
-#         self.projection = self.RNG.uniform(size=(cardinality, embedding_dim))
-#         self.gradient = np.zeros_like(self.projection)
-#
-#     def forward(self, incoming_x: NDArray) -> NDArray:
-#         if incoming_x.dtype != np.int:
-#             _x = incoming_x.astype(int)
-#
-#         assert _x.dtype == np.int_
-#         self.input = _x.copy()
-#
-#         # straight indexing
-#         outs = self.projection[_x]
-#         self.output = outs
-#
-#         return outs
-#
-#     def backward(self, incoming_grad: NDArray) -> NDArray:
-#         self.gradient = np.zeros_like(self.projection)
-#
-#         # inplace operation - "assign" the gradients to their input variable
-#         np.add.at(self.gradient, self.input, incoming_grad)
-#
-#         # self.update_weights(self.gradient)
-#         return self.input
-#
-#     def update_weights(self, value: NDArray) -> None:
-#         self.projection += value
-#
-#     @property
-#     def weights(self) -> NDArray:
-#         """alias"""
-#         return self.projection
-#
-#
-#
-#
-# class FourierLayer1D(Layer):
-#     #  https://ieeexplore.ieee.org/document/9616294
-#     def __init__(
-#         self, ni: int, no: int, window_count: int, sequence_length: int, hidden_dim: int
-#     ):
-#         super().__init__()
-#         self.ni = ni
-#         self.no = no
-#
-#         # self.positional_weights = self.RNG.uniform(size=(sequence_length))
-#         # self.frequency_weights = self.RNG.uniform(size=(hidden_dim))
-#
-#     def forward(self, x_data: NDArray):
-#         x_freq = np.fft.fft2(x_data, axes=(-2, -1)).real
-#         # scale, constrain or norm?
-#
-#         # x_out = np.fft.ifft2(reweighted, axes=(-2, -1)).real
-#
-#         # return normed(x_data + x_out)
-#
-#         # x = x @ W_linear
-#
-#     def backward(self, incoming_grad):
-#         complex_delta = incoming_grad.astype(np.complex128)
-#
-#         self.gradient = np.fft.ifft(complex_delta, axis=self.axis).real
-#
-#         self.update_weigupdate_weighthts()
-
+    def __repr__(self):
+        return self.__str__()
 
 if __name__ == "__main__":    ## working example -- train--- -- MOVE TO TESTS!
     from ml_tools.models.model_loss import MSELoss

@@ -4,6 +4,7 @@ from numpy.typing import NDArray
 
 GLOBAL_DTYPE = np.float32
 EPSILON = 1e-15
+ANY_SHAPE = (None,)
 
 # TOLERANCES AND LIMITS FOR SCALED CONJUGATE GRADIENT DESCENT (scg_regression)
 FLOAT_TOLERANCE = 1e-30
