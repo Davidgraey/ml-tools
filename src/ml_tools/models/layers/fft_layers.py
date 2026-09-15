@@ -1,5 +1,5 @@
 import numpy as np
-from ml_tools.models.layers import Layer
+from ml_tools.models.layers.layers import Layer, FullyConnectedLayer, NormalizeLayer
 import ml_tools.models.activations as activations
 from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON, ANY_SHAPE
 from numpy.typing import NDArray
@@ -235,3 +235,109 @@ class InverseFourierLayer(Layer):
     @property
     def num_parameters(self) -> int:
         return 0
+
+
+class FourierAttention(Layer):
+    def __init__(self, ni: int, no: int, use_2d: bool = True):
+        super().__init__()
+        assert ni == no, (
+            f"the feed forward residual needs matching widths, got ni={ni} no={no}"
+        )
+        self.fftlayer = FourierLayer(use_2d)
+        self.norm_a = NormalizeLayer(ni=ni, shift_scale=False)
+        self.fc = FullyConnectedLayer(ni=ni, no=no, activation_type="relu")
+        self.norm_b = NormalizeLayer(ni=no, shift_scale=True)
+        self.declare_shapes(inputs=((ni,),), outputs=((no,),))
+
+    def forward(self, x_data: NDArray, training_now: bool):
+        if self.fftlayer.use_2d:
+            assert x_data.ndim >= 3, (
+                "use_2d mixes over the last two axes, which on a 2D "
+                f"(batch, hidden) input means mixing across the batch and "
+                f"leaking between samples. Got shape {x_data.shape}; pass "
+                "(batch, sequence, hidden) or use use_2d=False."
+            )
+        self.training_now = training_now
+        fft_x = self.norm_a(self.fftlayer(x_data) + x_data)
+
+        self.output = self.norm_b(self.fc(fft_x) + fft_x)
+
+        return self.output
+
+    def backward(self, incoming_gradient: NDArray):
+        grad = self.norm_b.backward(incoming_gradient)
+        # residual connections
+        grad_fc_out = grad
+        grad_skip_b = grad
+        # ---- fully connected ----
+        grad = self.fc.backward(grad_fc_out)
+        # accumulate skip connection
+        grad = grad + grad_skip_b
+
+        grad = self.norm_a.backward(grad)
+        # second residual connections
+        grad_fft = grad
+        grad_skip_a = grad
+        # ---- FFT Layer ----
+        grad = self.fftlayer.backward(grad_fft)
+
+        # accumulate skip connection
+        grad = grad + grad_skip_a
+
+        self.gradient = grad
+
+        return grad.real.astype(GLOBAL_DTYPE)
+
+    def purge(self):
+        self.fftlayer.purge()
+        self.norm_a.purge()
+        self.fc.purge()
+        self.norm_b.purge()
+
+    def get_weights(self, for_serialize: bool = False) -> tuple[NDArray]|dict:
+        if for_serialize:
+            return {"norm_a": self.norm_a.get_weights(),
+                    "fc": self.fc.get_weights(),
+                    "norm_b": self.norm_b.get_weights()
+                    }
+        return (
+            self.norm_a.get_weights(),
+            self.fc.get_weights(),
+            self.norm_b.get_weights(),
+        )
+
+    def set_weights(self, weights: dict) -> None:
+        if weights is not None:
+            self.norm_a.set_weights(weights["norm_a"])
+            self.fc.set_weights(weights["fc"])
+            self.norm_b.set_weights(weights["norm_b"])
+
+    def get_gradients(self) -> dict[str, NDArray] | None:
+        return {
+            "norm_a": self.norm_a.get_gradients(),
+            "fc": self.fc.get_gradients(),
+            "norm_b": self.norm_b.get_gradients(),
+        }
+
+    def zero_gradients(self):
+        self.norm_a.zero_gradients()
+        self.fc.zero_gradients()
+        self.norm_b.zero_gradients()
+
+    @property
+    def num_parameters(self) -> int:
+        return (
+            self.norm_a.num_parameters
+            + self.fc.num_parameters
+            + self.norm_b.num_parameters
+        )
+
+    def update_weights(
+        self,
+        norm_a: dict[str, NDArray],
+        fc: dict[str, NDArray],
+        norm_b: dict[str, NDArray],
+    ) -> None:
+        self.norm_a.update_weights(**norm_a)
+        self.fc.update_weights(**fc)
+        self.norm_b.update_weights(**norm_b)

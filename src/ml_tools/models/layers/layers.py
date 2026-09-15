@@ -1,6 +1,6 @@
 import numpy as np
 import ml_tools.models.activations as activations
-from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON, ANY_SHAPE
+from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON, ANY_SHAPE, GLOBAL_COMPLEX_DTYPE
 from numpy.typing import NDArray
 from abc import ABC, abstractmethod
 from typing import Optional, Callable
@@ -124,7 +124,6 @@ class Layer(ABC):
                 "implemented set_weights processes restore them"
             )
 
-    @abstractmethod
     def get_gradients(self) -> dict[str, NDArray]:
         pass
 
@@ -227,9 +226,9 @@ class FullyConnectedLayer(Layer):
         self.declare_shapes(inputs=((ni,),), outputs=((no,),))
 
         # these values will be rewritten or updated on each pass
+        self.input = np.empty(shape=(ni, no))
         self.output = np.empty(shape=(ni, no))
-        self.input = np.empty(shape=(1, ni))
-        self.gradient = np.empty(shape=(1, no))
+        self.z = np.empty(shape=(ni, no))
 
     def forward(
         self, incoming_x: NDArray, forced_activation: Optional[str] = None
@@ -252,10 +251,7 @@ class FullyConnectedLayer(Layer):
             f"weights: {self.weights.shape}"
         )
 
-        # flatten to 2D array
         self.input = incoming_x.reshape(-1, self.in_shape[-1])
-
-        # lienar forward
         self.z = self.input @ self.weights + self.bias
 
         if forced_activation is None:  # standard layer activation
@@ -268,7 +264,7 @@ class FullyConnectedLayer(Layer):
         self._used_activation = forced_activation or self.activation
         self.output = this_activation(self.z)
 
-        # back to 3D
+        # reshape the leading dimensions
         return self.output.reshape(*self.in_shape[:-1], -1)
 
     def backward(
@@ -290,17 +286,16 @@ class FullyConnectedLayer(Layer):
             this_derivative: Callable = activations.derivative_dictionary[
                 forced_activation
             ]
-        # reshape to 2D in case (batch, sequence, hidden)
-        _grad = incoming_grad.reshape(-1, incoming_grad.shape[-1])
 
-        delta = this_derivative(self.output, self.z, _grad)
+        delta = incoming_grad.reshape(-1, incoming_grad.shape[-1])
+        delta = this_derivative(self.output, self.z, delta)
 
         self.gradient_weights = self.input.T @ delta
         self.gradient_bias = delta.sum(axis=0, keepdims=True)
 
         final_grad = delta @ self.weights.T
 
-        return final_grad.reshape(*self.in_shape[:-1], self.weights.shape[0])
+        return final_grad.reshape(*self.in_shape[:-1], -1)
 
     def update_weights(self, gradient_bias: NDArray, gradient_weights: NDArray) -> None:
         """
@@ -487,12 +482,11 @@ class NormalizeLayer(Layer):
             pass
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        incoming_grad =  incoming_grad.reshape(-1, self.in_shape[-1])
+        original_shape = incoming_grad.shape
+        incoming_grad = incoming_grad.reshape(-1, original_shape[-1])
         if self.shift_scale == True:
             self.gradient_beta = np.sum(incoming_grad, axis=0, keepdims=True)
-            self.gradient_gamma = np.sum(
-                incoming_grad * self.x_norm, axis=0, keepdims=True
-            )
+            self.gradient_gamma = np.sum(incoming_grad * self.x_norm, axis=0, keepdims=True)
             z = incoming_grad * self.scale_gamma
         else:
             self.gradient_beta = None
@@ -500,10 +494,9 @@ class NormalizeLayer(Layer):
             z = incoming_grad
 
         gradient = (1.0 / self.std) * (
-                z - np.mean(z, axis=-1, keepdims=True) - self.x_norm * np.mean(z * self.x_norm, axis=-1,  keepdims=True)
+                z - np.mean(z, axis=-1, keepdims=True) - self.x_norm * np.mean(z * self.x_norm, axis=-1, keepdims=True)
         )
-
-        return gradient.reshape(self.in_shape)
+        return gradient.reshape(original_shape)
 
     def purge(self):
         self.input = None
@@ -568,30 +561,21 @@ class RMSNormLayer(Layer):
         self.rms = None
 
     def forward(self, incoming_x: NDArray) -> NDArray:
-        self.in_shape = incoming_x.shape
-
-        # reshape to 2D in case (batch, sequence, hidden)
-        self.input = incoming_x.reshape(-1, self.in_shape[-1])
-
-        self.rms = np.sqrt(
-            np.mean(self.input ** 2, axis=-1, keepdims=True) + self.eps
-        )
+        in_shape = incoming_x.shape
+        self.input = incoming_x.reshape(-1, in_shape[-1])
+        self.rms = np.sqrt(np.mean(self.input ** 2, axis=-1, keepdims=True) + self.eps)
         self.x_norm = self.input / self.rms
-        output = self.x_norm * self.scale_gamma
-
-        return output.reshape(self.in_shape)
+        return (self.x_norm * self.scale_gamma).reshape(in_shape)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        _grad = incoming_grad.reshape(-1, self.in_shape[-1])
+        original_shape = incoming_grad.shape
 
-        self.gradient_gamma = np.sum(_grad * self.x_norm, axis=0, keepdims=True)
+        grad = incoming_grad.reshape(-1, original_shape[-1])
+        self.gradient_gamma = np.sum(grad * self.x_norm, axis=0, keepdims=True)
 
-        z = _grad * self.scale_gamma
-        gradient = (
-            z - self.x_norm * np.mean(z * self.x_norm, axis=-1, keepdims=True)
-        ) / self.rms
-
-        return gradient.reshape(self.in_shape)
+        z = grad * self.scale_gamma
+        gradient = (z - self.x_norm * np.mean(z * self.x_norm, axis=-1, keepdims=True)) / self.rms
+        return gradient.reshape(original_shape)
 
     def update_weights(self, gradient_gamma: NDArray) -> None:
         self.scale_gamma -= gradient_gamma
@@ -623,80 +607,6 @@ class RMSNormLayer(Layer):
 
     def __str__(self):
         return f"RMSNorm over {self.ni}"
-
-    def __repr__(self):
-        return self.__str__()
-
-class PersistentMemory(Layer):
-    """
-    Learned, fixed-width context that is persisted
-    per SPECTRE's persistent-memory extension
-
-    holds M, shape (num_memory, hidden_dim), trained jointly with the model.
-
-    Forward takes no input and backward does not propagate further
-    Used internally by SpectreAttention/ CausalSpectreAttention.
-    it folds its contribution directly into the frequency-domain quantities
-    they already accumulate.
-    """
-
-    preserves_shape = False
-
-    def __init__(self, num_memory: int, hidden_dim: int):
-        super().__init__()
-        assert num_memory >= 0, "num_memory must be zero or positive"
-        self.num_memory = num_memory
-        self.hidden_dim = hidden_dim
-        self.declare_shapes(inputs=(), outputs=((hidden_dim,),))
-
-
-        self.memory = xavier(self.RNG, ni=num_memory, no=hidden_dim).astype(GLOBAL_DTYPE)
-
-        self.zero_gradients()
-
-    def forward(self) -> NDArray:
-        """returns the current memory bank; there is no input to consume"""
-        return self.memory
-
-    def backward(self, incoming_gradient: NDArray) -> None:
-        """
-        assigns (not accumulates) the gradient, matching every other layer's
-        per-call overwrite convention -- the owning attention layer sums any
-        multiple contributions (query path, value path) before calling this
-        once, rather than relying on repeated calls to add up correctly
-        """
-        self.gradient_memory = incoming_gradient
-        return None
-
-    def update_weights(self, gradient_memory: NDArray) -> None:
-        self.memory -= gradient_memory
-
-    def purge(self) -> None:
-        pass
-
-    def zero_gradients(self) -> None:
-        self.gradient_memory = np.zeros_like(self.memory)
-
-    def get_weights(self, for_serialization: bool = False) -> NDArray:
-        if for_serialization:
-            return {"memory": self.memory}
-        return self.memory
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            self.memory = np.asarray(weights["memory"], dtype=GLOBAL_DTYPE)
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        if self.num_memory == 0:
-            return {}
-        return {"gradient_memory": self.gradient_memory}
-
-    @property
-    def num_parameters(self) -> int:
-        return self.memory.size
-
-    def __str__(self):
-        return f"PersistentMemory, {self.num_memory} slots over {self.hidden_dim}"
 
     def __repr__(self):
         return self.__str__()

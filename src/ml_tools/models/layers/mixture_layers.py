@@ -5,14 +5,14 @@ from typing import Optional
 from ml_tools.models.layers.layers import EPSILON, FullyConnectedLayer, Layer
 
 
+# MOE processes -- follow DeepSeek "N always on + top-K routing"
 class VotingBase(Layer):
     """
     Shared plumbing for the mixture voting layers --
     """
 
     # softmax votes already sum to one, so a top-k mask has to be renormalized
-    # to stay a distribution. Independent sigmoid votes never summed to one and
-    # must not be.
+    # to stay a valid distribution.
     renormalize: bool = False
     activation: str = "linear"
 

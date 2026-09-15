@@ -67,6 +67,12 @@ class LatentStack(Layer):
     def zero_gradients(self) -> None:
         pass
 
+    def get_weights(self):
+        pass
+
+    def set_weights(self):
+        pass
+
 
 class LatentSum(Layer):
     """
