@@ -681,7 +681,6 @@ class SpectreAttention(Layer):
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         mask_column = self.mask[..., None]
-        print("grad: ", incoming_gradient.shape)
         if self.use_wrm:
             incoming_gradient, d_descriptor_wrm = self.wrm.backward(incoming_gradient)
         else:

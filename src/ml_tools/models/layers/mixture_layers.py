@@ -39,6 +39,8 @@ class VotingBase(Layer):
         self.route_sum = None
         self.output = None
 
+        self.zero_gradients()
+
     def forward(self, incoming_x: NDArray) -> NDArray:
         """
         Parameters
@@ -180,6 +182,8 @@ class VotingWeight(VotingBase):
             ),
         )
 
+        self.zero_gradients()
+
 
 class VotingGate(VotingBase):
     """determines the weighting of each expert in the final output"""
@@ -246,6 +250,8 @@ class PoolingLayer(Layer):
             inputs=((None, None, None),),
             outputs=((None, 1, None),)
         )
+
+        self.zero_gradients()
 
     def forward(self, incoming_x: NDArray) -> NDArray:
         self.input = incoming_x  # Store for backward pass (matches framework pattern)

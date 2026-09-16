@@ -43,6 +43,8 @@ class FrequencyFFT(Layer):
             inputs=((window_size,),), outputs=((window_size,),)
         )
 
+        self.zero_gradients()
+
     def forward(self, incoming_x: NDArray) -> NDArray:
         """
         Forward process for the Hartley transform
@@ -116,6 +118,8 @@ class FourierLayer(Layer):
         else:
             self.fft_axes = -1
 
+        self.zero_gradients()
+
     def forward(self, incoming_x: NDArray) -> NDArray:
         """
         Hartley transform
@@ -178,6 +182,8 @@ class InverseFourierLayer(Layer):
             self.fft_axes = (-2, -1)
         else:
             self.fft_axes = -1
+
+        self.zero_gradients()
 
     def forward(self, incoming_x: NDArray) -> NDArray:
         """
@@ -247,7 +253,9 @@ class FourierAttention(Layer):
         self.norm_a = NormalizeLayer(ni=ni, shift_scale=False)
         self.fc = FullyConnectedLayer(ni=ni, no=no, activation_type="relu")
         self.norm_b = NormalizeLayer(ni=no, shift_scale=True)
+
         self.declare_shapes(inputs=((ni,),), outputs=((no,),))
+        self.zero_gradients()
 
     def forward(self, x_data: NDArray, training_now: bool):
         if self.fftlayer.use_2d:

@@ -230,6 +230,8 @@ class FullyConnectedLayer(Layer):
         self.output = np.empty(shape=(ni, no))
         self.z = np.empty(shape=(ni, no))
 
+        self.zero_gradients()
+
     def forward(
         self, incoming_x: NDArray, forced_activation: Optional[str] = None
     ) -> NDArray:
@@ -456,6 +458,8 @@ class NormalizeLayer(Layer):
         self.x_norm = None
         self.std = None
 
+        self.zero_gradients()
+
     def forward(self, incoming_x: NDArray) -> NDArray:
         self.in_shape = incoming_x.shape
 
@@ -506,17 +510,22 @@ class NormalizeLayer(Layer):
         self.gradient_gamma = None
 
     def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"shift_beta": self.shift_beta, "scale_gamma": self.scale_gamma}
-        return (self.shift_beta, self.scale_gamma)
+        if self.shift_scale is True:
+            if for_serialize:
+                return {"shift_beta": self.shift_beta, "scale_gamma": self.scale_gamma}
+            return (self.shift_beta, self.scale_gamma)
+        else:
+            return {}
+
 
     def get_gradients(self) -> dict[str, NDArray]:
-        if not self.shift_scale:
-            return {}
-        return {
-            "gradient_beta": self.gradient_beta,
-            "gradient_gamma": self.gradient_gamma,
-        }
+        if self.shift_scale is True:
+            return {
+                "gradient_beta": self.gradient_beta,
+                "gradient_gamma": self.gradient_gamma,
+            }
+        return {}
+
 
     def set_weights(self, weights: dict) -> None:
         if weights is not None:
@@ -559,6 +568,8 @@ class RMSNormLayer(Layer):
 
         self.x_norm = None
         self.rms = None
+
+        self.zero_gradients()
 
     def forward(self, incoming_x: NDArray) -> NDArray:
         in_shape = incoming_x.shape

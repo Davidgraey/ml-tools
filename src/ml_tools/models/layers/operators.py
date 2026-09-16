@@ -96,6 +96,7 @@ class LatentSum(Layer):
         self.is_output: bool = False
 
         self.declare_shapes(inputs=(ANY_SHAPE, ANY_SHAPE), outputs=(ANY_SHAPE,))
+        self.zero_gradients()
 
 
     @staticmethod
@@ -232,6 +233,7 @@ class ShiftRight(Layer):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.start_token: NDArray = np.zeros((1, 1, hidden_dim))
+
         self.declare_shapes(inputs=((hidden_dim,),), outputs=((hidden_dim,),))
         self.zero_gradients()
 

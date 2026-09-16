@@ -95,7 +95,11 @@ class Adam(Optimizer):
         self._momenta: dict = {}
         self._ridges: dict = {}
 
-    def update(self, value, path: tuple, momentum_update: float, ridge_update: float):
+    def update(self,
+               value,
+               path: tuple,
+               momentum_update: float,
+               ridge_update: float):
         # careful -- recursive
         if isinstance(value, dict):
             return {
