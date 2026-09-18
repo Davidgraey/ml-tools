@@ -67,21 +67,20 @@ def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
 # ------------------------------------------------------------------
 class Layer(ABC):
     preserves_shape: bool = False
+    registry_name: Optional[str] = None
+    _registry: dict[str, type] = {}
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        name = cls.registry_name or cls.__name__
+        if name in Layer._registry and Layer._registry[name] is not cls:
+            warnings.warn(f"layer name {name} redefined; keeping the latest class")
+        Layer._registry[name] = cls
 
     def __init__(self):
         super().__init__()
         self.RNG = np.random.RandomState(42)
         self.declare_shapes()
-        registry_name: Optional[str] = None
-        _registry: dict[str, type] = {}
-
-        # TODO: confirm this behavioral works with new or renames
-        def __init_subclass__(cls, **kwargs):
-            super().__init_subclass__(**kwargs)
-            name = cls.registry_name or cls.__name__
-            if name in Layer._registry and Layer._registry[name] is not cls:
-                warnings.warn(f"layer name {name} redefined; keeping the latest class")
-            Layer._registry[name] = cls
 
     def declare_shapes(self, inputs=(ANY_SHAPE,), outputs=(ANY_SHAPE,)) -> None:
         """

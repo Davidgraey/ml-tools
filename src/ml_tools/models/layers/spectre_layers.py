@@ -174,7 +174,7 @@ class PrefixFFTCache:
                 f"expected memory shape ({self.memory_tokens}, {self.hidden_dim}), "
                 f"got {memory.shape}"
             )
-        self.value_buffer[:, : self.memory_tokens] = memory[None].astype(self.dtype)
+        self.value_buffer[:, : self.memory_tokens] = memory[None].astype(GLOBAL_DTYPE)
         self.mask_buffer[:, : self.memory_tokens] = True
 
         self.prefix_fft[...] = np.fft.rfft(
@@ -808,18 +808,18 @@ class SpectreAttention(Layer):
                 "query_bias": self.query_bias,
                 "values_weights": self.values_weights,
                 "values_bias": self.values_bias,
-                "norm_query": self.norm_query.get_weights(),
-                "fc_1": self.fc_1.get_weights(),
-                "fc_2": self.fc_2.get_weights(),
+                "norm_query": self.norm_query.get_weights(for_serialize=True),
+                "fc_1": self.fc_1.get_weights(for_serialize=True),
+                "fc_2": self.fc_2.get_weights(for_serialize=True),
             }
             if self.band_radius:
                 weights["band_taps"] = self.band_taps
 
             if self.use_wrm:
-                weights["wrm"] = self.wrm.get_weights()
+                weights["wrm"] = self.wrm.get_weights(for_serialize=True)
 
             if self.memory_tokens:
-                weights["persistent_memory"] = self.memory.get_weights()
+                weights["persistent_memory"] = self.memory.get_weights(for_serialize=True)
 
             return weights
 
@@ -829,18 +829,18 @@ class SpectreAttention(Layer):
             self.query_bias,
             self.values_weights,
             self.values_bias,
-            self.norm_query.get_weights(),
-            self.fc_1.get_weights(),
-            self.fc_2.get_weights(),
+            self.norm_query.get_weights(for_serialize=False),
+            self.fc_1.get_weights(for_serialize=False),
+            self.fc_2.get_weights(for_serialize=False),
         ]
         if self.memory_tokens:
-            weights.append(self.memory.get_weights())
+            weights.append(self.memory.get_weights(for_serialize=False))
 
         if self.band_radius:
             weights.append(self.band_taps)
 
         if self.use_wrm:
-            weights.append(self.wrm.get_weights())
+            weights.append(self.wrm.get_weights(for_serialize=False))
         return tuple(weights)
 
     def set_weights(self, weights: dict) -> None:
@@ -851,12 +851,12 @@ class SpectreAttention(Layer):
         self.query_bias = np.asarray(weights["query_bias"], dtype=GLOBAL_DTYPE)
         self.values_weights = np.asarray(weights["values_weights"], dtype=GLOBAL_DTYPE)
         self.values_bias = np.asarray(weights["values_bias"], dtype=GLOBAL_DTYPE)
-        self.norm_query.set_weights(weights["norm_query"], dtype=GLOBAL_DTYPE)
+        self.norm_query.set_weights(weights["norm_query"])
         self.fc_1.set_weights(weights["fc_1"])
         self.fc_2.set_weights(weights["fc_2"])
 
         if self.band_radius and "band_taps" in weights:
-            self.band_taps = np.asarray(weights["band_taps"], dtype=GLOBAL_DTYPE)
+            self.band_taps = np.asarray(weights["band_taps"], dtype=GLOBAL_COMPLEX_DTYPE)
 
         if self.use_wrm and "wrm" in weights:
             self.wrm.set_weights(weights["wrm"])
@@ -1013,9 +1013,41 @@ class SpectreDecoderAttention(SpectreAttention):
         last_hidden = layer.prefill(prompt_embeddings, mask=prompt_mask)
         for _ in range(n_new_tokens):
             last_hidden = layer.decode_step(next_token_embedding)
+
+    use_wrm is not supported here. WaveletRefinementModule's Haar transform
+    needs the whole sequence_length window at once, but prefill/decode_step
+    only ever reconstruct one live position at a time, so it has no
+    single-token forward it could call.
     """
-    def __int__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    registry_name = "SPECTREDecoderAttention"
+
+    def __init__(self,
+                 sequence_length: int,
+                 hidden_dim: int,
+                 num_heads: int = 1,
+                 band_radius: int = 0,
+                 memory_tokens: int = 0,
+                 causal_decode: bool = False,
+                 modrelu_bias: float = 0.0,
+                 use_wrm: bool = False,
+                 use_positional_phase: bool = True,
+                 ):
+        assert not use_wrm, (
+            "SpectreDecoderAttention does not support use_wrm: the Wavelet "
+            "Refinement Module needs the full sequence_length window, but "
+            "prefill/decode_step only ever produce one live token at a time"
+        )
+        super().__init__(
+            sequence_length=sequence_length,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            band_radius=band_radius,
+            memory_tokens=memory_tokens,
+            causal_decode=causal_decode,
+            modrelu_bias=modrelu_bias,
+            use_wrm=use_wrm,
+            use_positional_phase=use_positional_phase,
+        )
         self.cache: Optional[PrefixFFTCache] = None
 
     def reset_cache(self, batch_size: int):
@@ -1024,8 +1056,6 @@ class SpectreDecoderAttention(SpectreAttention):
             hidden_dim=self.hidden_dim,
             batch_size=batch_size,
             memory_tokens=self.memory_tokens,
-            dtype=GLOBAL_DTYPE,
-            complex_dtype=GLOBAL_COMPLEX_DTYPE,
         )
         if self.memory_tokens:
             self.cache.set_memory(self.memory.get_memory())
@@ -1108,9 +1138,13 @@ class SpectreDecoderAttention(SpectreAttention):
             finished sequences in a batch; it still advances the cache
             (consistent with the ring-buffer accounting) but writes a zero
             token and does not affect sum_query.
+
+        positional phase -- Multiplying the gate by exp(j2*pi*k*t/N). It is decode-only.
         """
         assert self.cache is not None, "call reset_cache()/prefill() first"
         assert input_t.ndim == 2 and input_t.shape[1] == self.hidden_dim
+
+        t = self.cache.position
 
         query_t = self._project_heads(input_t, self.query_weights, self.query_bias)
         value_t = self._project_heads(input_t, self.values_weights, self.values_bias)
@@ -1121,11 +1155,15 @@ class SpectreDecoderAttention(SpectreAttention):
         total_counts = np.maximum(total_counts, 1.0)
         gate, descriptor = self._gate_from_sum_query(self.cache.sum_query, total_counts)
 
+        if self.use_positional_phase:
+            phase = np.conj(self.cache._twiddle[t % self.cache.max_sequence])
+            gate = gate * phase[None, None, :]
+
         gate_aligned = self._align_gate(gate)
         gate_full = self._merge_heads(
             np.broadcast_to(
                 gate_aligned,
-                (input_t.shape[0], self.cache.n_freq, self.num_heads, self.head_dim),
+                shape=(input_t.shape[0], self.cache.n_freq, self.num_heads, self.head_dim),
             )
         )
         window = self.cache.reconstruct(gate_full)
@@ -1171,3 +1209,113 @@ if __name__ == "__main__":
         rhs = np.real(np.sum(np.conj(g) * ATy))
 
         print(lhs, rhs, abs(lhs - rhs))
+
+
+if __name__ == "__main__":
+    from ml_tools.models.optimizers import SGD
+    def _mse(pred: np.ndarray, target: np.ndarray) -> float:
+        return float(np.mean((pred - target) ** 2))
+
+
+    def _mse_grad(pred: np.ndarray, target: np.ndarray) -> np.ndarray:
+        return (2.0 / pred.size) * (pred - target)
+
+
+    def _train_to_fit(layer, x, y, mask=None, steps=300, lr=5e-3, verbose=False):
+        """
+        Train `layer` with Adam to reproduce `y` from `x`.
+        Returns (first_loss, last_loss).
+        """
+        optimizer = SGD(learning_rate=lr)
+        losses = []
+
+        for step in range(steps):
+            layer.zero_gradients()  # belt-and-braces: some sub-layers accumulate via +=
+
+            pred = layer.forward(x, mask=mask, training_now=True)
+            loss = _mse(pred, y)
+            losses.append(loss)
+
+            grad_out = _mse_grad(pred, y)
+            layer.backward(grad_out)
+            optimizer.step([layer])
+
+            if verbose and step % 50 == 0:
+                print(f"step {step:4d}  loss {loss:.6f}")
+
+        return losses[0], losses[-1]
+
+
+    def test_spectre_attention_overfits_small_batch():
+        """
+        Plain (non-causal, no memory, no band, no WRM) SpectreAttention should
+        be able to drive down the MSE on a small, fixed synthetic batch.
+        """
+        rng = np.random.default_rng(0)
+
+        batch, seq_len, hidden, heads = 4, 8, 8, 2
+
+        layer = SpectreAttention(
+            sequence_length=seq_len,
+            hidden_dim=hidden,
+            num_heads=heads,
+            band_radius=0,
+            memory_tokens=0,
+            use_wrm=False,
+        )
+
+        x = rng.normal(size=(batch, seq_len, hidden)).astype(np.float32)
+        y = (rng.normal(size=(batch, seq_len, hidden)) * 0.5).astype(np.float32)
+
+        first_loss, last_loss = _train_to_fit(layer, x, y, steps=300, lr=5e-3)
+
+        print(f"[SpectreAttention] first_loss={first_loss:.6f} last_loss={last_loss:.6f}")
+
+        assert np.isfinite(last_loss), "loss went non-finite -- likely a NaN/inf leak in fwd/bwd"
+        assert last_loss < first_loss * 0.2, (
+            f"expected loss to drop by at least 5x over training, "
+            f"got {first_loss:.6f} -> {last_loss:.6f}"
+        )
+
+
+    def test_spectre_decoder_attention_overfits_with_memory_and_band():
+        """
+        SpectreDecoderAttention, trained the normal (non-cached) way per its own
+        docstring, with memory tokens *and* a banded gate enabled -- the two
+        extra mechanisms most likely to silently break gradients. Also exercises
+        the masked-token path.
+        """
+        rng = np.random.default_rng(1)
+
+        batch, seq_len, hidden, heads = 3, 6, 8, 2
+
+        layer = SpectreDecoderAttention(
+            sequence_length=seq_len,
+            hidden_dim=hidden,
+            num_heads=heads,
+            band_radius=1,
+            memory_tokens=2,
+            use_wrm=False,
+        )
+
+        x = rng.normal(size=(batch, seq_len, hidden)).astype(np.float32)
+        y = (rng.normal(size=(batch, seq_len, hidden)) * 0.5).astype(np.float32)
+
+        # a chunk of forward/backward branches on mask/total_counts -- worth
+        # covering here rather than in a separate test.
+        mask = np.ones((batch, seq_len), dtype=np.float32)
+        mask[:, -1] = 0.0  # last token padded out for every sample
+
+        first_loss, last_loss = _train_to_fit(layer, x, y, mask=mask, steps=400, lr=5e-3)
+
+        print(f"[SpectreDecoderAttention] first_loss={first_loss:.6f} last_loss={last_loss:.6f}")
+
+        assert np.isfinite(last_loss)
+        assert last_loss < first_loss * 0.2, (
+            f"expected loss to drop by at least 5x over training, "
+            f"got {first_loss:.6f} -> {last_loss:.6f}"
+        )
+
+    test_spectre_attention_overfits_small_batch()
+    test_spectre_decoder_attention_overfits_with_memory_and_band()
+    print("all good")

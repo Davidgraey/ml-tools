@@ -374,9 +374,16 @@ class WaveletRefinementModule(Layer):
     def get_weights(self, for_serialize: bool = False):
         return {
             "control_gate": self.control_gate,
-            "gate_projection": self.gate_projection.get_weights(),
-            "gate_output": self.gate_output.get_weights(),
+            "gate_projection": self.gate_projection.get_weights(for_serialize=for_serialize),
+            "gate_output": self.gate_output.get_weights(for_serialize=for_serialize),
         }
+
+    def set_weights(self, weights: dict) -> None:
+        if weights is None:
+            return
+        self.control_gate = np.asarray(weights["control_gate"], dtype=GLOBAL_DTYPE)
+        self.gate_projection.set_weights(weights["gate_projection"])
+        self.gate_output.set_weights(weights["gate_output"])
 
     def get_gradients(
             self,
