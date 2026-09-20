@@ -36,6 +36,10 @@ class GPLSOM(PLSOM):
     https://arxiv.org/pdf/0705.0199    (PLSOM)
     """
 
+    _structural_state_keys = PLSOM._structural_state_keys + (
+        "network_shape", "height", "width", "n_neurons", "grid_distances",
+    )
+
     def __init__(
         self,
         width: int,
@@ -47,7 +51,14 @@ class GPLSOM(PLSOM):
         distance="euclidean",
         verbose: bool = False,
         hit_decay: float = 0.9,
+        r_decay: float = 0.99,
+        validation_fraction: float = 0.0,
+        patience: int = 10,
+        min_delta: float = 1e-4,
+        restore_best: bool = True,
+        freeze_fraction: float = 0.15,
         spread_factor: float = 0.5,
+        growth_anneal: float = 1.0,
         prune_ratio: float = 0.25,
         min_shape: tuple[int, int] = (2, 2),
         max_neurons: Optional[int] = None,
@@ -57,9 +68,13 @@ class GPLSOM(PLSOM):
         Parameters
         ----------
         width, height, input_dim, theta_min, theta_max, lock_seed, distance,
-        verbose, hit_decay : see PLSOM
+        verbose, hit_decay, r_decay, validation_fraction, patience, min_delta,
+        restore_best, freeze_fraction : see PLSOM
         spread_factor : GSOM spread factor in (0, 1). Lower raises the growth
             threshold and yields a smaller final map.
+        growth_anneal : per-epoch multiplier on growth_threshold, so growth
+            can be made progressively harder to trigger as training proceeds.
+            1.0 (default) leaves the threshold fixed.
         prune_ratio : a row or column becomes a pruning candidate when its
             share of recent hits drops below this fraction of the average line.
         min_shape : (rows, cols) floor, so pruning cannot collapse the map.
@@ -78,12 +93,19 @@ class GPLSOM(PLSOM):
             distance=distance,
             verbose=verbose,
             hit_decay=hit_decay,
+            r_decay=r_decay,
+            validation_fraction=validation_fraction,
+            patience=patience,
+            min_delta=min_delta,
+            restore_best=restore_best,
+            freeze_fraction=freeze_fraction,
         )
 
         assert 0.0 < spread_factor < 1.0, "spread_factor must be in (0, 1)"
 
         self.spread_factor = spread_factor
         self.growth_threshold = -input_dim * np.log(spread_factor)
+        self.growth_anneal = growth_anneal
         self.prune_ratio = prune_ratio
         self.min_shape = min_shape
         self.max_neurons = max_neurons if max_neurons else 4 * self.n_neurons
@@ -96,11 +118,17 @@ class GPLSOM(PLSOM):
     # ------------------------------------------------------------------
     def after_epoch(self, step: int) -> None:
         """
-        At most one structural change per epoch, growth taking precedence.
-        Doing both in one epoch oscillates, since the two decisions read the
-        same decayed counters.
+        At most one structural change per epoch, growth taking precedence,
+        then prune, then a dead-unit reinit. Doing more than one in an epoch
+        oscillates, since the decisions read the same decayed counters.
+
+        Structural changes are disabled entirely once structure_frozen is
+        set (see PLSOM.fit), so the map gets a clean settling period before
+        training ends rather than being restructured on its last epochs.
         """
         if self.weights is None:
+            return
+        if self.structure_frozen:
             return
         if step - self.last_structural_epoch < self.settle_epochs:
             return
@@ -118,17 +146,17 @@ class GPLSOM(PLSOM):
             self.prune_line(*candidate)
             self.structure_trace.append((step, "prune", *self.network_shape))
             self.last_structural_epoch = step
+            return
 
-    def mean_node_error(self) -> NDArray:
-        """
-        Average quantisation error per sample assigned to each node.
+        dead = self.pick_dead_site()
+        if dead is not None:
+            self.reinit_line(*dead)
+            self.structure_trace.append((step, "reinit", *self.network_shape))
+            self.last_structural_epoch = step
 
-        The raw node_error is a decayed sum over every sample the node won, so
-        its scale rides on dataset size and would clear any fixed threshold.
-        Dividing by the hit count puts it in the units of a single distance,
-        which is what GT = -input_dim * ln(spread_factor) is expressed in.
-        """
-        return self.node_error / np.maximum(self.hit_map, 1.0)
+    def anneal_structure_thresholds(self) -> None:
+        """make growth progressively harder to trigger as training proceeds"""
+        self.growth_threshold *= self.growth_anneal
 
     def growth_fits(self, axis: int) -> bool:
         """
@@ -177,6 +205,32 @@ class GPLSOM(PLSOM):
         candidates = []
         for axis in (0, 1):
             if self.network_shape[axis] <= self.min_shape[axis]:
+                continue
+
+            line_hits = self.hit_map.reshape(self.network_shape).sum(axis=1 - axis)
+            average = line_hits.mean()
+            if average <= 0:
+                continue
+
+            position = int(np.argmin(line_hits))
+            if line_hits[position] < self.prune_ratio * average:
+                candidates.append((float(line_hits[position]), axis, position))
+
+        if not candidates:
+            return None
+
+        _, axis, position = min(candidates)
+        return axis, position
+
+    def pick_dead_site(self) -> Optional[tuple[int, int]]:
+        """
+        A row or column cold enough that pick_prune_site would drop it, but
+        blocked by min_shape -- a reinit target instead of a removal, so a
+        line stuck at the floor doesn't sit unused for the rest of training.
+        """
+        candidates = []
+        for axis in (0, 1):
+            if self.network_shape[axis] > self.min_shape[axis]:
                 continue
 
             line_hits = self.hit_map.reshape(self.network_shape).sum(axis=1 - axis)
@@ -300,6 +354,31 @@ class GPLSOM(PLSOM):
             addition = np.zeros(lines.shape[1])
 
         return np.insert(grid, position, addition, axis=axis).reshape(-1)
+
+    def reinit_line(self, axis: int, position: int) -> None:
+        """
+        Reinitialize a row/column stuck at the size floor: relocate it next
+        to the line with the worst mean error instead of leaving it unused,
+        and clear its hit/error records so it gets a fresh trial period.
+        """
+        errors = self.mean_node_error().reshape(self.network_shape)
+        lines_error = np.moveaxis(errors, axis, 0)
+        worst = int(np.argmax(lines_error.sum(axis=1)))
+
+        grid = self.weight_grid()
+        lines = np.moveaxis(grid, axis, 0)
+        lines[position] = lines[worst] + self.RNG.uniform(
+            -self.THETAMIN, self.THETAMIN, size=lines[position].shape
+        )
+        self.weights = grid.reshape(self.n_neurons, self.N_DIMS)
+
+        hit_grid = np.moveaxis(self.hit_map.reshape(self.network_shape), axis, 0)
+        hit_grid[position] = 0.0
+
+        error_grid = np.moveaxis(self.node_error.reshape(self.network_shape), axis, 0)
+        error_grid[position] = 0.0
+
+        self.previous_step_r = 0
 
     def predict(self, x: NDArray, n_clusters: int, verbose: bool = False) -> NDArray:
         """

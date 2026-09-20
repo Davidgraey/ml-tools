@@ -31,6 +31,15 @@ class ExplainableBoostedTreeModel(BasalModel):
 
     supports regression and classification (binary / multinomial / multilabel)
     """
+    # fields that fully determine a fitted model's prediction-time state, on
+    # top of BasalModel's core (x_means, x_stds -- unused here, this model
+    # bins raw feature values rather than standardizing). input_dimension is
+    # included since fit() overwrites it from the data, unlike the other
+    # constructor hyperparameters captured in get_config().
+    _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
+        "main_effects", "interactions", "intercept", "input_dimension",
+    )
+
     def __init__(
         self,
         input_dimension: int = 1,
@@ -44,6 +53,7 @@ class ExplainableBoostedTreeModel(BasalModel):
         seed: int = 42,
     ):
         super().__init__(input_dimension, output_dimension, seed)
+        self.seed = seed
 
         self.task = task
         self.num_bins = num_bins
@@ -448,6 +458,74 @@ class ExplainableBoostedTreeModel(BasalModel):
         "explained_variance".
         """
         return self.interactions[pair]
+
+    def get_config(self) -> dict:
+        """constructor hyperparameters, JSON-safe"""
+        task = self.task
+        return {
+            "output_dimension": self.output_dimension,
+            "task": task.value if isinstance(task, ClassificationTask) else task,
+            "num_bins": self.num_bins,
+            "learning_rate": self.learning_rate,
+            "num_rounds": self.num_rounds,
+            "max_interaction_pairs": self.max_interaction_pairs,
+            "interaction_num_bins": self.interaction_num_bins,
+            "seed": self.seed,
+        }
+
+    def serialize(self) -> dict:
+        """
+        Package the fitted model for inference: type, config, and just the
+        binned lookup tables predict() needs (_structural_state_keys).
+
+        Returns
+        -------
+        dict
+            {"type", "config", "weights"}, where weights holds the main-effect
+            and interaction bin tables, the intercept, and the fitted input
+            dimension.
+        """
+        return {
+            "type": self.__class__.__name__,
+            "config": self.get_config(),
+            "weights": self._capture_state(),
+        }
+
+    @classmethod
+    def unserialize(cls, payload: dict) -> "ExplainableBoostedTreeModel":
+        """
+        Reconstruct a fitted model for inference from serialize()'s output.
+
+        Parameters
+        ----------
+        payload : dict, as returned by serialize()
+
+        Returns
+        -------
+        ExplainableBoostedTreeModel
+            fitted, ready for predict()
+        """
+        config = payload["config"]
+        task = config["task"]
+        if task is not None:
+            task = ClassificationTask(task)
+
+        # input_dimension is restored from weights just below -- 1 is only a
+        # placeholder to satisfy the constructor
+        model = cls(
+            input_dimension=1,
+            output_dimension=config["output_dimension"],
+            task=task,
+            num_bins=config["num_bins"],
+            learning_rate=config["learning_rate"],
+            num_rounds=config["num_rounds"],
+            max_interaction_pairs=config["max_interaction_pairs"],
+            interaction_num_bins=config["interaction_num_bins"],
+            seed=config["seed"],
+        )
+        model._restore_state(payload["weights"])
+
+        return model
 
     @property
     def info(self) -> str:

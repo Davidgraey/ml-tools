@@ -32,6 +32,10 @@ def to_multilabel(row_indices: NDArray | list, num_classes: int) -> NDArray:
 
 SIGNAL_FAMILIES = ("tone", "multitone", "chirp", "damped", "noise")
 IMAGE_SHAPES = ("disc", "rect", "cross", "ring")
+# "gaussian" and "elongated" are analytic (no rejection sampling); the rest
+# reuse the same membership test as IMAGE_SHAPES, sampled as points instead
+# of a pixel mask; "moon" is a half ring.
+CLUSTER_SHAPES = ("gaussian", "elongated", "disc", "rect", "cross", "ring", "moon")
 
 # floor for the signal duration, so a length-1 request cannot divide by zero
 EPSILON_TIME = 1e-12
@@ -44,6 +48,11 @@ class GenConfig:
     noise_scale: float = 0.5
     num_classes: int = 3  # for multinomial / multilabel
     num_clusters: int = 3  # for clustering
+    outlier_fraction: float = 0.0  # for clustering: fraction of samples that are uniform noise, labeled -1
+    cluster_shape: str = "gaussian"  # for clustering: a CLUSTER_SHAPES name, or a sequence of names cycled across clusters
+    variance_jitter: float = 0.0  # for clustering: randomizes each cluster's spread per cluster and per dimension, 0 = flat noise_scale
+    separation: float = 0.0  # for clustering: minimum centroid distance as a multiple of noise_scale, 0 disables
+    imbalance: float = 0.0  # for clustering: >0 skews cluster sizes via Dirichlet concentration 1/imbalance
     ensure_label: bool = True  # for multilabel: ensure at least one sample for a class
     onehot: bool = False  # for classification
     verbose: bool = True # for stupid extra prints everywhere
@@ -93,12 +102,51 @@ class RandomDatasetGenerator:
     def _sigmoid(self, Z: NDArray) -> NDArray:
         return 1.0 / (1.0 + np.exp(-Z))
 
-    def _split_counts(self, total: int, groups: int) -> list[int]:
-        base = total // groups
-        counts = [base] * groups
-        for i in range(total % groups):
-            counts[i] += 1
-        return counts
+    def _split_counts(self, total: int, groups: int, imbalance: float = 0.0) -> list[int]:
+        """
+        Split `total` into `groups` integer counts summing to total.
+
+        imbalance=0 gives an even split. A higher value draws group
+        proportions from a Dirichlet distribution instead (concentration
+        1/imbalance, so larger imbalance means more skewed group sizes,
+        including possibly empty groups).
+        """
+        if imbalance <= 0:
+            base = total // groups
+            counts = [base] * groups
+            for i in range(total % groups):
+                counts[i] += 1
+            return counts
+        concentration = max(1.0 / imbalance, 0.05)
+        proportions = self.rng.dirichlet(np.full(groups, concentration))
+        return list(self.rng.multinomial(total, proportions))
+
+    def _rotate_2d(self, x: NDArray, y: NDArray, angle: float) -> tuple[NDArray, NDArray]:
+        """Rotate 2D coordinates by `angle` radians about the origin."""
+        rotated_x = x * np.cos(angle) + y * np.sin(angle)
+        rotated_y = -x * np.sin(angle) + y * np.cos(angle)
+        return rotated_x, rotated_y
+
+    def _shape_mask(self, shape: str, x: NDArray, y: NDArray, extent: float) -> NDArray:
+        """
+        Boolean mask for which (x, y) coordinates fall inside the named
+        shape. Shared by the image generator (applied to a pixel grid) and
+        the clustering generator (applied to candidate points, for
+        rejection sampling).
+        """
+        radius = np.sqrt(x ** 2 + y ** 2)
+        if shape == "disc":
+            return radius <= extent
+        if shape == "rect":
+            return (np.abs(x) <= extent) & (np.abs(y) <= extent * 0.6)
+        if shape == "cross":
+            arm = extent * 0.3
+            return ((np.abs(x) <= extent) & (np.abs(y) <= arm)) | (
+                (np.abs(y) <= extent) & (np.abs(x) <= arm)
+            )
+        if shape == "ring":
+            return (radius <= extent) & (radius >= extent * 0.6)
+        raise ValueError(f"unknown shape: {shape}")
 
     # --------------- Public Dispatcher ---------------
 
@@ -234,26 +282,163 @@ class RandomDatasetGenerator:
             )
         return X, Y, meta
 
+    # --------------- Clustering ---------------
+
+    def _cluster_shapes_for(self, requested: str | list, k: int) -> list:
+        """One shape name repeated k times, or a sequence cycled across k clusters."""
+        if isinstance(requested, str):
+            return [requested] * k
+        shapes = list(requested)
+        if not shapes:
+            raise ValueError("cluster_shape sequence must not be empty")
+        return [shapes[i % len(shapes)] for i in range(k)]
+
+    def _cluster_scale(self, base_scale: float, dims: int, variance_jitter: float) -> NDArray:
+        """
+        Per-dimension noise scale for one cluster: `base_scale` perturbed by
+        an overall per-cluster factor and an independent per-dimension
+        factor, both drawn from [1 - variance_jitter, 1 + variance_jitter].
+        variance_jitter=0 reproduces a flat `base_scale` in every dimension.
+        """
+        if variance_jitter <= 0:
+            return np.full(dims, base_scale)
+        low = max(1.0 - variance_jitter, 0.05)
+        high = 1.0 + variance_jitter
+        cluster_factor = self.rng.uniform(low, high)
+        dim_factor = self.rng.uniform(low, high, size=dims)
+        return base_scale * cluster_factor * dim_factor
+
+    def _place_centroids(self, k: int, dims: int, min_separation: float) -> NDArray:
+        """
+        Draw k centroids uniformly in a [-3, 3]^dims box. When
+        min_separation > 0, a candidate closer than that to any
+        already-placed centroid is redrawn, up to 200 tries, after which the
+        last candidate is kept rather than looping forever on an infeasible
+        request (too many clusters/too large a separation for the box).
+        """
+        box = 3.0
+        centroids = np.empty((k, dims))
+        for i in range(k):
+            candidate = self.rng.uniform(-box, box, size=dims)
+            if min_separation > 0:
+                for _ in range(200):
+                    if i == 0 or np.min(np.linalg.norm(centroids[:i] - candidate, axis=1)) >= min_separation:
+                        break
+                    candidate = self.rng.uniform(-box, box, size=dims)
+            centroids[i] = candidate
+        return centroids
+
+    def _shape_points(self, shape: str, count: int, extent: float = 1.0, angle: float = 0.0) -> NDArray:
+        """
+        Sample `count` 2D points inside the named shape via rejection
+        sampling against `_shape_mask`, then rotate them by `angle`.
+        "moon" is a half ring (a crescent), reusing the ring mask.
+        """
+        mask_shape = "ring" if shape == "moon" else shape
+        box = extent * 1.2
+        points = np.empty((count, 2))
+        filled = 0
+        while filled < count:
+            batch = max((count - filled) * 3, 32)
+            candidates = self.rng.uniform(-box, box, size=(batch, 2))
+            keep = self._shape_mask(mask_shape, candidates[:, 0], candidates[:, 1], extent)
+            if shape == "moon":
+                keep = keep & (candidates[:, 1] >= 0)
+            kept = candidates[keep]
+            take = min(len(kept), count - filled)
+            points[filled:filled + take] = kept[:take]
+            filled += take
+        if angle:
+            points[:, 0], points[:, 1] = self._rotate_2d(points[:, 0], points[:, 1], angle)
+        return points
+
     def _clustering(self, config: GenConfig):
+        """
+        Point clusters around random centroids, plus optional uniform
+        outliers.
+
+        `cluster_shape` selects the point-cloud shape: "gaussian" (default)
+        is an isotropic ball; "elongated" is an anisotropic, randomly
+        rotated gaussian; "disc"/"rect"/"cross"/"ring"/"moon" are sampled
+        via rejection sampling against the same membership test the image
+        generator's shapes use. It can be one name for every cluster, or a
+        sequence cycled across clusters. `variance_jitter` randomizes each
+        cluster's spread per cluster and per dimension. `separation` sets a
+        minimum centroid distance, as a multiple of noise_scale. `imbalance`
+        skews cluster sizes instead of splitting them evenly. Outliers are
+        labeled -1 and scattered over the data's own bounding box. Every
+        knob defaults to off, reproducing the original plain isotropic
+        gaussian, evenly split behavior.
+        """
         k = config.num_clusters
-        counts = self._split_counts(config.num_samples, k)
-        centroids = self.rng.uniform(-3, 3, size=(k, config.num_features))
+        n_outliers = max(0, min(round(config.num_samples * config.outlier_fraction), config.num_samples))
+        counts = self._split_counts(config.num_samples - n_outliers, k, imbalance=config.imbalance)
+        centroids = self._place_centroids(k, config.num_features, config.separation * config.noise_scale)
+        shapes = self._cluster_shapes_for(config.cluster_shape, k)
+
         clusters = []
         labels = []
-        for i, c in enumerate(counts):
-            block = centroids[i] + self.rng.normal(
-                0, config.noise_scale, size=(c, config.num_features)
-            )
-            clusters.append(block)
-            labels.append(np.full(c, i, dtype=int))
+        for i, (count, shape) in enumerate(zip(counts, shapes)):
+            scale = self._cluster_scale(config.noise_scale, config.num_features, config.variance_jitter)
+
+            if shape == "gaussian":
+                offsets = self.rng.normal(0, scale, size=(count, config.num_features))
+
+            elif shape == "elongated":
+                axis_scale = scale.copy()
+                axis_scale[0] *= 3.0
+                if config.num_features > 1:
+                    axis_scale[1:] *= 0.4
+                offsets = self.rng.normal(0, axis_scale, size=(count, config.num_features))
+                if config.num_features >= 2:
+                    angle = self.rng.uniform(0, np.pi)
+                    offsets[:, 0], offsets[:, 1] = self._rotate_2d(
+                        offsets[:, 0], offsets[:, 1], angle
+                    )
+
+            else:
+                if config.num_features < 2:
+                    raise ValueError(f"cluster shape '{shape}' needs num_features >= 2")
+                angle = self.rng.uniform(0, np.pi)
+                offsets = np.empty((count, config.num_features))
+                offsets[:, :2] = self._shape_points(shape, count, angle=angle) * scale[:2]
+                if config.num_features > 2:
+                    offsets[:, 2:] = self.rng.normal(
+                        0, scale[2:], size=(count, config.num_features - 2)
+                    )
+
+            clusters.append(centroids[i] + offsets)
+            labels.append(np.full(count, i, dtype=int))
+
         X = np.vstack(clusters)
         y = np.concatenate(labels)
-        X, y = self._shuffle(X, y)
-        meta = dict(centroids=centroids, cluster_sizes=counts)
-        if config.verbose:
-            print(f"Clustering: X{X.shape}, sizes={counts}")
-        return X, y, meta
 
+        if n_outliers:
+            if X.shape[0] > 0:
+                margin = 0.25 * (X.max(axis=0) - X.min(axis=0))
+                low = X.min(axis=0) - margin
+                high = X.max(axis=0) + margin
+            else:
+                # every sample is an outlier -- fall back to the centroid
+                # spread itself, since there is no cluster data to size off
+                margin = np.full(config.num_features, max(config.noise_scale, 1e-6) * 3)
+                low = centroids.min(axis=0) - margin
+                high = centroids.max(axis=0) + margin
+            outliers = self.rng.uniform(low, high, size=(n_outliers, config.num_features))
+            X = np.vstack([X, outliers])
+            y = np.concatenate([y, np.full(n_outliers, -1, dtype=int)])
+
+        X, y = self._shuffle(X, y)
+        meta = dict(
+            centroids=centroids,
+            cluster_sizes=counts,
+            cluster_shapes=shapes,
+            outlier_count=n_outliers,
+            outlier_label=-1,
+        )
+        if config.verbose:
+            print(f"Clustering: X{X.shape}, sizes={counts}, shapes={shapes}, outliers={n_outliers}")
+        return X, y, meta
 
     # --------------- Signal ---------------
 
@@ -391,30 +576,9 @@ class RandomDatasetGenerator:
                 shifted_x = grid_x - centre[1]
                 shifted_y = grid_y - centre[0]
                 # rotate the sample points, which rotates the shape the other way
-                rotated_x = shifted_x * np.cos(angle) + shifted_y * np.sin(angle)
-                rotated_y = -shifted_x * np.sin(angle) + shifted_y * np.cos(angle)
+                rotated_x, rotated_y = self._rotate_2d(shifted_x, shifted_y, angle)
 
-                radius = np.sqrt(rotated_x ** 2 + rotated_y ** 2)
-
-                if shape == "disc":
-                    mask = radius <= extent
-
-                elif shape == "rect":
-                    mask = (np.abs(rotated_x) <= extent) & (
-                        np.abs(rotated_y) <= extent * 0.6
-                    )
-
-                elif shape == "cross":
-                    arm = extent * 0.3
-                    mask = (
-                        (np.abs(rotated_x) <= extent) & (np.abs(rotated_y) <= arm)
-                    ) | ((np.abs(rotated_y) <= extent) & (np.abs(rotated_x) <= arm))
-
-                elif shape == "ring":
-                    mask = (radius <= extent) & (radius >= extent * 0.6)
-
-                else:
-                    raise ValueError(f"unknown image shape: {shape}")
+                mask = self._shape_mask(shape, rotated_x, rotated_y, extent)
 
                 image = mask.astype(np.float64)
                 image = image + self.rng.normal(

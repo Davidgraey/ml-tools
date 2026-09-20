@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Optional
 from ml_tools.models.layers.layers import Layer, FullyConnectedLayer, NormalizeLayer
 import ml_tools.models.activations as activations
 from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON, ANY_SHAPE
@@ -13,6 +14,7 @@ def hartley(x_array: NDArray, axis: int = -1) -> NDArray:
 def hartley_2d(x_array: NDArray, axes: tuple = (-2, -1)) -> NDArray:
     x_freq = np.fft.fft2(x_array, axes=axes)
     return x_freq.real - x_freq.imag
+
 
 class FrequencyFFT(Layer):
     def __init__(self, max_sequence_length: int, window_size: int):
@@ -45,12 +47,16 @@ class FrequencyFFT(Layer):
 
         self.zero_gradients()
 
-    def forward(self, incoming_x: NDArray) -> NDArray:
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """
         Forward process for the Hartley transform
         Parameters
         ----------
         incoming_x : Numpy array of (number_of_windows, samples per window)
+        mask : unused -- the transform mixes only within a window's own
+            samples (the last axis), never across windows, so padding
+            elsewhere in the sequence can't affect it. Accepted for
+            pass-through compatibility with the graph.
 
         Returns
         -------
@@ -120,9 +126,14 @@ class FourierLayer(Layer):
 
         self.zero_gradients()
 
-    def forward(self, incoming_x: NDArray) -> NDArray:
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """
         Hartley transform
+
+        mask : unused -- the transform is linear and the sequence is already
+            zero-padded upstream, so a padded position contributes nothing to
+            any output frequency; there's nothing a mask would additionally
+            exclude. Accepted for pass-through compatibility with the graph.
         """
         self.input = incoming_x
 
@@ -185,11 +196,13 @@ class InverseFourierLayer(Layer):
 
         self.zero_gradients()
 
-    def forward(self, incoming_x: NDArray) -> NDArray:
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """
         Hartley is its own inverse up to 1/N, so the inverse direction is
         the same transform carrying that scale. Stacking this on top of
         FourierLayer reconstructs the input exactly.
+
+        mask : unused, same reasoning as FourierLayer.forward.
         """
         self.input = incoming_x
         self.scale = self._scale(incoming_x.shape)
@@ -257,7 +270,10 @@ class FourierAttention(Layer):
         self.declare_shapes(inputs=((ni,),), outputs=((no,),))
         self.zero_gradients()
 
-    def forward(self, x_data: NDArray, training_now: bool):
+    def forward(self, x_data: NDArray, training_now: bool = True, mask: Optional[NDArray] = None) -> NDArray:
+        """mask : unused -- neither the FFT mixing nor the per-position norm
+        and feed-forward sublayers need it (see FourierLayer.forward and
+        NormalizeLayer.forward); accepted for pass-through compatibility."""
         if self.fftlayer.use_2d:
             assert x_data.ndim >= 3, (
                 "use_2d mixes over the last two axes, which on a 2D "

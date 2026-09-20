@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Optional
 from numpy.typing import NDArray
 from ml_tools.models.layers.layers import Layer
 
@@ -68,11 +69,14 @@ class RopeEmbedding(Layer):
         self.pos_sine = np.sin(rotation_angle)
         self.pos_cosine = np.cos(rotation_angle)
 
-    def forward(self, input_data: NDArray) -> NDArray:
+    def forward(self, input_data: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """
         Parameters
         ----------
         input_data : (sequence, dimension) or (batch, sequence, dimension)
+        mask : unused -- each position is rotated by its own index alone,
+            independent of every other position. Accepted for pass-through
+            compatibility with the graph.
 
         Returns
         -------
@@ -144,8 +148,11 @@ class RopeEmbedding(Layer):
     def zero_gradients(self) -> None:
         pass
 
-    def get_weights(self) -> None:
-        return None
+    def get_weights(self, for_serialize: bool = False):
+        return {} if for_serialize else None
+
+    def set_weights(self, weights: dict) -> None:
+        pass
 
     def get_gradients(self) -> dict[str, NDArray]:
         """
@@ -231,11 +238,14 @@ class SinusoidEmbedding(Layer):
         self.pos_table[:, 0::2] = np.sin(rotation_angle)
         self.pos_table[:, 1::2] = np.cos(rotation_angle)
 
-    def forward(self, input_data: NDArray) -> NDArray:
+    def forward(self, input_data: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """
         Parameters
         ----------
         input_data : (sequence, dimension) or (batch, sequence, dimension)
+        mask : unused -- each position adds its own row of the fixed table,
+            independent of every other position. Accepted for pass-through
+            compatibility with the graph.
 
         Returns
         -------
@@ -289,8 +299,11 @@ class SinusoidEmbedding(Layer):
     def zero_gradients(self) -> None:
         pass
 
-    def get_weights(self) -> None:
-        return None
+    def get_weights(self, for_serialize: bool = False):
+        return {} if for_serialize else None
+
+    def set_weights(self, weights: dict) -> None:
+        pass
 
     def get_gradients(self) -> dict[str, NDArray]:
         """empty by contract, the table is fixed and there is nothing to learn"""

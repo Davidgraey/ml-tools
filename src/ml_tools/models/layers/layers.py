@@ -1,11 +1,17 @@
-import numpy as np
-import ml_tools.models.activations as activations
-from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON, ANY_SHAPE, GLOBAL_COMPLEX_DTYPE
-from numpy.typing import NDArray
-from abc import ABC, abstractmethod
-from typing import Optional, Callable
-import warnings
 import inspect
+import warnings
+from abc import ABC, abstractmethod
+from typing import Callable, Optional
+
+import ml_tools.models.activations as activations
+import numpy as np
+from ml_tools.models.constants import (
+    ANY_SHAPE,
+    EPSILON,
+    GLOBAL_COMPLEX_DTYPE,
+    GLOBAL_DTYPE,
+)
+from numpy.typing import NDArray
 
 
 # -------------    weight initilization functions    ---------------
@@ -40,9 +46,8 @@ def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
     where they disagree.
 
     Shapes are in trailing-axis form, so they are matched from the last axis
-    backwards and only the overlap is checked. The extra leading axes of the
-    longer shape are the ones the shorter one leaves unspoken, so they are
-    unconstrained rather than wrong. None on either side is a wildcard.
+    backwards and only the overlap is checked.
+    none on either side is a wildcard "*" / any_value
 
     Returns
     -------
@@ -113,7 +118,7 @@ class Layer(ABC):
         pass
 
     @abstractmethod
-    def get_weights(self, for_serialize: bool) -> NDArray|dict[str, dict]:
+    def get_weights(self, for_serialize: bool) -> NDArray | dict[str, dict]:
         pass
 
     def set_weights(self, weights: dict) -> None:
@@ -180,7 +185,9 @@ class Layer(ABC):
         """
         layer_cls = cls._registry.get(serialized_dict["type"])
         if layer_cls is None:
-            raise KeyError(f"no layer registered as {serialized_dict['type']!r}. Known: {sorted(cls._registry)}")
+            raise KeyError(
+                f"no layer registered as {serialized_dict['type']!r}. Known: {sorted(cls._registry)}"
+            )
 
         accepted = inspect.signature(layer_cls.__init__).parameters
         config = {k: v for k, v in serialized_dict["config"].items() if k in accepted}
@@ -188,14 +195,18 @@ class Layer(ABC):
         dropped = set(serialized_dict["config"]) - set(config)
 
         if dropped:
-            warnings.warn(f"{serialized_dict['type']}: dropping saved config keys: {sorted(dropped)}")
+            warnings.warn(
+                f"{serialized_dict['type']}: dropping saved config keys: {sorted(dropped)}"
+            )
 
         layer = layer_cls(**config)
 
         try:
             layer.set_weights(serialized_dict["weights"])
         except (ValueError, NotImplementedError) as error:
-            warnings.warn(f"{serialized_dict['type']}: could not instantiate weights -- {error}")
+            warnings.warn(
+                f"{serialized_dict['type']}: could not instantiate weights -- {error}"
+            )
         return layer
 
 
@@ -210,6 +221,8 @@ class FullyConnectedLayer(Layer):
         :param is_output: boolean flag designating if this is an output layer or hidden layer
         """
         super().__init__()
+        self.ni: int = ni
+        self.no: int = no
         self.activation: str = activation_type
         self._func_activation: Callable = activations.activation_dictionary[
             self.activation
@@ -232,7 +245,10 @@ class FullyConnectedLayer(Layer):
         self.zero_gradients()
 
     def forward(
-        self, incoming_x: NDArray, forced_activation: Optional[str] = None
+        self,
+        incoming_x: NDArray,
+        forced_activation: Optional[str] = None,
+        mask: Optional[NDArray] = None,
     ) -> NDArray:
         """
 
@@ -240,6 +256,10 @@ class FullyConnectedLayer(Layer):
         ----------
         incoming_x : input data that is already standardized, if called for
         forced_activation :
+        mask : unused -- every row is projected independently of every other,
+            so padding elsewhere in the sequence can't affect this layer's
+            output. Accepted for pass-through compatibility with the rest of
+            the graph.
 
         Returns
         -------
@@ -348,7 +368,14 @@ class FullyConnectedLayer(Layer):
 
     @property
     def num_parameters(self) -> int:
-        return  self.bias.size + self.weights.size
+        return self.bias.size + self.weights.size
+
+    def get_config(self) -> dict:
+        """activation_type is stored as self.activation, so the base
+        introspection (which matches by name) can't find it on its own"""
+        config = super().get_config()
+        config["activation_type"] = self.activation
+        return config
 
     def __str__(self):
         return f"Layer of {self.activation}, shaped {self.shape} -- output is {self.is_output}"
@@ -374,8 +401,13 @@ class DropoutLayer(Layer):
         self.output = None
 
     def forward(
-        self, incoming_x: NDArray, training_now: bool = True
+        self,
+        incoming_x: NDArray,
+        training_now: bool = True,
+        mask: Optional[NDArray] = None,
     ):
+        """mask : unused -- dropout is applied per element regardless of
+        padding; accepted for pass-through compatibility with the graph."""
         self.input = incoming_x
         if training_now:
             if self.do_hinton:
@@ -417,7 +449,7 @@ class DropoutLayer(Layer):
             return {}
         return None
 
-    def get_gradients(self)  -> dict[str, NDArray]:
+    def get_gradients(self) -> dict[str, NDArray]:
         return {}
 
     @property
@@ -459,13 +491,16 @@ class NormalizeLayer(Layer):
 
         self.zero_gradients()
 
-    def forward(self, incoming_x: NDArray) -> NDArray:
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
+        """mask : unused -- normalization is over each position's own feature
+        axis, independent of every other position; accepted for pass-through
+        compatibility with the graph."""
         self.in_shape = incoming_x.shape
 
         # reshape to 2D in case (batch, sequence, hidden)
         self.input = incoming_x.reshape(-1, self.in_shape[-1])
 
-        _mean = np.mean(self.input,  axis=-1, keepdims=True)
+        _mean = np.mean(self.input, axis=-1, keepdims=True)
         self.std = np.sqrt(np.var(self.input, axis=-1, keepdims=True) + self.eps)
 
         self.x_norm = (self.input - _mean) / self.std
@@ -476,7 +511,11 @@ class NormalizeLayer(Layer):
 
         return output.reshape(self.in_shape)
 
-    def update_weights(self, gradient_beta: Optional[NDArray] = None, gradient_gamma: Optional[NDArray] = None) -> None:
+    def update_weights(
+        self,
+        gradient_beta: Optional[NDArray] = None,
+        gradient_gamma: Optional[NDArray] = None,
+    ) -> None:
         # update the shift & scale values based on gradient contributions
         if self.shift_scale == True:
             self.shift_beta -= gradient_beta
@@ -489,7 +528,9 @@ class NormalizeLayer(Layer):
         incoming_grad = incoming_grad.reshape(-1, original_shape[-1])
         if self.shift_scale == True:
             self.gradient_beta = np.sum(incoming_grad, axis=0, keepdims=True)
-            self.gradient_gamma = np.sum(incoming_grad * self.x_norm, axis=0, keepdims=True)
+            self.gradient_gamma = np.sum(
+                incoming_grad * self.x_norm, axis=0, keepdims=True
+            )
             z = incoming_grad * self.scale_gamma
         else:
             self.gradient_beta = None
@@ -497,7 +538,9 @@ class NormalizeLayer(Layer):
             z = incoming_grad
 
         gradient = (1.0 / self.std) * (
-                z - np.mean(z, axis=-1, keepdims=True) - self.x_norm * np.mean(z * self.x_norm, axis=-1, keepdims=True)
+            z
+            - np.mean(z, axis=-1, keepdims=True)
+            - self.x_norm * np.mean(z * self.x_norm, axis=-1, keepdims=True)
         )
         return gradient.reshape(original_shape)
 
@@ -516,7 +559,6 @@ class NormalizeLayer(Layer):
         else:
             return {}
 
-
     def get_gradients(self) -> dict[str, NDArray]:
         if self.shift_scale is True:
             return {
@@ -525,10 +567,8 @@ class NormalizeLayer(Layer):
             }
         return {}
 
-
     def set_weights(self, weights: dict) -> None:
         if weights is not None:
-
             self.shift_beta = np.asarray(weights["shift_beta"], dtype=GLOBAL_DTYPE)
             self.scale_gamma = np.asarray(weights["scale_gamma"], dtype=GLOBAL_DTYPE)
 
@@ -570,10 +610,12 @@ class RMSNormLayer(Layer):
 
         self.zero_gradients()
 
-    def forward(self, incoming_x: NDArray) -> NDArray:
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
+        """mask : unused -- same reasoning as NormalizeLayer: each position
+        is normalized against only its own features."""
         in_shape = incoming_x.shape
         self.input = incoming_x.reshape(-1, in_shape[-1])
-        self.rms = np.sqrt(np.mean(self.input ** 2, axis=-1, keepdims=True) + self.eps)
+        self.rms = np.sqrt(np.mean(self.input**2, axis=-1, keepdims=True) + self.eps)
         self.x_norm = self.input / self.rms
         return (self.x_norm * self.scale_gamma).reshape(in_shape)
 
@@ -584,7 +626,9 @@ class RMSNormLayer(Layer):
         self.gradient_gamma = np.sum(grad * self.x_norm, axis=0, keepdims=True)
 
         z = grad * self.scale_gamma
-        gradient = (z - self.x_norm * np.mean(z * self.x_norm, axis=-1, keepdims=True)) / self.rms
+        gradient = (
+            z - self.x_norm * np.mean(z * self.x_norm, axis=-1, keepdims=True)
+        ) / self.rms
         return gradient.reshape(original_shape)
 
     def update_weights(self, gradient_gamma: NDArray) -> None:
@@ -621,14 +665,17 @@ class RMSNormLayer(Layer):
     def __repr__(self):
         return self.__str__()
 
-if __name__ == "__main__":    ## working example -- train--- -- MOVE TO TESTS!
+
+if __name__ == "__main__":  ## working example -- train--- -- MOVE TO TESTS!
+    import matplotlib.pyplot as plt
+    from ml_tools.generators import RandomDatasetGenerator
     from ml_tools.models.model_loss import MSELoss
     from ml_tools.models.optimizers import SGD
-    from ml_tools.generators import RandomDatasetGenerator
-    import matplotlib.pyplot as plt
 
     r = RandomDatasetGenerator()
-    x_regression, y_regression, meta = r.generate(task="regression", num_samples=1500, num_features=3, noise_scale=1.5)
+    x_regression, y_regression, meta = r.generate(
+        task="regression", num_samples=1500, num_features=3, noise_scale=1.5
+    )
     fc = FullyConnectedLayer(ni=3, no=10, activation_type="relu")
     nc1 = NormalizeLayer(ni=10, shift_scale=False)
     dp = DropoutLayer(dropout_prob=0.05)
@@ -636,7 +683,9 @@ if __name__ == "__main__":    ## working example -- train--- -- MOVE TO TESTS!
     nc2 = NormalizeLayer(ni=10, shift_scale=True)
     fc3 = FullyConnectedLayer(ni=10, no=10, activation_type="relu", is_output=False)
     fc4 = FullyConnectedLayer(ni=10, no=10, activation_type="sigmoid", is_output=False)
-    fc5 = FullyConnectedLayer(ni=10, no=10, activation_type="relu_leaky", is_output=False)
+    fc5 = FullyConnectedLayer(
+        ni=10, no=10, activation_type="relu_leaky", is_output=False
+    )
     fc6 = FullyConnectedLayer(ni=10, no=1, activation_type="tanh", is_output=True)
     lossfc = MSELoss()
     optimizer = SGD(0.002)

@@ -16,21 +16,17 @@ things follow from that:
     pass is a walk down the list
 """
 
-# train() and eval() annotate their return as NeuralNetwork from inside the
-# class body, where the name does not exist yet. Deferring annotations is what
-# makes that legal, and without it the module raises NameError on import.
-from __future__ import annotations
-import time
-
 import inspect
+import pickle
+import time
 from typing import Iterable, Optional
 
 import numpy as np
+from ml_tools.models.layers.layers import ANY_SHAPE, Layer, shape_conflict
 from numpy.typing import NDArray
 
-from ml_tools.models.layers.layers import ANY_SHAPE, Layer, shape_conflict
-
 INPUT_NAME = "input"
+
 
 class Node:
     """
@@ -63,8 +59,8 @@ class Node:
         self.consumers: list = []
 
         if layer is None:
-            self.in_shape = shape[0]
-            self.out_shape = shape[-1]
+            self.in_shape = shape
+            self.out_shape = shape
         else:
             incoming = tuple(source.out_shape for source in sources)
             resolved = layer.infer_output_shapes(incoming)
@@ -77,14 +73,20 @@ class Node:
             self.in_shape = shape[0]
             self.out_shape = resolved[0]
 
-        # Check once here instead of inspecting the signature on every forward pass.
-        self.accepts_training = bool(layer) and (
-                "training_now" in inspect.signature(layer.forward).parameters
-        )
-        # flag for allowing the mask
-        self.accepts_mask = bool(layer) and (
-                "mask" in inspect.signature(layer.forward).parameters
-        )
+        if layer is None:
+            self.forward_kwargs: frozenset[str] = frozenset()
+            self.accepts_any_kwarg = False
+        else:
+            parameters = inspect.signature(layer.forward).parameters
+            self.forward_kwargs = frozenset(
+                name
+                for name, parameter in parameters.items()
+                if parameter.default is not inspect.Parameter.empty
+            )
+            self.accepts_any_kwarg = any(
+                parameter.kind is parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
 
         for source in sources:
             source.consumers.append(self)
@@ -95,8 +97,7 @@ class Node:
 
     @property
     def shapes(self) -> dict[str, tuple]:
-        return {"input": self.in_shape,
-                "output": self.out_shape}
+        return {"input": self.in_shape, "output": self.out_shape}
 
     def __hash__(self):
         return id(self)
@@ -162,6 +163,7 @@ class NeuralNetwork:
 
         source = Node(INPUT_NAME, shape=tuple(input_shape))
         object.__setattr__(self, "_input", source)
+        object.__setattr__(self, "_input_shape", tuple(input_shape))
         self._nodes.append(source)
 
         if layers is not None:
@@ -170,14 +172,10 @@ class NeuralNetwork:
     # ------------- connecting
     @property
     def input(self) -> Node:
-        """ the graph's source node; pass it as an input source to the first layer """
+        """the graph's source node; pass it as an input source to the first layer"""
         return self._input
 
-    def connect(self,
-                layer: Layer,
-                *sources: Node,
-                name: Optional[str] = None
-                ) -> Node:
+    def connect(self, layer: Layer, *sources: Node, name: Optional[str] = None) -> Node:
         """
         Place a layer in the graph, fed by the given nodes, and return its node.
 
@@ -310,7 +308,7 @@ class NeuralNetwork:
         return f"{stem}_{index}"
 
     def extend(self, layers: Iterable[Layer]) -> Node:
-        """ chain layers end to end """
+        """chain layers end to end"""
         node = self._output or self._input
         for layer in layers:
             node = self.connect(layer, node)
@@ -330,9 +328,7 @@ class NeuralNetwork:
         real node produces a valid graph with the wrong edge, which nothing can
         detect.
         """
-        requested = (
-            (inputs,) if isinstance(inputs, (str, Node)) else tuple(inputs)
-        )
+        requested = (inputs,) if isinstance(inputs, (str, Node)) else tuple(inputs)
         sources = tuple(
             source if isinstance(source, Node) else self.get_node(source)
             for source in requested
@@ -373,7 +369,7 @@ class NeuralNetwork:
 
     # ------------- registration
     def __setattr__(self, attribute: str, value):
-        """ assigning a Layer registers it directly """
+        """assigning a Layer registers it directly"""
         if isinstance(value, Layer):
             self._remember(value)
         elif isinstance(value, NeuralNetwork) and value is not self:
@@ -386,33 +382,38 @@ class NeuralNetwork:
             self._registered.append(layer)
 
     # ------------- the passes
-    def forward(self,
-                x_data: NDArray,
-                mask: Optional[NDArray] = None) -> NDArray:
+    def forward(self, x_data: NDArray, **kwargs) -> NDArray:
         """
         forward pass -- taking the insertion order or navigating the node-to-node process
 
-        mask : optional (batch, sequence) array, 1 where a position is real
-            content and 0 where it is padding. Delivered to whichever layers
-            declare a `mask` parameter; every other layer is unaffected.
+        kwargs : offered to every node, and picked up only by the layers
+            that declare a matching optional parameter -- mask, forced_activation,
+            or anything a layer adds later. A layer that doesn't declare the
+            name never receives it, so unused kwargs are silently ignored.
+            training_now defaults to the network's own train()/eval() state
+            and can be overridden here like any other kwarg.
         """
         start = time.perf_counter()
         output = self.output
         values = {self._input: x_data}
+        pool = {"training_now": self.training, **kwargs}
 
         for node in self._nodes:
             if node.is_source:
                 continue
             arguments = [values[source] for source in node.sources]
+            passthrough = (
+                pool
+                if node.accepts_any_kwarg
+                else {
+                    key: value
+                    for key, value in pool.items()
+                    if key in node.forward_kwargs
+                }
+            )
             start = time.perf_counter()
-            if node.accepts_training:
-                values[node] = node.layer.forward(
-                    *arguments, training_now=self.training
-                )
-            else:
-                values[node] = node.layer.forward(*arguments)
+            values[node] = node.layer.forward(*arguments, **passthrough)
             self._record_timing(node.name, "forward", time.perf_counter() - start)
-
 
         object.__setattr__(
             self, "activations", {node.name: value for node, value in values.items()}
@@ -449,13 +450,18 @@ class NeuralNetwork:
 
         return gradients.get(self._input)
 
-    def __call__(self, x_data: NDArray) -> NDArray:
-        return self.forward(x_data)
+    def __call__(self, x_data: NDArray, **kwargs) -> NDArray:
+        return self.forward(x_data, **kwargs)
 
     def _record_timing(self, name: str, phase: str, elapsed: float) -> None:
         entry = self._timings.setdefault(
-            name, {"forward_total": 0.0, "forward_calls": 0,
-                   "backward_total": 0.0, "backward_calls": 0}
+            name,
+            {
+                "forward_total": 0.0,
+                "forward_calls": 0,
+                "backward_total": 0.0,
+                "backward_calls": 0,
+            },
         )
         entry[f"{phase}_total"] += elapsed
         entry[f"{phase}_calls"] += 1
@@ -473,8 +479,13 @@ class NeuralNetwork:
         top : only show this many nodes; None shows every timed node
         """
         rows = [
-            (name, entry["forward_total"], entry["forward_calls"],
-             entry["backward_total"], entry["backward_calls"])
+            (
+                name,
+                entry["forward_total"],
+                entry["forward_calls"],
+                entry["backward_total"],
+                entry["backward_calls"],
+            )
             for name, entry in self._timings.items()
         ]
         rows.sort(key=lambda row: row[1] + row[3], reverse=True)
@@ -500,9 +511,7 @@ class NeuralNetwork:
     def edges(self) -> list[tuple[str, str]]:
         """every (producer, consumer) pair, for tracing or rendering"""
         return [
-            (source.name, node.name)
-            for node in self._nodes
-            for source in node.sources
+            (source.name, node.name) for node in self._nodes for source in node.sources
         ]
 
     def validate(self) -> list[str]:
@@ -531,6 +540,80 @@ class NeuralNetwork:
                 f"{layer.__class__.__name__} is registered but not connected"
             )
         return problems
+
+    # ------------- serialization
+    def serialize(self) -> dict:
+        """
+        Package the graph into a plain, nested dict: every connected node's
+        layer (via Layer.serialize()), the edges between them by name, and
+        enough of the network's own state to rebuild it with deserialize().
+
+        A node's identity is an object reference while the graph is live;
+        here an edge becomes a name reference, since that is what survives
+        a dict. Nodes are listed in insertion order, which the class already
+        keeps topological, so replaying them on deserialize connects every
+        source before anything that needs it.
+
+        The input source node itself isn't listed -- it carries no layer,
+        and __init__ rebuilds it from input_shape.
+        """
+        nodes = [
+            {
+                "name": node.name,
+                "sources": [source.name for source in node.sources],
+                "layer": node.layer.serialize(),
+            }
+            for node in self._nodes
+            if not node.is_source
+        ]
+
+        return {
+            "name": self.name,
+            "input_shape": self._input_shape,
+            "nodes": nodes,
+            "output": self.output.name,
+        }
+
+    @classmethod
+    def deserialize(cls, serialized_dict: dict) -> NeuralNetwork:
+        """
+        Rebuild a network from serialize() output.
+
+        Each layer is restored with Layer.deserialize(), then reconnected
+        through the ordinary connect() -- so a rebuilt graph is checked for
+        shape conflicts exactly as it was the first time it was built.
+        """
+        net = cls(
+            name=serialized_dict["name"], input_shape=serialized_dict["input_shape"]
+        )
+        by_name = {INPUT_NAME: net.input}
+
+        for entry in serialized_dict["nodes"]:
+            layer = Layer.deserialize(entry["layer"])
+            try:
+                sources = tuple(
+                    by_name[source_name] for source_name in entry["sources"]
+                )
+            except KeyError as error:
+                raise KeyError(
+                    f"node {entry['name']!r} needs source {error}, which hasn't "
+                    "been connected yet -- the saved nodes are out of order"
+                ) from error
+            by_name[entry["name"]] = net.connect(layer, *sources, name=entry["name"])
+
+        net.output = by_name[serialized_dict["output"]]
+        return net
+
+    def save(self, path: str) -> None:
+        """pickle serialize() to a single file -- weights are raw ndarrays, not JSON-safe"""
+        with open(path, mode="wb") as f:
+            pickle.dump(self.serialize(), f, protocol=pickle.DEFAULT_PROTOCOL)
+
+    @classmethod
+    def load(cls, path: str) -> NeuralNetwork:
+        """the inverse of save()"""
+        with open(path, mode="rb") as f:
+            return cls.deserialize(pickle.load(f))
 
     def train(self) -> NeuralNetwork:
         object.__setattr__(self, "training", True)
@@ -595,16 +678,12 @@ class NeuralNetwork:
         """
         if x_data is not None:
             self.forward(x_data)
-        shapes = {
-            name: np.shape(value) for name, value in self.activations.items()
-        }
+        shapes = {name: np.shape(value) for name, value in self.activations.items()}
 
         listed = [node for node in self._nodes if not node.is_source]
         width = max((len(node.name) for node in listed), default=4)
 
-        lines = [
-            f"{self.name}: {len(listed)} nodes, {self.num_parameters} parameters"
-        ]
+        lines = [f"{self.name}: {len(listed)} nodes, {self.num_parameters} parameters"]
         lines.append(f"  {'node'.ljust(width)}  {'sources':<26} shape")
         for node in listed:
             marker = " <- output" if node is self._output else ""

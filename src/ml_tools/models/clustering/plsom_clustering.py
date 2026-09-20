@@ -1,16 +1,14 @@
 import copy
 import time
+from typing import Callable, Optional
 
 import matplotlib.pyplot as plt
-import numpy as np
-from numpy.typing import NDArray
-from typing import Optional
-
 import ml_tools.distances as distances
+import numpy as np
 from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork
-from ml_tools.visuals.cluster_visuals import plot_clusters
 from ml_tools.types import BasalModel
-
+from ml_tools.visuals.cluster_visuals import plot_clusters
+from numpy.typing import NDArray
 
 DISTANCE_DICT = {
     "euclidean": distances.euclidian_distance,
@@ -40,6 +38,17 @@ class PLSOM(BasalModel):
     sample:pseudo-clustering:cluster membership chain.
     """
 
+    # fields that fully determine a fitted map's structure and weights, on top
+    # of BasalModel's core (x_means, x_stds) -- _capture_state/_restore_state
+    # (inherited from BasalModel) snapshot exactly these. Growing subclasses
+    # extend this tuple further with their own structural fields
+    # (network_shape, etc).
+    _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
+        "weights",
+        "hit_map",
+        "node_error",
+    )
+
     def __init__(
         self,
         width: int,
@@ -51,6 +60,12 @@ class PLSOM(BasalModel):
         distance="euclidean",
         verbose: bool = False,
         hit_decay: float = 0.9,
+        r_decay: float = 0.99,
+        validation_fraction: float = 0.0,
+        patience: int = 10,
+        min_delta: float = 1e-4,
+        restore_best: bool = True,
+        freeze_fraction: float = 0.15,
     ):
         """
         Create the Self Organizing Map  - rectangular / square grids
@@ -68,8 +83,30 @@ class PLSOM(BasalModel):
         hit_decay : per-epoch multiplier on hit_map and node_error, so both
             describe recent activity rather than the whole training history. At
             0.9 a node's record is largely forgotten over about ten epochs.
+        r_decay : per-epoch multiplier carried into the next epoch's starting
+            previous_step_r (see calc_epsilon), so the error scale can relax
+            over training instead of being pinned wherever an early epoch's
+            first sample happened to set it.
+        validation_fraction : fraction of x held out from fitting to score
+            each epoch. 0 (default) disables validation entirely -- no split,
+            no early stopping, no best-state rollback.
+        patience : consecutive epochs without a validation improvement of at
+            least min_delta before training stops early. Only used when
+            validation_fraction > 0.
+        min_delta : minimum drop in validation error that counts as an
+            improvement.
+        restore_best : if True and validation is enabled, the map is rolled
+            back to its best-validation-epoch state at the end of fit(),
+            rather than left at whatever the final epoch produced.
+        freeze_fraction : fraction of num_iterations, at the end of training,
+            during which structural changes (grow/prune/reinit) are disabled
+            so a late-inserted node still gets real training time before the
+            run ends. Has no effect on a fixed-lattice PLSOM, only on growing
+            subclasses.
         """
-        super().__init__(input_dimension=input_dim, output_dimension=width * height)
+        super().__init__(
+            input_dimension=input_dim, output_dimension=width * height, seed=lock_seed
+        )
 
         self.width = width
         self.height = height
@@ -88,6 +125,11 @@ class PLSOM(BasalModel):
         self.node_error = np.zeros(shape=self.n_neurons)
         self.verbose = verbose
 
+        # "grid" judges neighborhood by lattice position (see calc_neighborhood);
+        # a subclass with no lattice (e.g. a distance-only grower) sets this to
+        # "dist" to judge it by distance between neurons' weight vectors instead
+        self.neighborhood_method = "grid"
+
         # Constants
         # minimum theta (within neighborhood influence)- 1 for alternate equations - might be worth trying both!
         self.THETAMIN = theta_min if theta_min else 1
@@ -103,6 +145,21 @@ class PLSOM(BasalModel):
         self.epsilon_trace = []
 
         self.previous_step_r = 0
+        self.r_decay = r_decay
+
+        assert 0.0 <= validation_fraction < 1.0, "validation_fraction must be in [0, 1)"
+        assert 0.0 <= freeze_fraction <= 1.0, "freeze_fraction must be in [0, 1]"
+        self.validation_fraction = validation_fraction
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best = restore_best
+        self.freeze_fraction = freeze_fraction
+
+        self.val_error_trace: list[float] = []
+        self.best_val_error: float = float("inf")
+        self.best_epoch: Optional[int] = None
+        self.structure_frozen: bool = False
+        self._best_state: Optional[dict] = None
 
     def initialize_weights(self, x: NDArray, method="kaiming") -> NDArray:
         """
@@ -120,7 +177,7 @@ class PLSOM(BasalModel):
             # may need to scale down bound further!
             bound = np.sqrt(2 / self.N_DIMS)
             # all our values will be between 0 and 1 for categorical data
-            return np.random.uniform(
+            return self.RNG.uniform(
                 low=0, high=bound, size=(self.n_neurons, self.N_DIMS)
             )
 
@@ -129,13 +186,13 @@ class PLSOM(BasalModel):
             for dim in range(self.N_DIMS):
                 low = np.min(x, axis=0)[dim]
                 high = np.max(x, axis=0)[dim]
-                weights[:, dim] = np.random.uniform(
+                weights[:, dim] = self.RNG.uniform(
                     low=low, high=high, size=(self.n_neurons)
                 )
             return weights
 
         else:
-            return np.random.uniform(
+            return self.RNG.uniform(
                 low=-0.1, high=0.1, size=(self.n_neurons, self.N_DIMS)
             )
 
@@ -162,27 +219,64 @@ class PLSOM(BasalModel):
         return _x
 
     def fit(
-        self, x: NDArray, num_iterations: int, verbose: Optional[bool] = None
+        self,
+        x: NDArray,
+        num_iterations: int,
+        verbose: Optional[bool] = None,
+        on_epoch: Optional[Callable[["PLSOM", int], None]] = None,
     ) -> None:
-        # initalize our paramters, weights and standaridzaion trackers
-        _x = self.initalize_params(x)
+        """
+        Parameters
+        ----------
+        on_epoch : optional callback run at the end of every epoch, after
+            after_epoch's own growth/prune decision, as (self, step). A seam
+            for a caller that wants a snapshot per epoch (e.g. an animation)
+            without altering training itself.
+        """
+        x = np.asarray(x)
+
+        if self.validation_fraction > 0:
+            n_val = max(1, int(len(x) * self.validation_fraction))
+            perm = self.RNG.permutation(len(x))
+            val_idx, train_idx = perm[:n_val], perm[n_val:]
+            x_train, x_val_raw = x[train_idx], x[val_idx]
+        else:
+            x_train, x_val_raw = x, None
+
+        # initalize our paramters, weights and standaridzaion trackers -- the
+        # validation split is held out of this too, so its stats never leak in
+        _x = self.initalize_params(x_train)
+        _x_val = self.standardize(x_val_raw) if x_val_raw is not None else None
+
+        epochs_without_improvement = 0
 
         for step in range(num_iterations):
             self.RNG.shuffle(_x)
-            # Decay our maximum value of THETA slightly - To  keep the full grid from being pulled back and forth by outliers
-            self.THETAMAX = (
-                self.THETAMAX * 0.98
-                if self.THETAMAX > self.THETAMIN
-                else self.THETAMIN + 1
-            )
+            # Decay our maximum value of THETA slightly - To  keep the full grid from being pulled back and forth by outliers.
+            # Floored at THETAMIN rather than reset above it: bouncing back up to
+            # THETAMIN + 1 every time it dipped below created a permanent decay/jump
+            # sawtooth once THETAMAX got close to THETAMIN, and each jump suddenly
+            # widens the neighborhood again, which can collapse the whole map.
+            self.THETAMAX = max(self.THETAMAX * 0.98, self.THETAMIN)
 
             # fade the per-node records so they track recent activity. Without
             # this a node that was dead early still reads as dead once busy.
             self.hit_map *= self.hit_decay
             self.node_error *= self.hit_decay
 
+            # structural changes freeze for the last freeze_fraction of
+            # training, so a late-inserted node still gets real training time
+            # under a properly annealed neighborhood before the run ends
+            self.structure_frozen = step >= num_iterations * (1 - self.freeze_fraction)
+
             bmu_i, bmu_dist = self.calc_bmu(_x[0])
-            self.previous_step_r = bmu_dist[bmu_i]
+            # carry the error scale forward across epochs (decayed by
+            # r_decay) instead of resetting it to a single noisy point
+            # estimate every epoch -- lets it relax as training converges
+            # without being pinned wherever an early epoch's first sample set it
+            self.previous_step_r = max(
+                self.previous_step_r * self.r_decay, bmu_dist[bmu_i]
+            )
 
             error_trace = []
             epsilon_trace = []
@@ -217,6 +311,33 @@ class PLSOM(BasalModel):
             self.q_error_trace.append(np.mean(error_trace))
             self.epsilon_trace.append(np.mean(epsilon_trace))
             self.after_epoch(step)
+            self.anneal_structure_thresholds()
+            if on_epoch is not None:
+                on_epoch(self, step)
+
+            if _x_val is not None:
+                _, val_dist = self.forward(_x_val)
+                val_error = float(np.mean(np.min(val_dist, axis=-1)))
+                self.val_error_trace.append(val_error)
+
+                if val_error < self.best_val_error - self.min_delta:
+                    self.best_val_error = val_error
+                    self.best_epoch = step
+                    self._best_state = self._capture_state()
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+
+                if epochs_without_improvement >= self.patience:
+                    if self.verbose or verbose:
+                        print(
+                            f"early stop at epoch {step}, best val error "
+                            f"{self.best_val_error:.4f} at epoch {self.best_epoch}"
+                        )
+                    break
+
+        if _x_val is not None and self.restore_best and self._best_state is not None:
+            self._restore_state(self._best_state)
 
         if self.verbose or verbose:
             self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
@@ -231,6 +352,25 @@ class PLSOM(BasalModel):
         lattice has nothing to do here, so this is deliberately empty.
         """
         pass
+
+    def anneal_structure_thresholds(self) -> None:
+        """
+        Seam for growing subclasses to make structural change progressively
+        harder to trigger as training proceeds. A fixed lattice has nothing
+        to anneal, so this is deliberately empty.
+        """
+        pass
+
+    def mean_node_error(self) -> NDArray:
+        """
+        Average quantisation error per sample assigned to each node.
+
+        The raw node_error is a decayed sum over every sample the node won, so
+        its scale rides on dataset size and would clear any fixed threshold.
+        Dividing by the hit count puts it in the units of a single distance,
+        which is what a growth threshold like GSOM's GT is expressed in.
+        """
+        return self.node_error / np.maximum(self.hit_map, 1.0)
 
     def calc_bmu(self, x: NDArray) -> tuple[NDArray | int, NDArray]:
         """
@@ -297,7 +437,7 @@ class PLSOM(BasalModel):
         # return distance between this unit and all others - return should be n_neurons, n_dims
         if method == "dist":
             bmw = self.weights[bmu_i, :]
-            return self.distance_function(bmw, self.weights)
+            return self.distance_function(bmw, self.weights) ** 2
 
         elif method == "grid":
             return self.grid_distances[bmu_i, :] ** 2
@@ -318,7 +458,10 @@ class PLSOM(BasalModel):
         adjusted gaussian kernel applied to distances
         """
 
-        return np.exp((-1 * self.get_lateral_distance(bmu_i, method="grid") / theta**2))
+        return np.exp(
+            -self.get_lateral_distance(bmu_i, method=self.neighborhood_method)
+            / theta**2
+        )
 
     def _idx_to_grid(self, idx: int) -> tuple[int, int]:
         """

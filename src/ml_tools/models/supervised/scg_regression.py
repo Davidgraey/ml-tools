@@ -30,6 +30,15 @@ from ml_tools.types import BasalModel
 
 
 class GradientDescent(BasalModel):
+    # fields that fully determine a fitted model's prediction-time state, on
+    # top of BasalModel's core (x_means, x_stds) -- serialize()/unserialize()
+    # snapshot and restore exactly these via _capture_state/_restore_state.
+    # y_means/y_stds stay None for a classification task (see init_standardize)
+    # and restore as None, which predict() never reads in that case.
+    _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
+        "weights", "y_means", "y_stds",
+    )
+
     def __init__(
         self,
         task: str | ClassificationTask = "regression",
@@ -59,6 +68,13 @@ class GradientDescent(BasalModel):
         self.reg_alpha: float = (
             reg_alpha  # balance between lasso L1 (0.0) ridge L2 (1.0)
         )
+
+        # only populated by init_standardize for a regression task -- set here
+        # (rather than left undefined) so a classification model always has
+        # them, same as BasalModel's x_means/x_stds, and _capture_state never
+        # hits a missing attribute
+        self.y_means = None
+        self.y_stds = None
 
         self.task: ClassificationTask = task
         if task == "regression":
@@ -483,6 +499,69 @@ class GradientDescent(BasalModel):
         """return a copy of the weights"""
         self._weight_shape = self.weights.shape
         return copy.deepcopy(self.weights)
+
+    def get_config(self) -> dict:
+        """constructor hyperparameters, JSON-safe"""
+        task = self.task
+        return {
+            "task": task.value if isinstance(task, ClassificationTask) else task,
+            "divisi": self.divisi,
+            "reg_lambda": self.reg_lambda,
+            "reg_alpha": self.reg_alpha,
+            "use_elastic_reg": self.use_elastic_reg,
+            "early_termination": self.early_termination,
+        }
+
+    def serialize(self) -> dict:
+        """
+        Package the fitted model for inference: type, config, and just the
+        weights predict() needs (_structural_state_keys).
+
+        Returns
+        -------
+        dict
+            {"type", "config", "weights"}, where weights holds the beta
+            coefficients and the standardization stats for both x and y.
+        """
+        return {
+            "type": self.__class__.__name__,
+            "config": self.get_config(),
+            "weights": self._capture_state(),
+        }
+
+    @classmethod
+    def unserialize(cls, payload: dict) -> "GradientDescent":
+        """
+        Reconstruct a fitted model for inference from serialize()'s output.
+
+        Parameters
+        ----------
+        payload : dict, as returned by serialize()
+
+        Returns
+        -------
+        GradientDescent
+            fitted, ready for predict() (and for fit() to continue training)
+        """
+        config = payload["config"]
+        task = config["task"]
+        if task != "regression":
+            task = ClassificationTask(task)
+
+        model = cls(
+            task=task,
+            divisi=config["divisi"],
+            reg_lambda=config["reg_lambda"],
+            reg_alpha=config["reg_alpha"],
+            use_elastic_reg=config["use_elastic_reg"],
+            early_termination=config["early_termination"],
+        )
+        model._restore_state(payload["weights"])
+        # weights include the bias row, so this is the true input dimension
+        model.input_dimension = model.weights.shape[0] - 1
+        model.full_init = True
+
+        return model
 
 
 if __name__ == "__main__":

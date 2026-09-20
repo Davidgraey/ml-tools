@@ -41,6 +41,7 @@ def silhouette_score(x_data: NDArray, prediction: NDArray) -> float:
     # intra-cluster mean distance for each sample (exclude self)
     own_sizes = cluster_sizes[inv]
     own_sums = summed_distances[np.arange(num_samples), inv]
+    is_singleton = own_sizes <= 1
     with np.errstate(divide="ignore", invalid="ignore"):
         # I hate that npwhere doesn't like kwargs.
         intra_dist = np.where(
@@ -68,6 +69,11 @@ def silhouette_score(x_data: NDArray, prediction: NDArray) -> float:
             (nearest_clust_dist - intra_dist) / largest_delta,
             0.0
         )
+
+    # a sample alone in its own cluster has no intra-cluster distance to
+    # measure cohesion against -- convention (matching sklearn) is silhouette
+    # 0 for it, not the 1.0 that "perfect cohesion" (intra_dist=0) would imply
+    scores = np.where(is_singleton, 0.0, scores)
 
     return np.mean(scores)
 
@@ -134,6 +140,11 @@ def calinski_harabasz_index(x_data: NDArray, prediction: NDArray) -> float:
     unique_labels = np.unique(prediction)
     n_samples, n_features = x_data.shape
     n_clusters = len(unique_labels)
+    # undefined (both terms divide by n_clusters - 1) when everything landed
+    # in one cluster -- match silhouette_score's convention for a degenerate
+    # partition rather than raising a ZeroDivisionError
+    if n_clusters < 2 or n_samples == 0:
+        return 0.0
     overall_mean = np.mean(x_data, axis=0)
 
 
@@ -155,6 +166,100 @@ def calinski_harabasz_index(x_data: NDArray, prediction: NDArray) -> float:
         intra_dispersion += np.sum((cluster_data - cluster_means[i]) ** 2)
 
     return (inter_dispersion / intra_dispersion) * ((n_samples - n_clusters) / (n_clusters - 1))
+
+
+def cubic_clustering_criterion(x_data: NDArray, prediction: NDArray) -> float:
+    """
+    Cubic Clustering Criterion (CCC) for estimating the number of clusters
+    Compares the observed R^2 of a clustering against the R^2 expected from
+    points spread uniformly over the data's own principal-axis extent, with
+    the same number of clusters. Values above ~2-3 suggest real structure;
+    values near or below 0 suggest the clustering has no more structure than
+    a random split of uniform data.
+
+    Parameters
+    ----------
+    x_data : our original data samples
+    prediction : predictied labels as integers
+
+    Returns
+    -------
+    CCC statistic - higher is "better", roughly 0 for no structure
+
+    References
+    ----------
+    Sarle, W.S. (1983), "Cubic Clustering Criterion", SAS Technical
+    Report A-108, SAS Institute Inc.
+    """
+    unique_labels = np.unique(prediction)
+    n_samples, n_features = x_data.shape
+    n_clusters = len(unique_labels)
+    # same degenerate cases as calinski_harabasz_index, plus we need at
+    # least 2 samples to form a covariance matrix
+    if n_clusters < 2 or n_samples < 2:
+        return 0.0
+
+    x_centered = x_data - x_data.mean(axis=0)
+    total_scatter = x_centered.T @ x_centered
+    trace_total = np.trace(total_scatter)
+    if trace_total <= 0:
+        return 0.0
+
+    within_scatter = 0.0
+    for label in unique_labels:
+        cluster_data = x_data[prediction == label]
+        cluster_centered = cluster_data - cluster_data.mean(axis=0)
+        within_scatter += np.sum(cluster_centered ** 2)
+
+    r_squared = 1.0 - within_scatter / trace_total
+
+    # eigenvalues of the covariance matrix describe the data's own
+    # principal-axis spread -- this is the "hyperbox" the null hypothesis
+    # (uniformly distributed points) is compared against
+    eigenvalues = np.linalg.eigvalsh(total_scatter / (n_samples - 1))
+    eigenvalues = np.sort(eigenvalues)[::-1]
+    sqrt_eigs = np.sqrt(np.maximum(eigenvalues, 0.0))
+    s = np.where(sqrt_eigs > 0, sqrt_eigs, 1.0)
+    vv = np.prod(s)
+
+    # scale s down to a per-cluster cell size, then decide how many of the
+    # largest (>= cell size) axes to treat exactly (hypercube) vs.
+    # approximate (hypersphere tail) -- Sarle's mixed approximation
+    cell_scale = (vv / n_clusters) ** (1.0 / n_features)
+    u = s / cell_scale
+    k1 = int(np.sum(u >= 1.0))
+    p1 = min(k1, n_clusters - 1)
+
+    if 0 < p1 < n_features:
+        v1 = np.prod(s[:p1])
+        cell_scale = (v1 / n_clusters) ** (1.0 / p1)
+        u = s / cell_scale
+        b1 = np.sum(1.0 / (n_samples + u[:p1]))
+        tail = u[p1:]
+        b2 = np.sum(tail ** 2 / (n_samples + tail))
+        b_total = b1 + b2
+        effective_dims = p1
+    else:
+        b_total = np.sum(1.0 / (n_samples + u))
+        effective_dims = n_features
+
+    sum_u2 = np.sum(u ** 2)
+    if sum_u2 <= 0:
+        return 0.0
+    expected_r_squared = 1.0 - (b_total / sum_u2) * (
+        (n_samples - n_clusters) ** 2 / n_samples
+    ) * (1.0 + 4.0 / n_samples)
+
+    ratio_num = 1.0 - expected_r_squared
+    ratio_den = 1.0 - r_squared
+    if ratio_num <= 0 or ratio_den <= 0:
+        return 0.0
+
+    ccc = np.log(ratio_num / ratio_den) * (
+        np.sqrt(n_samples * effective_dims / 2.0)
+        / (0.001 + expected_r_squared) ** 1.2
+    )
+    return float(ccc)
 
 
 # ---- performance metrics with labels available ----
@@ -182,11 +287,23 @@ def mutual_information_score(labels_true, labels_pred):
     return mi
 
 
+def entropy_from_counts(counts: NDArray) -> float:
+    """
+    Shannon entropy (nats) of a frequency/count vector. Zero-count entries
+    are dropped first (0 * log(0) is conventionally 0, not nan), which a
+    contingency-matrix row or column routinely has.
+    """
+    counts = counts[counts > 0]
+    if counts.size == 0:
+        return 0.0
+    probabilities = counts / counts.sum()
+    return -np.sum(probabilities * np.log(probabilities))
+
+
 def entropy(labels):
     """Compute entropy of a label distribution."""
     _, counts = np.unique(labels, return_counts=True)
-    probabilities = counts / counts.sum()
-    return -np.sum(probabilities * np.log(probabilities))
+    return entropy_from_counts(counts)
 
 
 def homogeneity(labels_true, labels_pred):
@@ -204,17 +321,18 @@ def homogeneity(labels_true, labels_pred):
 
     num_samples = np.sum(cont_matrix)
     class_freqs = np.sum(cont_matrix, axis=1)
-    class_entropy = entropy(class_freqs)
+    class_entropy = entropy_from_counts(class_freqs)
 
+    # conditional entropy H(C|K) = sum_k (n_k / n) * H(C | K=k) -- each
+    # cluster's own class-mixture entropy, weighted by its share of the data
+    # and accumulated across every cluster, not just the last one
     cond_ent = 0.0
 
     for i in range(num_clusters):
         cluster = cont_matrix[:, i]
         cluster_size = np.sum(cluster)
         if cluster_size > 0:
-            cond_ent = entropy(cluster)
-
-    cond_ent /= num_samples
+            cond_ent += (cluster_size / num_samples) * entropy_from_counts(cluster)
 
     # homogeneity score
     if class_entropy == 0:

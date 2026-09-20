@@ -12,12 +12,22 @@ EPSILON = 1e-12
 
 
 class CentroidNeuralNetwork(BasalModel):
+    # fields that fully determine a fitted model's prediction-time state, on
+    # top of BasalModel's core (x_means, x_stds) -- serialize()/unserialize()
+    # snapshot and restore exactly these via _capture_state/_restore_state.
+    # The per-k growth history (centroid tracker, label tracker, metrics) is
+    # training-time bookkeeping and deliberately left out.
+    _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
+        "centroids", "skip_standardize",
+    )
+
     def __init__(self,
                  max_clusters: int,
                  seed: int = 42,
                  initial_clusters: NDArray | None = None,
                  epsilon: float = 2e-3):
         super().__init__(seed=seed)
+        self.seed = seed
         self.max_clusters = max_clusters
         self.epsilon: float = epsilon
         self.num_dims: int = 0
@@ -37,7 +47,8 @@ class CentroidNeuralNetwork(BasalModel):
         self._is_fitted = False
         self.skip_standardize=False
 
-        self.metrics = {k: 0.0 for k in range(2, max_clusters)}
+        self.metrics = {k: 0.0 for k in range(2, max_clusters + 1)}
+        self._scored = False
 
     @staticmethod
     def distance_metric(data_x: NDArray, data_y: NDArray) -> NDArray:
@@ -93,7 +104,7 @@ class CentroidNeuralNetwork(BasalModel):
     def split_clusters(self, xs, closest_centroids, num_centroids: int, split_target: int):
 
         cluster_xs = xs[closest_centroids == split_target]
-        cluster_mean = np.mean(cluster_xs)
+        cluster_mean = np.mean(cluster_xs, axis=0)
         centered_xs = cluster_xs - cluster_mean
         cluster_covariance = np.cov(cluster_xs, rowvar=False)
 
@@ -120,7 +131,7 @@ class CentroidNeuralNetwork(BasalModel):
             org_x_data: NDArray,
             verbose: bool = False,
             num_iterations: int = 25,
-            fast_forward: bool = True,
+            fast_forward: bool = False,
             mini_batch: bool = False,
             skip_standardize: bool = False
     ) -> tuple[NDArray, NDArray]:
@@ -130,12 +141,23 @@ class CentroidNeuralNetwork(BasalModel):
         ----------
         org_x_data : numpy.ndarray
         verbose : bool Verbose will trigger plotting and additional outputs during the fit process
-        fast_forward : bool - if True, will skip metric calculations and plotting
+        fast_forward : bool - if True, skips metric calculations and plotting, and get_optimal()
+            has nothing to select from (it will raise instead of silently returning the smallest k)
 
         Returns
         -------
         the unstandardized centroid locations and the class labels for each data point
         """
+        # refitting an already-fitted instance starts clean rather than growing
+        # from wherever the previous fit left off
+        if self._is_fitted:
+            self.centroids = None
+            self._label_tracker = {}
+            self._centroid_tracker = {}
+            self.metrics = {k: 0.0 for k in range(2, self.max_clusters + 1)}
+            self._scored = False
+            self._is_fitted = False
+
         # check and see if we've done the standardization process:
         if skip_standardize:
             self.skip_standardize = skip_standardize
@@ -144,8 +166,11 @@ class CentroidNeuralNetwork(BasalModel):
             self.init_standardize(org_x_data)
             x_data = self.standardize(org_x_data)
 
-        self.num_dims = np.ndim(x_data)
         num_samples, num_features = x_data.shape
+        # the density volume formula (local_density) needs the feature count,
+        # not np.ndim(x_data) -- that's always 2 for any ordinary (samples,
+        # features) array, regardless of how many features there actually are
+        self.num_dims = num_features
 
         # overwrite any prior labels -- set all to -1 (no cluster)
         previous_labels = np.full(num_samples, -1, dtype=int)
@@ -155,10 +180,9 @@ class CentroidNeuralNetwork(BasalModel):
         if mini_batch and (num_samples > 500):
             batch_size = max((num_samples // 5), 500)
             log.info(f"processing in minibatches of size: {batch_size}")
-            breakpoint = batch_size * 0.01
         else:
             batch_size = num_samples
-            breakpoint = batch_size * 0.01
+        breakpoint = max(1, int(batch_size * self.epsilon))
 
         # initalize the first two centroids ------------------
         if self.centroids is None:
@@ -189,10 +213,24 @@ class CentroidNeuralNetwork(BasalModel):
                     batch_mask=shuffle_mask
                 )
 
-                # early convergence:
-                # if breakpoint >= changed_count:
-                #     log.info(f"breaking from iterations at step {i} ")
-                #     break
+                if changed_count <= breakpoint:
+                    log.info(f"converged at iteration {i} for {num_centroids} centroids ({changed_count} changed)")
+                    break
+
+            # record this cluster count's state -- every count visited is
+            # trackable/selectable, including the final one (num_centroids ==
+            # max_clusters), which used to be discarded before this point
+            self._centroid_tracker.update({num_centroids: self.centroids[:num_centroids].copy()})
+            if fast_forward is False:
+                self.metrics.update(
+                    {
+                        num_centroids: silhouette_score(
+                            xs,
+                            closest_centroids
+                        )
+                    }
+                )
+                self._scored = True
 
             if num_centroids == self.max_clusters:
                 log.info(f"breaking from iterations at {num_centroids} centroids created ")
@@ -227,19 +265,7 @@ class CentroidNeuralNetwork(BasalModel):
             #     cluster_b
             # ])
 
-            # these metric calculations take time - if we know a target, we can 'fast forward' and skip metrics
-            if fast_forward is False:
-                self.metrics.update(
-                    {
-                        num_centroids: silhouette_score(
-                            xs,
-                            closest_centroids
-                        )
-                    }
-                )
-
             # cleanup, update & ending of the loop ---------------
-            self._centroid_tracker.update({num_centroids: self.centroids[:num_centroids].copy()})
             num_centroids += 1
             # carry this latest "closest" forward into next loop
             self._update_labels(num_centroids, closest_centroids, shuffle_mask)
@@ -267,7 +293,7 @@ class CentroidNeuralNetwork(BasalModel):
             org_x_data: NDArray,
             verbose: bool = False,
             num_iterations: int = 25,
-            fast_forward: bool = True,
+            fast_forward: bool = False,
             mini_batch: bool = False,
             skip_standardize: bool = False,
         ) -> tuple[NDArray, NDArray]:
@@ -311,17 +337,28 @@ class CentroidNeuralNetwork(BasalModel):
 
     def local_density(self, distances: NDArray, k_radius: int=10) -> NDArray:
         """
+        Density around each centroid, from the mean distance to its k nearest
+        points.
 
         Parameters
         ----------
-        x_data :
-        num_centroids :
-        k_radius :
+        distances : (num_points, num_centroids) distance from every point to
+            every centroid.
+        k_radius : target neighbor count. Clamped to what num_points actually
+            supports, so this stays well-defined when clustering runs directly
+            on a small set of prototypes (e.g. a SOM's neurons) rather than the
+            full sample set.
 
         Returns
         -------
-
+        density per centroid.
         """
+        num_points = distances.shape[0]
+        if num_points < 2:
+            return np.ones(distances.shape[1])
+
+        k_radius = min(k_radius, num_points - 1)
+
         # take the mean distance of the closest-K points to centroid (KNN)
         kth_distance = np.mean(
             np.partition(distances, k_radius, axis=0)[:k_radius, :],
@@ -332,38 +369,35 @@ class CentroidNeuralNetwork(BasalModel):
         self.volume = 0.5 * (np.pi ** (self.num_dims-1)) * (radius**self.num_dims)
         point_count = np.sum((distances <= radius), axis=0)
 
-        return point_count / self.volume
+        return point_count / (self.volume + EPSILON)
 
-    def predict(self, x_data: NDArray, skip_standardize: bool = False,) -> tuple[int, NDArray, NDArray]:
+    def predict(self, x_data: NDArray, num_centroids: int | None = None) -> NDArray:
         """
-        Standardize and predict the x_data using the already fitted parameters of the centroid nnet
+        Classify new data against the fitted centroids.
 
         Parameters
         ----------
-        x_data : input sample data -> must match the dimension count of the data used during fitting
+        x_data : input samples, same feature dimension as the data used to fit
+        num_centroids : how many of the fitted centroids to classify against.
+            Defaults to every centroid currently held (e.g. all of them, for a
+            freshly fit model, or just the optimal set, for one restored via
+            unserialize()). Pass get_optimal()'s best count explicitly to pick
+            the optimal k from a still-in-memory fitted model.
 
         Returns
         -------
-        the results of get_optimal -> optimal number of centroids, the centroid positions, and the centroid
-        membership (integer per x data sample)
+        NDArray
+            integer cluster label per sample, nearest centroid by distance
         """
-        if skip_standardize:
-            self.skip_standardize = skip_standardize
-        else:
-            xs = self.standardize(x_data)
-        for num_centroids in range(0, self.max_clusters):
-            closest_centroids, _ = self.forward(
-                x_data=xs,
-                num_centroids=num_centroids,
-                axis=-1
-            )
-            self._update_labels(
-                num_clusters=num_centroids,
-                closest_centroids=closest_centroids,
-                shuffle_mask=np.arange(0, xs.shape[0])
-            )
+        if not self._is_fitted:
+            raise RuntimeError("Model is not fitted yet. Call fit() first.")
 
-        return self.get_optimal()
+        xs = x_data if self.skip_standardize else self.standardize(x_data)
+        if num_centroids is None:
+            num_centroids = len(self.centroids)
+
+        labels, _ = self.forward(xs, num_centroids=num_centroids, axis=-1)
+        return labels
 
     # predictions, targets
     def calculate_loss(
@@ -397,10 +431,30 @@ class CentroidNeuralNetwork(BasalModel):
                 )
             else:
                 error[cluster_idx] = 0
-
-                # include weighting by density - here density approaches 0 for denser clusters
-                error[cluster_idx] * (self.density + EPSILON)
         return error
+
+    def growth_history(self) -> list[dict]:
+        """
+        Centroids and labels at each cluster count tried during fit, in the
+        order they were created (2, 3, ..., final), with centroids on the
+        original data scale like get_optimal(). A seam for a caller that
+        wants to show growth over time (e.g. an animation) without reaching
+        into the internal trackers.
+        """
+        if not self._is_fitted:
+            raise RuntimeError("Model is not fitted yet. Call fit() first.")
+
+        history = []
+        for num_centroids in sorted(self._centroid_tracker):
+            centroids = self._centroid_tracker[num_centroids]
+            if not self.skip_standardize:
+                centroids = self.unstandardize(centroids)
+            history.append(dict(
+                num_centroids=num_centroids,
+                centroids=centroids,
+                labels=self._label_tracker[num_centroids],
+            ))
+        return history
 
     def get_optimal(self) -> tuple[int, NDArray, NDArray]:
         """
@@ -408,6 +462,11 @@ class CentroidNeuralNetwork(BasalModel):
         """
         if not self._is_fitted:
             raise RuntimeError("Model is not fitted yet. Call fit() first.")
+        if not self._scored:
+            raise RuntimeError(
+                "No cluster-count scoring was collected (fit ran with fast_forward=True), "
+                "so there is no meaningful optimum to pick. Refit with fast_forward=False."
+            )
 
         best_scoring = max(self.metrics, key=self.metrics.get)
         if self.skip_standardize:
@@ -419,6 +478,76 @@ class CentroidNeuralNetwork(BasalModel):
             _cents[:best_scoring, ...],
             self._label_tracker[best_scoring]
         )
+
+    def get_config(self) -> dict:
+        """constructor hyperparameters, JSON-safe"""
+        return {
+            "max_clusters": self.max_clusters,
+            "seed": self.seed,
+            "epsilon": self.epsilon,
+        }
+
+    def serialize(self) -> dict:
+        """
+        Package the fitted model for inference: type, config, and just the
+        weights predict() needs (_structural_state_keys). The per-k growth
+        history (centroid tracker, label tracker, metrics) is training-time
+        bookkeeping and is left out.
+
+        Returns
+        -------
+        dict
+            {"type", "config", "weights"}, where weights holds the optimal
+            (standardized-space) centroids and the standardization stats.
+        """
+        best_scoring, _, _ = self.get_optimal()
+
+        # _capture_state reads the CURRENT self.centroids -- swap in just the
+        # optimal-k slice for the snapshot, then put the full growth history
+        # back so this call has no side effect on an in-memory model
+        full_centroids = self.centroids
+        self.centroids = self._centroid_tracker[best_scoring]
+        try:
+            weights = self._capture_state()
+        finally:
+            self.centroids = full_centroids
+
+        return {
+            "type": self.__class__.__name__,
+            "config": self.get_config(),
+            "weights": weights,
+        }
+
+    @classmethod
+    def unserialize(cls, payload: dict) -> "CentroidNeuralNetwork":
+        """
+        Reconstruct a fitted model for inference from serialize()'s output.
+
+        Only the optimal centroids and standardization stats are restored.
+        The growth-history trackers and metrics stay at their fresh-instance
+        defaults, so get_optimal() and growth_history() are not usable on the
+        result -- call predict() instead.
+
+        Parameters
+        ----------
+        payload : dict, as returned by serialize()
+
+        Returns
+        -------
+        CentroidNeuralNetwork
+            fitted, ready for predict()
+        """
+        config = payload["config"]
+
+        model = cls(
+            max_clusters=config["max_clusters"],
+            seed=config["seed"],
+            epsilon=config["epsilon"],
+        )
+        model._restore_state(payload["weights"])
+        model._is_fitted = True
+
+        return model
 
 
 # Example usage:

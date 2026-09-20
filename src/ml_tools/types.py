@@ -1,12 +1,24 @@
 """
 Typing complex objects & definitions for __package__
 """
-from enum import Enum, auto
-import numpy as np
-from numpy.typing import NDArray, ArrayLike
-from typing import Protocol, Tuple, Dict, List, Optional, Union, Iterable, Callable, TypedDict
+import copy
 from abc import ABC, abstractmethod
+from enum import Enum, auto
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    TypedDict,
+    Union,
+)
+
+import numpy as np
 from ml_tools.models.constants import EPSILON
+from numpy.typing import ArrayLike, NDArray
 
 
 # -------------- Transform Base Class  --------------
@@ -17,6 +29,13 @@ class BasalTransform(ABC):
     forward pass and no loss to minimise on its own behalf, so it only
     promises fit, predict and the two combined.
     """
+
+    # fields every BasalTransform needs snapshotted to fully serialize/restore
+    # a fitted instance. Empty here -- unlike BasalModel, BasalTransform has no
+    # __init__ and owns no state of its own -- so a subclass defines its own
+    # fitted-parameter fields from scratch, the same way it extends this empty
+    # tuple rather than overriding it outright.
+    _structural_state_keys: tuple[str, ...] = ()
 
     @abstractmethod
     def fit(self, x_data: NDArray, **kwargs):
@@ -40,9 +59,27 @@ class BasalTransform(ABC):
         info.update(self.__dict__)
         return info
 
+    # --------------- State snapshot / restore ---------------
+    def _capture_state(self) -> dict:
+        """deep-copy the fields that fully determine this transform's fitted state"""
+        return {key: copy.deepcopy(getattr(self, key)) for key in self._structural_state_keys}
+
+    def _restore_state(self, state: dict) -> None:
+        """restore a snapshot taken by _capture_state"""
+        for key, value in state.items():
+            setattr(self, key, value)
+
 
 # -------------- Model Base Class  --------------
 class BasalModel(ABC):
+    # fields every BasalModel needs snapshotted to fully serialize/restore a
+    # fitted instance -- just the standardization stats here, since BasalModel
+    # itself owns no learned parameters of its own. A subclass extends this
+    # tuple with whatever holds its own learned state (weights, centroids,
+    # ...) rather than overriding it outright, so the standardization stats
+    # are never accidentally dropped from a subclass's snapshot.
+    _structural_state_keys: tuple[str, ...] = ("x_means", "x_stds")
+
     def __init__(self,
                  input_dimension: int = 1,
                  output_dimension: int = 1,
@@ -93,6 +130,16 @@ class BasalModel(ABC):
     @property
     def info(self):
         return ""
+
+    # --------------- State snapshot / restore ---------------
+    def _capture_state(self) -> dict:
+        """deep-copy the fields that fully determine this model's fitted state"""
+        return {key: copy.deepcopy(getattr(self, key)) for key in self._structural_state_keys}
+
+    def _restore_state(self, state: dict) -> None:
+        """restore a snapshot taken by _capture_state"""
+        for key, value in state.items():
+            setattr(self, key, value)
 
     # --------------- Standardization / Normalize ---------------
     def update_running_standardize(self, new_data_mean, new_data_std, new_data_count) -> None:

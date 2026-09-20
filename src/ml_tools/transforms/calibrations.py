@@ -24,6 +24,16 @@ class ProbCalibration(BasalTransform):
     Temperature Scaling divides logits by learned T: P = sigmoid(f/T) or softmax(f/T)
     """
 
+    # fields that fully determine a fitted calibrator's predict()-time state,
+    # on top of BasalTransform's (empty) core. Only the branch matching
+    # self.method is ever populated by fit() -- the others stay None, same as
+    # a freshly-constructed instance, so restoring them is harmless.
+    _structural_state_keys: tuple[str, ...] = BasalTransform._structural_state_keys + (
+        "platt_coefficient", "platt_intercept",
+        "isotonic_scores", "isotonic_values",
+        "spline_x", "spline_y", "spline_d",
+    )
+
     def __init__(self, data_dimension: int, method: CalibrationType = "platt"):
 
         self.input_dimension: int = data_dimension
@@ -113,6 +123,52 @@ class ProbCalibration(BasalTransform):
     def fit_predict(self, y_score: NDArray, y_true: NDArray) -> NDArray:
         """Fit and transform in one step."""
         return self.fit(y_score, y_true).predict(y_score)
+
+    def get_config(self) -> dict:
+        """constructor hyperparameters, JSON-safe"""
+        return {
+            "data_dimension": self.input_dimension,
+            "method": self.method.value,
+        }
+
+    def serialize(self) -> dict:
+        """
+        Package the fitted transform for inference: type, config, and just
+        the fitted parameters predict() needs (_structural_state_keys).
+
+        Returns
+        -------
+        dict
+            {"type", "config", "weights"}, where weights holds whichever
+            method's fitted parameters are populated.
+        """
+        return {
+            "type": self.__class__.__name__,
+            "config": self.get_config(),
+            "weights": self._capture_state(),
+        }
+
+    @classmethod
+    def unserialize(cls, payload: dict) -> "ProbCalibration":
+        """
+        Reconstruct a fitted calibrator for inference from serialize()'s
+        output.
+
+        Parameters
+        ----------
+        payload : dict, as returned by serialize()
+
+        Returns
+        -------
+        ProbCalibration
+            fitted, ready for predict()
+        """
+        config = payload["config"]
+        model = cls(data_dimension=config["data_dimension"], method=config["method"])
+        model._restore_state(payload["weights"])
+        model._is_fitted = True
+
+        return model
 
     # Platt Scaling # ------------------------------------------------------------------------
     def _platt_forward(self, logits: NDArray) -> NDArray:
