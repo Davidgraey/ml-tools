@@ -546,13 +546,7 @@ class NeuralNetwork:
         """
         Package the graph into a plain, nested dict: every connected node's
         layer (via Layer.serialize()), the edges between them by name, and
-        enough of the network's own state to rebuild it with deserialize().
-
-        A node's identity is an object reference while the graph is live;
-        here an edge becomes a name reference, since that is what survives
-        a dict. Nodes are listed in insertion order, which the class already
-        keeps topological, so replaying them on deserialize connects every
-        source before anything that needs it.
+        enough of the network's own state to rebuild it with deserialize()
 
         The input source node itself isn't listed -- it carries no layer,
         and __init__ rebuilds it from input_shape.
@@ -575,7 +569,7 @@ class NeuralNetwork:
         }
 
     @classmethod
-    def deserialize(cls, serialized_dict: dict) -> NeuralNetwork:
+    def deserialize(cls, serialized_dict: dict) -> 'NeuralNetwork':
         """
         Rebuild a network from serialize() output.
 
@@ -610,16 +604,16 @@ class NeuralNetwork:
             pickle.dump(self.serialize(), f, protocol=pickle.DEFAULT_PROTOCOL)
 
     @classmethod
-    def load(cls, path: str) -> NeuralNetwork:
+    def load(cls, path: str) -> 'NeuralNetwork':
         """the inverse of save()"""
         with open(path, mode="rb") as f:
             return cls.deserialize(pickle.load(f))
 
-    def train(self) -> NeuralNetwork:
+    def train(self) -> 'NeuralNetwork':
         object.__setattr__(self, "training", True)
         return self
 
-    def eval(self) -> NeuralNetwork:
+    def eval(self) -> 'NeuralNetwork':
         """
         switch to inference -- changes training behavior and training-specific behaviors
         """
