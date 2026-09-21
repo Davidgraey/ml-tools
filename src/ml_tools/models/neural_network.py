@@ -412,7 +412,14 @@ class NeuralNetwork:
                 }
             )
             start = time.perf_counter()
-            values[node] = node.layer.forward(*arguments, **passthrough)
+            try:
+                values[node] = node.layer.forward(*arguments, **passthrough)
+            except Exception as error:
+                shapes = ", ".join(str(np.shape(argument)) for argument in arguments)
+                raise RuntimeError(
+                    f"{node.name} ({node.layer.__class__.__name__}).forward failed "
+                    f"on input shape(s) {shapes}: {error}"
+                ) from error
             self._record_timing(node.name, "forward", time.perf_counter() - start)
 
         object.__setattr__(
@@ -432,7 +439,14 @@ class NeuralNetwork:
                 # nothing downstream in the DAG
                 continue
 
-            returned = node.layer.backward(gradients.pop(node))
+            incoming = gradients.pop(node)
+            try:
+                returned = node.layer.backward(incoming)
+            except Exception as error:
+                raise RuntimeError(
+                    f"{node.name} ({node.layer.__class__.__name__}).backward failed "
+                    f"on gradient shape {np.shape(incoming)}: {error}"
+                ) from error
             self._record_timing(node.name, "backward", time.perf_counter() - start)
             parts = returned if len(node.sources) > 1 else (returned,)
 
@@ -444,6 +458,13 @@ class NeuralNetwork:
 
             for source, part in zip(node.sources, parts):
                 if source in gradients:
+                    if gradients[source].shape != part.shape:
+                        raise ValueError(
+                            f"{node.name!r} sent a {part.shape} gradient to "
+                            f"{source.name!r}, but another consumer already "
+                            f"sent {gradients[source].shape} -- every consumer "
+                            "of a shared source has to agree on its shape"
+                        )
                     gradients[source] = gradients[source] + part
                 else:
                     gradients[source] = part

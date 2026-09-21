@@ -26,7 +26,7 @@ from ml_tools.models.layers.layers import (
     shape_conflict,
 )
 from ml_tools.models.layers.layers import Layer
-from ml_tools.models.blocks import SpectreAttention
+from ml_tools.models.layers.spectre_layers import PersistentMemory, SpectreAttention
 from ml_tools.models.layers.operators import LatentStack
 from ml_tools.models.model_loss import MSELoss
 from ml_tools.models.neural_network import INPUT_NAME, NeuralNetwork, Node
@@ -476,8 +476,22 @@ LAYER_ARGUMENTS = {
     "SinusoidEmbedding": ((8, 6), {}),
     "VotingBase": ((6, 4), {}),
     "VotingWeight": ((6, 4), {}),
-    # VotingGate carries a hidden width the others do not
+    # VotingWeightBalanced and VotingGate carry a hidden width the plain
+    # voters do not
+    "VotingWeightBalanced": ((6, 5, 4), {"top_k": 2}),
     "VotingGate": ((6, 5, 4), {"top_k": 2}),
+    # hidden_dim, num_shared_experts, num_routed_experts, top_k, gate_hidden
+    "MixtureOfExperts": ((6, 2, 5, 2, 8), {}),
+    "PoolingLayer": ((), {}),
+    "LatentSum": ((), {}),
+    "LatentProduct": ((), {}),
+    "LatentDifference": ((), {}),
+    "ShiftRight": ((6,), {}),
+    # memory_tokens, hidden_dim
+    "PersistentMemory": ((3, 6), {}),
+    "SpectreDecoderAttention": ((8, 6), {}),
+    # hidden_dim, sequence_length
+    "WaveletRefinementModule": ((6, 8), {}),
 }
 
 
@@ -539,6 +553,98 @@ def test_every_layer_infers_exactly_one_output_shape(layer_class):
 
     incoming = tuple(ANY_SHAPE for _ in layer.shapes["input"])
     assert len(layer.infer_output_shapes(incoming)) == 1
+
+
+# -------------    forward and backward shapes agree with reality    -----
+# (x_data shape, number of sources). One layer reused twice as both sources
+# is how a merge layer (LatentStack, LatentSum, ...) gets exercised, since
+# connect() lets the same node feed a layer more than once.
+NETWORK_RECIPES = {
+    "FullyConnectedLayer": ((3, 8, 4), 1),
+    "DropoutLayer": ((3, 8, 6), 1),
+    "NormalizeLayer": ((3, 8, 6), 1),
+    "RMSNormLayer": ((3, 8, 6), 1),
+    "FrequencyFFT": ((5, 4), 1),
+    "FourierLayer": ((3, 8, 6), 1),
+    "InverseFourierLayer": ((3, 8, 6), 1),
+    "FourierAttention": ((3, 8, 6), 1),
+    "VotingBase": ((3, 8, 6), 1),
+    "VotingWeight": ((3, 8, 6), 1),
+    "VotingWeightBalanced": ((3, 8, 6), 1),
+    "VotingGate": ((3, 8, 6), 1),
+    "MixtureOfExperts": ((3, 8, 6), 1),
+    "PoolingLayer": ((3, 8, 6), 1),
+    "LatentStack": ((3, 8, 6), 2),
+    "LatentSum": ((3, 8, 6), 2),
+    "LatentProduct": ((3, 8, 6), 2),
+    "LatentDifference": ((3, 8, 6), 2),
+    "ShiftRight": ((3, 8, 6), 1),
+    "SpectreAttention": ((3, 8, 6), 1),
+    "SpectreDecoderAttention": ((3, 8, 6), 1),
+    "RopeEmbedding": ((3, 8, 6), 1),
+    "SinusoidEmbedding": ((3, 8, 6), 1),
+    "WaveletRefinementModule": ((3, 8, 6), 2),
+    # PersistentMemory takes zero inputs -- connect() requires at least one
+    # source, so it cannot be wired into a graph at all. See
+    # test_persistent_memory_has_no_backward_shape_to_check below instead.
+}
+
+
+@pytest.mark.parametrize("layer_class", concrete_layers(), ids=lambda c: c.__name__)
+def test_every_layer_agrees_with_its_own_forward_and_backward_shapes(layer_class):
+    """
+    Wire one layer into a real NeuralNetwork, run an actual forward and
+    backward pass, and check both directions against reality rather than
+    declared metadata:
+
+    - forward's actual output shape against the shape the graph resolved
+      for that node at connect() time (a layer can declare its shapes
+      correctly and still emit something else)
+    - backward's returned input gradient shape against the actual data
+      that was fed to forward()
+    """
+    construction = LAYER_ARGUMENTS.get(layer_class.__name__)
+    recipe = NETWORK_RECIPES.get(layer_class.__name__)
+    if construction is None or recipe is None:
+        pytest.skip(f"{layer_class.__name__} needs a construction and network recipe")
+
+    arguments, keywords = construction
+    x_shape, num_sources = recipe
+    layer = layer_class(*arguments, **keywords)
+
+    net = NeuralNetwork(input_shape=x_shape[1:])
+    node = net.connect(layer, *(net.input for _ in range(num_sources)))
+    net.output = node
+
+    x_data = np.random.RandomState(0).normal(size=x_shape)
+    output = net.forward(x_data)
+
+    conflict = shape_conflict(output.shape, node.out_shape)
+    assert conflict is None, (
+        f"{layer_class.__name__}: forward produced {output.shape}, but the "
+        f"graph resolved this node's output as {node.out_shape} from "
+        f"declared shapes -- {conflict}"
+    )
+
+    grad_output = np.random.RandomState(1).normal(size=output.shape)
+    grad_input = net.backward(grad_output)
+
+    assert grad_input.shape == x_data.shape, (
+        f"{layer_class.__name__}: backward returned {grad_input.shape}, "
+        f"forward was fed {x_data.shape}"
+    )
+
+
+def test_persistent_memory_has_no_backward_shape_to_check():
+    """
+    PersistentMemory declares zero inputs and its forward takes none, so it
+    can never be connect()-ed into a graph -- exercised directly instead of
+    through NETWORK_RECIPES.
+    """
+    layer = PersistentMemory(memory_tokens=3, hidden_dim=6)
+    output = layer.forward()
+    grad = layer.backward(np.random.RandomState(0).normal(size=output.shape))
+    assert grad is None
 
 
 # -------------    the output    -----------------------------------

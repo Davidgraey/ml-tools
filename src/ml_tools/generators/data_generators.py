@@ -30,12 +30,38 @@ def to_multilabel(row_indices: NDArray | list, num_classes: int) -> NDArray:
     return result
 
 
+def token_accuracy(predicted_ids: NDArray, target_ids: NDArray, mask: Optional[NDArray] = None) -> float:
+    """Fraction of non-padded positions where predicted_ids equals target_ids."""
+    predicted_ids, target_ids = np.asarray(predicted_ids), np.asarray(target_ids)
+    if mask is None:
+        mask = np.ones_like(target_ids, dtype=bool)
+    correct = (predicted_ids == target_ids) & mask
+    return float(correct.sum() / max(int(mask.sum()), 1))
+
+
+def sequence_exact_match(predicted_ids: NDArray, target_ids: NDArray, mask: Optional[NDArray] = None) -> float:
+    """Fraction of rows where every non-padded position of predicted_ids equals target_ids."""
+    predicted_ids, target_ids = np.asarray(predicted_ids), np.asarray(target_ids)
+    if mask is None:
+        mask = np.ones_like(target_ids, dtype=bool)
+    row_matches = np.where(mask, predicted_ids == target_ids, True)
+    return float(row_matches.all(axis=-1).mean())
+
+
 SIGNAL_FAMILIES = ("tone", "multitone", "chirp", "damped", "noise")
 IMAGE_SHAPES = ("disc", "rect", "cross", "ring")
 # "gaussian" and "elongated" are analytic (no rejection sampling); the rest
 # reuse the same membership test as IMAGE_SHAPES, sampled as points instead
 # of a pixel mask; "moon" is a half ring.
 CLUSTER_SHAPES = ("gaussian", "elongated", "disc", "rect", "cross", "ring", "moon")
+SEQUENCE_TASKS = ("copy", "reverse", "sort", "cipher", "add")
+
+# reserved ids shared by every sequence task; content tokens (or, for "add",
+# digits and the "+" separator) start at TOKEN_OFFSET
+PAD_ID = 0
+BOS_ID = 1
+EOS_ID = 2
+TOKEN_OFFSET = 3
 
 # floor for the signal duration, so a length-1 request cannot divide by zero
 EPSILON_TIME = 1e-12
@@ -67,6 +93,13 @@ class GenConfig:
     image_size: int = 32
     min_extent: float = 0.15  # smallest shape radius, as a fraction of the image
     max_extent: float = 0.40  # largest shape radius, as a fraction of the image
+
+    # for sequence
+    sequence_task: str = "copy"  # a SEQUENCE_TASKS name
+    vocab_size: int = 12  # size of the content vocabulary, excluding PAD/BOS/EOS
+    min_seq_length: int = 4  # for copy/reverse/sort/cipher
+    max_seq_length: int = 10  # for copy/reverse/sort/cipher
+    num_digits: int = 3  # for "add": digits per addend
 
 
 class RandomDatasetGenerator:
@@ -160,6 +193,7 @@ class RandomDatasetGenerator:
             "clustering",
             "signal",
             "image",
+            "sequence",
         ],
         **kwargs,
     ):
@@ -179,6 +213,8 @@ class RandomDatasetGenerator:
             return self._signal(config)
         if task == "image":
             return self._image(config)
+        if task == "sequence":
+            return self._sequence(config)
         raise ValueError(f"Unknown task: {task}")
 
     # --------------- Task Implementations ---------------
@@ -612,6 +648,169 @@ class RandomDatasetGenerator:
             print(f"Image: X{X.shape}, shapes={list(shapes)}")
         return X, y, meta
 
+    # --------------- Sequence ---------------
+
+    def _sequence_content_lengths(self, n: int, min_length: int, max_length: int) -> NDArray:
+        if min_length < 1 or max_length < min_length:
+            raise ValueError(
+                f"require 1 <= min_seq_length <= max_seq_length, got {min_length}, {max_length}"
+            )
+        return self.rng.integers(min_length, max_length + 1, size=n)
+
+    def _sequence_transform_samples(self, config: GenConfig, task: str) -> tuple[list, list, dict]:
+        """Random content sequences, plus the copy/reverse/sort/cipher target for each."""
+        lengths = self._sequence_content_lengths(
+            config.num_samples, config.min_seq_length, config.max_seq_length
+        )
+        cipher_map = None
+        if task == "cipher":
+            cipher_map = self.rng.permutation(config.vocab_size) + TOKEN_OFFSET
+
+        sources, targets = [], []
+        for length in lengths:
+            tokens = self.rng.integers(TOKEN_OFFSET, TOKEN_OFFSET + config.vocab_size, size=length)
+            if task == "copy":
+                target = tokens
+            elif task == "reverse":
+                target = tokens[::-1]
+            elif task == "sort":
+                target = np.sort(tokens)
+            elif task == "cipher":
+                target = cipher_map[tokens - TOKEN_OFFSET]
+            else:
+                raise ValueError(f"unknown sequence_task: {task}")
+            sources.append(list(tokens))
+            targets.append(list(target))
+
+        extra_meta = {"cipher_map": cipher_map} if task == "cipher" else {}
+        return sources, targets, extra_meta
+
+    def _sequence_add_samples(self, config: GenConfig) -> tuple[list, list, dict]:
+        """
+        Multi-digit addition: the source is `a`'s digits, a separator token,
+        then `b`'s digits, each addend zero-padded to num_digits; the target
+        is the sum's digits, zero-padded to num_digits + 1 to hold a carry
+        out of the top digit.
+        """
+        digits = config.num_digits
+        separator = TOKEN_OFFSET + 10
+        upper = 10 ** digits
+
+        a_values = self.rng.integers(0, upper, size=config.num_samples)
+        b_values = self.rng.integers(0, upper, size=config.num_samples)
+        sums = a_values + b_values
+
+        def digit_tokens(value: int, width: int) -> list:
+            return [TOKEN_OFFSET + int(digit) for digit in str(value).zfill(width)]
+
+        sources, targets = [], []
+        for a_value, b_value, sum_value in zip(a_values, b_values, sums):
+            sources.append(
+                digit_tokens(a_value, digits) + [separator] + digit_tokens(b_value, digits)
+            )
+            targets.append(digit_tokens(sum_value, digits + 1))
+
+        extra_meta = dict(operands=np.stack([a_values, b_values], axis=1), sums=sums)
+        return sources, targets, extra_meta
+
+    def _pack_seq2seq(self, sources: list, targets: list) -> tuple:
+        """
+        Pad variable-length token lists into fixed-width arrays, append
+        EOS_ID to each, and build the shifted decoder input used for teacher
+        forcing.
+
+        Returns
+        -------
+        encoder_input, encoder_mask : (n, max_len) int, (n, max_len) bool
+        decoder_input, decoder_target, decoder_mask : (n, max_len). decoder_input
+            is BOS_ID followed by the target tokens; decoder_target is the
+            target tokens followed by EOS_ID -- the same content, one
+            position apart, which is the shift a decoder trains against.
+        source_lengths, target_lengths : (n,) int, the real (unpadded) lengths
+        """
+        n = len(sources)
+        max_len = max(max(len(s) for s in sources), max(len(t) for t in targets)) + 1
+
+        encoder_input = np.full((n, max_len), PAD_ID, dtype=int)
+        encoder_mask = np.zeros((n, max_len), dtype=bool)
+        decoder_input = np.full((n, max_len), PAD_ID, dtype=int)
+        decoder_target = np.full((n, max_len), PAD_ID, dtype=int)
+        decoder_mask = np.zeros((n, max_len), dtype=bool)
+        source_lengths = np.empty(n, dtype=int)
+        target_lengths = np.empty(n, dtype=int)
+
+        for i, (source, target) in enumerate(zip(sources, targets)):
+            source_full = list(source) + [EOS_ID]
+            encoder_input[i, :len(source_full)] = source_full
+            encoder_mask[i, :len(source_full)] = True
+            source_lengths[i] = len(source_full)
+
+            decoder_in = [BOS_ID] + list(target)
+            decoder_out = list(target) + [EOS_ID]
+            decoder_input[i, :len(decoder_in)] = decoder_in
+            decoder_target[i, :len(decoder_out)] = decoder_out
+            decoder_mask[i, :len(decoder_out)] = True
+            target_lengths[i] = len(decoder_out)
+
+        return (
+            encoder_input, encoder_mask, decoder_input, decoder_target,
+            decoder_mask, source_lengths, target_lengths,
+        )
+
+    def _sequence(self, config: GenConfig):
+        """
+        Token sequence-to-sequence tasks for validating a transformer
+        encoder / decoder: copy, reverse, sort, a fixed substitution cipher,
+        and multi-digit addition.
+
+        `X` is the encoder input. `y` is the decoder's target: the correct
+        content followed by EOS_ID, right-padded with PAD_ID to the batch's
+        longest sequence. `meta["decoder_input"]` is the same content led by
+        BOS_ID instead of trailing EOS_ID -- feed `X` to the encoder and
+        `decoder_input` to the decoder under teacher forcing, then compare
+        its output against `y` (see `token_accuracy` / `sequence_exact_match`).
+        `meta["encoder_padding_mask"]` and `["decoder_padding_mask"]` mark
+        the real, non-pad positions of `X` and `y` respectively.
+
+        copy/reverse/sort/cipher draw variable-length sequences from a
+        `vocab_size` content vocabulary; "add" instead encodes two
+        `num_digits`-digit numbers and their sum as digit tokens, which
+        needs vocab_size >= 11 (10 digits plus the "+" separator).
+        """
+        task = config.sequence_task
+        if task not in SEQUENCE_TASKS:
+            raise ValueError(f"unknown sequence_task: {task}, expected one of {SEQUENCE_TASKS}")
+        if config.vocab_size < 2:
+            raise ValueError("vocab_size must be at least 2")
+
+        if task == "add":
+            if config.vocab_size < 11:
+                raise ValueError("sequence_task 'add' needs vocab_size >= 11 (10 digits + separator)")
+            sources, targets, extra_meta = self._sequence_add_samples(config)
+        else:
+            sources, targets, extra_meta = self._sequence_transform_samples(config, task)
+
+        (encoder_input, encoder_mask, decoder_input, decoder_target,
+         decoder_mask, source_lengths, target_lengths) = self._pack_seq2seq(sources, targets)
+
+        meta = dict(
+            sequence_task=task,
+            vocab_size=config.vocab_size,
+            pad_id=PAD_ID,
+            bos_id=BOS_ID,
+            eos_id=EOS_ID,
+            token_offset=TOKEN_OFFSET,
+            decoder_input=decoder_input,
+            encoder_padding_mask=encoder_mask,
+            decoder_padding_mask=decoder_mask,
+            source_lengths=source_lengths,
+            target_lengths=target_lengths,
+            **extra_meta,
+        )
+        if config.verbose:
+            print(f"Sequence[{task}]: encoder{encoder_input.shape}, decoder{decoder_target.shape}")
+        return encoder_input, decoder_target, meta
+
 
 # Example usage:
 if __name__ == "__main__":
@@ -633,6 +832,14 @@ if __name__ == "__main__":
     )
     x_image, y_image, meta_image = gen.generate(
         "image", num_samples=120, image_size=32, num_classes=4
+    )
+    x_seq, y_seq, meta_seq = gen.generate(
+        "sequence", num_samples=100, sequence_task="sort", vocab_size=12,
+        min_seq_length=4, max_seq_length=10,
+    )
+    print(
+        f"sort example: encoder in={x_seq[0][meta_seq['encoder_padding_mask'][0]]}, "
+        f"target={y_seq[0][meta_seq['decoder_padding_mask'][0]]}"
     )
 
     import matplotlib.pyplot as plt

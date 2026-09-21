@@ -16,8 +16,12 @@ from numpy.typing import NDArray
 
 # -------------    adjoints of the real FFT pair    ----------------
 def rfft_adjoint(grad_freq: NDArray, sequence_length: int, axis: int = 1) -> NDArray:
-    out = np.fft.irfft(grad_freq, n=sequence_length, axis=axis)
-    return (out * sequence_length).astype(GLOBAL_DTYPE)
+    frequencies = grad_freq.shape[axis]
+    pad_width = [(0, 0)] * grad_freq.ndim
+    pad_width[axis] = (0, sequence_length - frequencies)
+    padded = np.pad(grad_freq, pad_width)
+    out = np.fft.ifft(padded, n=sequence_length, axis=axis) * sequence_length
+    return out.real.astype(GLOBAL_DTYPE)
 
 
 def irfft_adjoint(
@@ -619,6 +623,8 @@ class SpectreAttention(Layer):
             seq_sum = (query_forward * mask_column).sum(axis=1)
             seq_sum += memory_query.sum(axis=1)
 
+            value_masked = np.concatenate([memory_value, value_forward], axis=1)
+
         else:
             query_forward = query_all
             value_forward = value_all * mask_column
@@ -626,6 +632,8 @@ class SpectreAttention(Layer):
             self.total_counts = self.counts
 
             seq_sum = (query_forward * mask_column).sum(axis=1)
+
+            value_masked = value_forward
 
         self.seq_mu = seq_sum / self.total_counts
         self.descriptor = self.norm_query(self.seq_mu)
@@ -653,7 +661,7 @@ class SpectreAttention(Layer):
         self.num_combined_frequencies = total_length // 2 + 1
 
         self.value_transform = np.fft.rfft(
-            value_all,
+            value_masked,
             n=total_length,
             axis=1,
         )

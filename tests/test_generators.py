@@ -12,17 +12,24 @@ import numpy as np
 import pytest
 
 from ml_tools.generators.data_generators import (
+    BOS_ID,
+    EOS_ID,
     IMAGE_SHAPES,
+    PAD_ID,
+    SEQUENCE_TASKS,
     SIGNAL_FAMILIES,
+    TOKEN_OFFSET,
     RandomDatasetGenerator,
+    sequence_exact_match,
     to_int_classes,
     to_multilabel,
     to_onehot,
+    token_accuracy,
 )
 
 
 TABULAR_TASKS = ("regression", "binary", "multiclass", "multilabel", "clustering")
-ALL_TASKS = TABULAR_TASKS + ("signal", "image")
+ALL_TASKS = TABULAR_TASKS + ("signal", "image", "sequence")
 
 
 # -------------    the dispatcher    -------------------------------
@@ -315,6 +322,129 @@ def test_brightness_alone_is_a_weak_signal(generator):
     )
     accuracy = (predicted == y_data[test]).mean()
     assert accuracy < 0.6, f"brightness alone reaches {accuracy:.2f}"
+
+
+# -------------    sequence task    --------------------------------
+def _content_and_target(x_data, y_data, meta, row):
+    """A row's real tokens, EOS stripped from both source and target."""
+    source = x_data[row, :meta["source_lengths"][row] - 1]
+    target = y_data[row, :meta["target_lengths"][row] - 1]
+    return source, target
+
+
+@pytest.mark.parametrize("task", SEQUENCE_TASKS)
+def test_sequence_shapes_and_padding(task, generator):
+    x_data, y_data, meta = generator.generate(
+        "sequence", num_samples=60, sequence_task=task, vocab_size=12,
+        min_seq_length=4, max_seq_length=10, verbose=False,
+    )
+    assert x_data.shape == y_data.shape
+    assert meta["decoder_input"].shape == y_data.shape
+    encoder_mask, decoder_mask = meta["encoder_padding_mask"], meta["decoder_padding_mask"]
+    assert (x_data[~encoder_mask] == PAD_ID).all()
+    assert (y_data[~decoder_mask] == PAD_ID).all()
+    # every real content run ends in EOS, right where its length says it does
+    for row, length in enumerate(meta["source_lengths"]):
+        assert x_data[row, length - 1] == EOS_ID
+    for row, length in enumerate(meta["target_lengths"]):
+        assert y_data[row, length - 1] == EOS_ID
+
+
+def test_sequence_decoder_input_is_target_shifted_by_one(generator):
+    """decoder_input is BOS + target; comparing it to y one step over is
+    exactly the teacher-forcing shift a decoder trains against."""
+    _, y_data, meta = generator.generate(
+        "sequence", num_samples=40, sequence_task="copy", verbose=False
+    )
+    decoder_input = meta["decoder_input"]
+    assert (decoder_input[:, 0] == BOS_ID).all()
+    for row, length in enumerate(meta["target_lengths"]):
+        assert np.array_equal(decoder_input[row, 1:length], y_data[row, :length - 1])
+
+
+def test_copy_target_matches_source(generator):
+    x_data, y_data, meta = generator.generate(
+        "sequence", num_samples=100, sequence_task="copy", verbose=False
+    )
+    for row in range(len(x_data)):
+        source, target = _content_and_target(x_data, y_data, meta, row)
+        assert np.array_equal(source, target)
+
+
+def test_reverse_target_is_source_reversed(generator):
+    x_data, y_data, meta = generator.generate(
+        "sequence", num_samples=100, sequence_task="reverse", verbose=False
+    )
+    for row in range(len(x_data)):
+        source, target = _content_and_target(x_data, y_data, meta, row)
+        assert np.array_equal(source[::-1], target)
+
+
+def test_sort_target_is_source_sorted(generator):
+    x_data, y_data, meta = generator.generate(
+        "sequence", num_samples=100, sequence_task="sort", verbose=False
+    )
+    for row in range(len(x_data)):
+        source, target = _content_and_target(x_data, y_data, meta, row)
+        assert np.array_equal(np.sort(source), target)
+        assert (np.diff(target) >= 0).all()
+
+
+def test_cipher_target_follows_the_planted_map(generator):
+    x_data, y_data, meta = generator.generate(
+        "sequence", num_samples=100, sequence_task="cipher", vocab_size=12, verbose=False
+    )
+    cipher_map = meta["cipher_map"]
+    assert sorted(cipher_map.tolist()) == list(range(TOKEN_OFFSET, TOKEN_OFFSET + 12))
+    for row in range(len(x_data)):
+        source, target = _content_and_target(x_data, y_data, meta, row)
+        assert np.array_equal(cipher_map[source - TOKEN_OFFSET], target)
+
+
+def test_add_target_decodes_to_the_correct_sum(generator):
+    x_data, y_data, meta = generator.generate(
+        "sequence", num_samples=200, sequence_task="add", num_digits=3, verbose=False
+    )
+    for row in range(len(x_data)):
+        length = meta["target_lengths"][row] - 1
+        digits = y_data[row, :length] - TOKEN_OFFSET
+        predicted = int("".join(str(d) for d in digits))
+        a_value, b_value = meta["operands"][row]
+        assert predicted == a_value + b_value == meta["sums"][row]
+
+
+def test_add_requires_room_for_digits_and_separator(generator):
+    with pytest.raises(ValueError):
+        generator.generate("sequence", sequence_task="add", vocab_size=5, verbose=False)
+
+
+def test_sequence_task_must_be_known(generator):
+    with pytest.raises(ValueError):
+        generator.generate("sequence", sequence_task="nonsense", verbose=False)
+
+
+def test_vocab_size_must_allow_at_least_two_tokens(generator):
+    with pytest.raises(ValueError):
+        generator.generate("sequence", vocab_size=1, verbose=False)
+
+
+def test_seq_length_bounds_are_validated(generator):
+    with pytest.raises(ValueError):
+        generator.generate("sequence", min_seq_length=10, max_seq_length=4, verbose=False)
+
+
+def test_token_accuracy_and_exact_match_against_self(generator):
+    _, y_data, meta = generator.generate(
+        "sequence", num_samples=50, sequence_task="sort", verbose=False
+    )
+    mask = meta["decoder_padding_mask"]
+    assert token_accuracy(y_data, y_data, mask) == 1.0
+    assert sequence_exact_match(y_data, y_data, mask) == 1.0
+
+    wrong = y_data.copy()
+    wrong[:, 0] = wrong[:, 0] + 1
+    assert token_accuracy(wrong, y_data, mask) < 1.0
+    assert sequence_exact_match(wrong, y_data, mask) == 0.0
 
 
 # -------------    configuration edges    --------------------------
