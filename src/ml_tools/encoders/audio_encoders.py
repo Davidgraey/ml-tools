@@ -1,10 +1,6 @@
 """
------------------------- Audio preprocessing / encoders ------------------------
+Signal (audio) preprocessing / encoders ------------------------
 Waveform to windowed spectral features and back again.
-
-The stages are exposed as plain functions so each one can be checked on its
-own, and AudioProcessor wraps them to satisfy the Processor contract used by
-the rest of the encoders package.
 """
 
 import numpy as np
@@ -16,9 +12,7 @@ import matplotlib.pyplot as plt
 
 from ml_tools.encoders.encoders import Processor
 from ml_tools.utilities import rolling_windows_nd, standardize_data
-
-
-EPSILON = 1e-12
+from ml_tools.constants import EPSILON
 
 
 def downsample_sequence(
@@ -68,17 +62,15 @@ def progressive_downsample(
     data: NDArray, factors: list[int], mask: Optional[NDArray] = None
 ) -> list[tuple[NDArray, Optional[NDArray]]]:
     """
-    Build a resolution pyramid by chaining downsample_sequence.
+    BUILD a resolution pyramid by chaining downsample_sequence
 
-    Each level downsamples the PREVIOUS level's output rather than the
-    original data by a cumulative factor -- matching scipy's own guidance to
-    chain moderate factors, and reusing each level's filtering for the next.
+    Each level downsamples the PREVIOUS level's output
 
     Parameters
     ----------
     data : (batch, sequence, hidden)
     factors : per-level downsampling factor, e.g. [2, 2, 2] for a
-        1x -> 1/2x -> 1/4x -> 1/8x pyramid
+        1x, 1/2x, 1/4x, 1/8x pyramid
     mask : optional (batch, sequence) or (batch, sequence, 1)
 
     Returns
