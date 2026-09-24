@@ -6,8 +6,9 @@ validates both with twine. Stops at the first failing step.
 
 Requires the dev extras: pip install -e ".[dev]"
 
-Run: python scripts/prepare_release.py
+python scripts/prepare_release.py
 """
+
 import shutil
 import subprocess
 import sys
