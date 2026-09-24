@@ -3,7 +3,7 @@ Explainable Boosted Tree Model (EBM) example.
 
 Fits ExplainableBoostedTreeModel (binary, regression, multiclass) against
 RandomDatasetGenerator tasks, renders the unified diagnostic dashboard for
-each via ml_tools.visuals.supervised_visuals.plot_model_diagnostics, and
+each via polyergalio.visuals.supervised_visuals.plot_model_diagnostics, and
 plots the learned shape function of the top-2 most important features via
 plot_shape_functions.
 
@@ -11,10 +11,10 @@ Run: python tree_models_example.py
 """
 
 import numpy as np
-from ml_tools.generators.data_generators import RandomDatasetGenerator, to_onehot
-from ml_tools.models.constants import ClassificationTask
-from ml_tools.models.supervised.trees.tree_models import ExplainableBoostedTreeModel
-from ml_tools.visuals.supervised_visuals import plot_model_diagnostics, plot_shape_functions
+from polyergalio.generators.data_generators import RandomDatasetGenerator, to_onehot
+from polyergalio.models.constants import ClassificationTask
+from polyergalio.models.supervised.trees.tree_models import ExplainableBoostedTreeModel
+from polyergalio.visuals.supervised_visuals import plot_model_diagnostics, plot_shape_functions
 
 
 def ebm_weights_vector(model: ExplainableBoostedTreeModel, num_features: int) -> np.ndarray:

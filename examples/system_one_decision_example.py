@@ -11,19 +11,19 @@ then one shared scorer read off the [MARK] positions.
 Run: python system_one_decision_example.py
 """
 
-from ml_tools.generators.data_generators import RandomDatasetGenerator
-from ml_tools.models.constants import DECISION_TYPES
-from ml_tools.models.embedding.embedding import TextEmbedding
-from ml_tools.models.layers.decision_layers import (
+from polyergalio.generators.data_generators import RandomDatasetGenerator
+from polyergalio.models.constants import DECISION_TYPES
+from polyergalio.models.embedding.embedding import TextEmbedding
+from polyergalio.models.layers.decision_layers import (
     DecisionHead,
     decision_correct,
     decode_decisions,
     masked_softmax,
 )
-from ml_tools.models.layers.spectre_layers import SpectreAttention
-from ml_tools.models.model_loss import DecisionLoss
-from ml_tools.models.neural_network import NeuralNetwork
-from ml_tools.models.optimizers import SGD
+from polyergalio.models.layers.spectre_layers import SpectreAttention
+from polyergalio.models.model_loss import DecisionLoss
+from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.optimizers import SGD
 
 HIDDEN_DIM = 32
 HEAD_HIDDEN = 16

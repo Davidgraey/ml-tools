@@ -2,7 +2,14 @@
 __pycache__/
 *.py[cod]
 *$py.class
+# images and data objects and references we generate
 data/*
+*.pkl
+*.csv
+*.gif
+*.png
+*.log
+*.pdf
 
 # C extensions
 *.so

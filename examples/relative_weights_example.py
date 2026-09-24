@@ -6,7 +6,7 @@ share of a model's R² -- against RandomDatasetGenerator's regression,
 binary, multiclass, and multilabel tasks, and compares its estimated
 importance to the generator's planted |weight| magnitudes.
 
-Plotting lives in ml_tools.visuals.supervised_visuals: plot_relative_weights
+Plotting lives in polyergalio.visuals.supervised_visuals: plot_relative_weights
 (true vs RWA importance, one bar chart or a per-class grid) and
 plot_prediction_scatter (pred vs target, regression only -- RWA's
 classification predictions are hard labels, not a useful scatter).
@@ -15,9 +15,9 @@ Run: python relative_weights_example.py
 """
 
 import numpy as np
-from ml_tools.generators.data_generators import RandomDatasetGenerator, to_onehot
-from ml_tools.models.supervised.relative_weights import relative_weights
-from ml_tools.visuals.supervised_visuals import (
+from polyergalio.generators.data_generators import RandomDatasetGenerator, to_onehot
+from polyergalio.models.supervised.relative_weights import relative_weights
+from polyergalio.visuals.supervised_visuals import (
     plot_prediction_scatter,
     plot_relative_weights,
 )

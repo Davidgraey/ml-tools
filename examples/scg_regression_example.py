@@ -4,16 +4,16 @@ Scaled Conjugate Gradient regression example.
 Fits GradientDescent (regression, binary, multinomial, multilabel) against
 RandomDatasetGenerator tasks and renders the unified diagnostic dashboard --
 loss curve, pred-vs-target, and true-vs-learned weight comparison -- from
-ml_tools.visuals.supervised_visuals.plot_model_diagnostics for each.
+polyergalio.visuals.supervised_visuals.plot_model_diagnostics for each.
 
 Run: python scg_regression_example.py
 """
 
 import numpy as np
-from ml_tools.generators.data_generators import RandomDatasetGenerator, to_onehot
-from ml_tools.models.constants import ClassificationTask
-from ml_tools.models.supervised.scg_regression import GradientDescent
-from ml_tools.visuals.supervised_visuals import plot_model_diagnostics
+from polyergalio.generators.data_generators import RandomDatasetGenerator, to_onehot
+from polyergalio.models.constants import ClassificationTask
+from polyergalio.models.supervised.scg_regression import GradientDescent
+from polyergalio.visuals.supervised_visuals import plot_model_diagnostics
 
 NUM_SAMPLES = 2000
 NUM_FEATURES = 8

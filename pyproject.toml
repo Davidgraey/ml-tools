@@ -37,12 +37,21 @@ classifiers = [
 gui = ["matplotlib"]
 audio = ["librosa"]
 test = ["pytest"]
+dev = ["pytest", "coverage", "build", "twine"]
 
 [tool.setuptools.dynamic]
 version = {attr = "polyergalio.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.coverage.run]
+source = ["src/polyergalio"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
