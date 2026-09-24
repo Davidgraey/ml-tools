@@ -3,7 +3,7 @@ from typing import Callable, Optional
 import numpy as np
 from ml_tools.models.activations import mod_relu, mod_relu_derivative
 from ml_tools.models.constants import EPSILON, GLOBAL_COMPLEX_DTYPE, GLOBAL_DTYPE
-from ml_tools.models.layers.layers import (
+from ml_tools.models.layers.basal_layers import (
     FullyConnectedLayer,
     Layer,
     NormalizeLayer,
@@ -383,8 +383,6 @@ class SpectreAttention(Layer):
 
         self.training_now: bool = True
 
-        self.declare_shapes(inputs=((hidden_dim,),), outputs=((hidden_dim,),))
-
         if self.memory_tokens > 0:
             self.memory = PersistentMemory(
                 memory_tokens=self.memory_tokens, hidden_dim=self.hidden_dim
@@ -395,9 +393,12 @@ class SpectreAttention(Layer):
         self._cache = None
         self._last_forward = None
 
+        # sequence axis is pinned, not wildcarded: fft_length / num_frequencies
+        # are sized off sequence_length at construction time, so a mismatched
+        # sequence length here is a real, catchable error, not a free axis.
         self.declare_shapes(
-            inputs=((None, None, self.hidden_dim),),
-            outputs=((None, None, self.hidden_dim),),
+            inputs=((self.sequence_length, self.hidden_dim),),
+            outputs=((self.sequence_length, self.hidden_dim),),
         )
 
         self.num_frequencies = self.fft_length // 2 + 1
@@ -571,8 +572,9 @@ class SpectreAttention(Layer):
         self,
         input_data: NDArray,
         mask: Optional[NDArray] = None,
-        training_now: bool = True,
+        training_now: Optional[bool] = None,
     ):
+        training_now = self.training if training_now is None else training_now
         assert input_data.ndim == 3
         assert input_data.shape[1] == self.sequence_length
         assert input_data.shape[2] == self.hidden_dim

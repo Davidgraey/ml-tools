@@ -9,7 +9,8 @@ from typing import Optional
 from ml_tools.models.activations import sigmoid, softmax
 from ml_tools.models.constants import ClassificationTask, Reductions
 from ml_tools.distances import cosine_distance
-from ml_tools.models.constants import EPSILON
+from ml_tools.models.constants import DECISION_TYPES, EPSILON
+from ml_tools.models.layers.decision_layers import decision_type_ids, masked_softmax
 
 
 loss_dictionary, derivative_dictionary = {}, {}
@@ -297,6 +298,64 @@ class MultiHeadLoss(Loss):
         return self.forward(predictions, targets, mask)
 
 
+class DecisionLoss(Loss):
+    """
+    Loss for Decision system (System-One style model)
+    Masked softmax cross-entropy over each row's options, shared by every
+    question type. Score rows can add an ordinal penalty, the expected squared
+    distance between the predicted and true level, so near misses cost less.
+    """
+
+    def __init__(self, ordinal_weight: float = 0.0):
+        super().__init__()
+        self.ordinal_weight = ordinal_weight
+        self.probabilities = None
+
+    def forward(
+        self,
+        prediction: NDArray,
+        targets: NDArray,
+        mask: Optional[NDArray] = None,
+        decisiontypes: Optional[NDArray] = None,
+    ) -> float:
+        """
+        Parameters
+        ----------
+        prediction : (batch, options) logits
+        targets : (batch,) answer option index
+        mask : (batch, options) token_mask; all options real if None
+        decisiontypes : (batch,) DECISION_TYPES members or values, needed for the ordinal term
+        """
+        self.prediction = prediction
+        self.targets = np.asarray(targets, dtype=int)
+        self.token_mask = np.ones_like(prediction, dtype=bool) if mask is None else mask.astype(bool)
+        self.probabilities = masked_softmax(prediction, self.token_mask)
+        self.onehot = np.eye(prediction.shape[-1])[self.targets]
+
+        picked = np.take_along_axis(self.probabilities, self.targets[:, None], axis=-1)[:, 0]
+        loss = -np.log(np.maximum(picked, EPSILON))
+
+        self.ordinal_rows = np.zeros(len(self.targets), dtype=bool)
+        if self.ordinal_weight and decisiontypes is not None:
+            self.ordinal_rows = decision_type_ids(decisiontypes) == DECISION_TYPES.SCORE.value
+            levels = np.arange(prediction.shape[-1])
+            self.distance = (levels[None, :] - self.targets[:, None]) ** 2 * self.token_mask
+            expected = np.sum(self.probabilities * self.distance, axis=-1)
+            loss = loss + self.ordinal_weight * expected * self.ordinal_rows
+
+        return float(np.mean(loss))
+
+    def backward(self) -> NDArray:
+        grad = self.probabilities - self.onehot
+        if self.ordinal_rows.any():
+            expected = np.sum(self.probabilities * self.distance, axis=-1, keepdims=True)
+            ordinal = self.probabilities * (self.distance - expected)
+            grad = grad + self.ordinal_weight * ordinal * self.ordinal_rows[:, None]
+        return grad * self.token_mask / len(self.targets)
+
+    def __call__(self, predictions, targets, mask=None, decisiontypes=None) -> float:
+        return self.forward(predictions, targets, mask, decisiontypes)
+
 # ------------------------------------------------------------------
 @derivative
 def mse_derivative(prediction, targets, **kwargs) -> float | NDArray:
@@ -320,3 +379,17 @@ def cross_entropy_derivative(
     """BACKPROP TRICKS for sigmoid / softmax: combine"""
     sample_count = targets.shape[0]
     return (prediction - targets) / sample_count
+
+
+# ------------------------------------------------------------------
+# free-function wrappers, delegating to the Loss classes above. Added so
+# ml_tools.models.supervised.* (scg_regression, tree_models) can import
+# cross_entropy / mse as plain functions rather than instantiate a class.
+def mse(prediction: NDArray, targets: NDArray, **kwargs) -> float:
+    return MSELoss()(prediction, targets)
+
+
+def cross_entropy(
+    prediction: NDArray, targets: NDArray, task: ClassificationTask, **kwargs
+) -> float:
+    return CrossEntropyLoss(task)(prediction, targets)

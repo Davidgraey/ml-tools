@@ -22,7 +22,7 @@ import time
 from typing import Iterable, Optional
 
 import numpy as np
-from ml_tools.models.layers.layers import ANY_SHAPE, Layer, shape_conflict
+from ml_tools.models.layers.basal_layers import ANY_SHAPE, Layer, shape_conflict
 from numpy.typing import NDArray
 
 INPUT_NAME = "input"
@@ -630,16 +630,18 @@ class NeuralNetwork:
         with open(path, mode="rb") as f:
             return cls.deserialize(pickle.load(f))
 
-    def train(self) -> 'NeuralNetwork':
-        object.__setattr__(self, "training", True)
+    def train(self, mode: bool = True) -> 'NeuralNetwork':
+        """switch the network and every layer in it between training and inference"""
+        object.__setattr__(self, "training", mode)
+        for layer in self.layers:
+            layer.train(mode)
         return self
 
     def eval(self) -> 'NeuralNetwork':
         """
         switch to inference -- changes training behavior and training-specific behaviors
         """
-        object.__setattr__(self, "training", False)
-        return self
+        return self.train(False)
 
     @property
     def nodes(self) -> list[Node]:

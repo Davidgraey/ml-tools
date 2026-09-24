@@ -7,12 +7,29 @@ GLOBAL_COMPLEX_DTYPE = np.complex64
 EPSILON = 1e-15
 ANY_SHAPE = (None,)
 
+MASKED_LOGIT = -1e4
+
 # TOLERANCES AND LIMITS FOR SCALED CONJUGATE GRADIENT DESCENT (scg_regression)
 FLOAT_TOLERANCE = 1e-30
 SIGMA_ZERO = 1e-6
 LAMBDA_MAX = 1e24
 LAMBDA_MIN = 1e-20
 
+# TOKEN CONSTANTS
+PAD_ID = 0
+BOS_ID = 1
+EOS_ID = 2
+CLS_ID = 3
+SEP_ID = 4
+MARK_ID = 5
+TOKEN_OFFSET = 6
+
+
+class DECISION_TYPES(Enum):
+    BINARY = 0
+    CHOICE = 1
+    SCORE = 2
+    
 
 class ClassificationTask(Enum):
     BINARY = "binary"

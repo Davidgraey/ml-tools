@@ -1,8 +1,6 @@
 """
 Shared fixtures and numerical helpers.
 
-https://docs.pytest.org/en/stable/how-to/fixtures.html
-
 Every dataset comes from RandomDatasetGenerator with a fixed seed, so tests
 work from reproducible data rather than hand-written examples, and a failure
 can always be reproduced by constructing the generator with the same seed.
@@ -21,15 +19,10 @@ from ml_tools.generators import RandomDatasetGenerator
 
 SEED = 42
 
-# a separate stream for upstream gradients. Drawing them from SEED would make
-# them numerically equal to the fixture data, and an upstream vector parallel
-# to the input sits in a normalisation layer's null space, which makes the true
-# gradient vanish and the comparison meaningless.
+# a separate stream for upstream gradients.
 UPSTREAM_SEED = 1009
 
-# central differences on float64 lose roughly half the available digits, so
-# 1e-6 steps leave errors around 1e-8. Anything above this means a real
-# disagreement rather than floating point noise.
+# Anything above this tolerance a significant disagreement rather than floating point noise
 GRADIENT_TOLERANCE = 1e-6
 STEP = 1e-6
 
@@ -219,6 +212,36 @@ def image_dataset(generator):
     return generator.generate(
         task="image", num_samples=80, image_size=16, num_classes=4, verbose=False
     )
+
+
+@pytest.fixture()
+def sequence_dataset(generator):
+    """
+    encoder/decoder token sequences (a sort task): X is the encoder input,
+    y is the decoder target, meta carries decoder_input and the padding
+    masks -- see RandomDatasetGenerator._sequence's docstring.
+    """
+    return generator.generate(
+        task="sequence", num_samples=150, sequence_task="sort", vocab_size=12,
+        min_seq_length=4, max_seq_length=10, verbose=False,
+    )
+
+
+@pytest.fixture()
+def calibration_data(generator):
+    """
+    Uncalibrated scores that correlate with a binary label: the label comes
+    from the generator (seeded, like every other fixture here), then scores
+    are scaled toward it with independent noise added, so a calibration
+    model has real structure to recover without the scores already being
+    calibrated probabilities.
+    """
+    _, labels, _ = generator.generate(task="binary", num_samples=600, verbose=False)
+    labels = labels.reshape(-1, 1)
+    rng = np.random.default_rng(SEED)
+    scores = labels * rng.uniform(0.2, 0.9999, size=labels.shape)
+    scores = scores + rng.uniform(-0.2, 0.2, size=labels.shape)
+    return scores, labels
 
 
 @pytest.fixture()

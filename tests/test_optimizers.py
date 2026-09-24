@@ -1,17 +1,11 @@
 """
 Optimizers and the parameter-update contract.
-
-The contract is a naming one: get_gradients() returns keys that
-update_weights() accepts as keyword arguments. These tests pin that down,
-because a mismatch is only discovered at run time and only on the code path
-that happens to use the layer.
 """
 
 import numpy as np
 import pytest
-
-from ml_tools.models.blocks import FourierAttention
-from ml_tools.models.layers.layers import (
+from ml_tools.models.layers.fft_layers import FourierAttention
+from ml_tools.models.layers.basal_layers import (
     DropoutLayer,
     FullyConnectedLayer,
     NormalizeLayer,
@@ -20,7 +14,6 @@ from ml_tools.models.layers.layers import (
 from ml_tools.models.model_loss import MSELoss
 from ml_tools.models.neural_network import NeuralNetwork
 from ml_tools.models.optimizers import SGD, Optimizer
-
 
 PARAMETERISED_LAYERS = (
     lambda: FullyConnectedLayer(4, 3, "relu"),
@@ -134,7 +127,7 @@ def test_sgd_handles_nested_blocks(sequence_batch):
 
 
 # -------------    end to end descent    ---------------------------
-@pytest.mark.slow
+
 def test_network_reduces_regression_loss(regression_dataset):
     x_data, y_data, _ = regression_dataset
     y_data = y_data.reshape(-1, 1)
@@ -161,11 +154,11 @@ def test_network_reduces_regression_loss(regression_dataset):
     assert value < first * 0.9, f"expected real progress, got {first} -> {value}"
 
 
-@pytest.mark.slow
+
 def test_classifier_learns_a_separable_problem(multiclass_dataset):
+    from ml_tools.generators.data_generators import to_onehot
     from ml_tools.models.constants import ClassificationTask
     from ml_tools.models.model_loss import CrossEntropyLoss
-    from ml_tools.generators.data_generators import to_onehot
 
     x_data, y_data, _ = multiclass_dataset
     targets = to_onehot(y_data, 4)
@@ -186,6 +179,39 @@ def test_classifier_learns_a_separable_problem(multiclass_dataset):
 
     accuracy = (prediction.argmax(-1) == y_data).mean()
     assert accuracy > 0.6, f"accuracy {accuracy:.3f} is near chance"
+
+
+@pytest.mark.slow
+def test_multilabel_classifier_learns(multilabel_dataset):
+    """
+    multilabel_dataset was never wired into a real NeuralNetwork + optimizer
+    loop -- test_supervised.py covers GradientDescent on it, this covers the
+    layer/CrossEntropyLoss(MULTILABEL) path the same way the multinomial case
+    above covers its own loss branch.
+    """
+    from ml_tools.models.activations import sigmoid
+    from ml_tools.models.constants import ClassificationTask
+    from ml_tools.models.model_loss import CrossEntropyLoss
+
+    x_data, y_data, _ = multilabel_dataset
+
+    layers = [
+        FullyConnectedLayer(4, 24, "relu"),
+        FullyConnectedLayer(24, 4, "linear", is_output=True),
+    ]
+    network = NeuralNetwork(layers)
+    loss = CrossEntropyLoss(ClassificationTask.MULTILABEL)
+    optimizer = SGD(2.0)
+
+    for _ in range(400):
+        prediction = network.forward(x_data)
+        loss(prediction, y_data)
+        network.backward(loss.backward())
+        optimizer.step(layers)
+
+    predicted = (sigmoid(prediction) >= 0.5).astype(int)
+    accuracy = (predicted == y_data).mean()
+    assert accuracy > 0.7, f"per-label accuracy {accuracy:.3f} is near chance"
 
 
 def test_neural_network_orders_the_backward_pass(small_matrix):

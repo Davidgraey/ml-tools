@@ -2,7 +2,7 @@ from typing import Optional
 
 import numpy as np
 from ml_tools.models.constants import GLOBAL_COMPLEX_DTYPE, GLOBAL_DTYPE
-from ml_tools.models.layers.layers import FullyConnectedLayer, Layer
+from ml_tools.models.layers.basal_layers import FullyConnectedLayer, Layer
 from numpy.typing import NDArray
 
 
@@ -209,7 +209,7 @@ class WaveletRefinementModule(Layer):
         self,
         v_tilde: NDArray,
         descriptor: NDArray,
-        training_now: bool = True,
+        training_now: Optional[bool] = None,
         mask: Optional[NDArray] = None,
     ) -> NDArray:
         """
@@ -227,6 +227,7 @@ class WaveletRefinementModule(Layer):
             inside the real content or fully inside the padding are fine
             either way.
         """
+        training_now = self.training if training_now is None else training_now
         # Validate inputs
         assert v_tilde.ndim == 3, (
             f"data into the wavelet refinement must be (batch, seq, hidden),"

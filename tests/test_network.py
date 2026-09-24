@@ -1,37 +1,25 @@
 """
-The NeuralNetwork graph container.
-
-Connections are object references: connect() returns the node it made, and that
-node is what you pass as the next source. Two properties follow, and both are
-asserted here -- a cycle cannot be constructed, and insertion order is already a
-topological order.
-
-The property that earns the graph its complexity is gradient accumulation at a
-fan-out: when one node feeds several consumers, its gradient is the sum of what
-they send back. Walking a list backwards cannot do that, and getting it wrong
-produces a network that trains, just not correctly, so it is checked against
-finite differences rather than by inspection.
+The NeuralNetwork graph container (DAG)
 """
 
 import inspect
 
 import numpy as np
 import pytest
-
-from ml_tools.models.layers.layers import (
+from conftest import GRADIENT_TOLERANCE, numeric_gradient, relative_error
+from ml_tools.models.layers.basal_layers import (
     ANY_SHAPE,
     DropoutLayer,
     FullyConnectedLayer,
+    Layer,
     NormalizeLayer,
     shape_conflict,
 )
-from ml_tools.models.layers.layers import Layer
+from ml_tools.models.layers.operator_layers import LatentStack
 from ml_tools.models.layers.spectre_layers import PersistentMemory, SpectreAttention
-from ml_tools.models.layers.operators import LatentStack
 from ml_tools.models.model_loss import MSELoss
 from ml_tools.models.neural_network import INPUT_NAME, NeuralNetwork, Node
 from ml_tools.models.optimizers import SGD
-from conftest import GRADIENT_TOLERANCE, numeric_gradient, relative_error
 
 
 def as_float64(layer):
@@ -67,6 +55,9 @@ class FixedWidthMerge(Layer):
 
     def purge(self) -> None:
         pass
+
+    def get_weights(self, for_serialize: bool = False):
+        return {} if for_serialize else None
 
     def zero_gradients(self) -> None:
         pass
@@ -143,7 +134,7 @@ def test_arity_is_checked_when_wiring():
     a = net.connect(FullyConnectedLayer(4, 3, "linear"), net.input)
     b = net.connect(FullyConnectedLayer(4, 3, "linear"), net.input)
     c = net.connect(FullyConnectedLayer(4, 3, "linear"), net.input)
-    with pytest.raises(ValueError, match="takes 2 to 2 inputs, got 3"):
+    with pytest.raises(ValueError, match="declares 2 input shapes"):
         net.connect(LatentStack(), a, b, c)
 
 
@@ -380,7 +371,7 @@ def test_more_sources_than_declared_inputs_is_refused():
     net = NeuralNetwork()
     first = net.connect(FullyConnectedLayer(4, 3, "linear"), net.input)
     second = net.connect(FullyConnectedLayer(4, 3, "linear"), net.input)
-    with pytest.raises(ValueError, match="inputs, got 2"):
+    with pytest.raises(ValueError, match="declares 1 input shapes"):
         net.connect(NormalizeLayer(3), first, second)
 
 
@@ -410,6 +401,9 @@ def test_a_multi_output_layer_is_refused():
 
         def zero_gradients(self) -> None:
             pass
+
+        def get_weights(self, for_serialize: bool = False):
+            return {} if for_serialize else None
 
     net = NeuralNetwork()
     first = net.connect(FullyConnectedLayer(4, 4, "linear"), net.input)
@@ -474,7 +468,10 @@ LAYER_ARGUMENTS = {
     "SpectreAttention": ((8, 6), {}),
     "RopeEmbedding": ((8, 6), {}),
     "SinusoidEmbedding": ((8, 6), {}),
-    "VotingBase": ((6, 4), {}),
+    # VotingBase itself is excluded: self.stack is empty until a subclass
+    # populates it, so its forward output width is input_shape, not the
+    # num_experts its declared output shape claims. Its subclasses below
+    # (which do populate the stack) exercise the real behavior.
     "VotingWeight": ((6, 4), {}),
     # VotingWeightBalanced and VotingGate carry a hidden width the plain
     # voters do not
@@ -492,6 +489,10 @@ LAYER_ARGUMENTS = {
     "SpectreDecoderAttention": ((8, 6), {}),
     # hidden_dim, sequence_length
     "WaveletRefinementModule": ((6, 8), {}),
+    # hidden_dim, head_hidden
+    "DecisionHead": ((6, 8), {}),
+    # num_embeddings, embedding_dim
+    "TextEmbedding": ((12, 6), {}),
 }
 
 
@@ -568,7 +569,6 @@ NETWORK_RECIPES = {
     "FourierLayer": ((3, 8, 6), 1),
     "InverseFourierLayer": ((3, 8, 6), 1),
     "FourierAttention": ((3, 8, 6), 1),
-    "VotingBase": ((3, 8, 6), 1),
     "VotingWeight": ((3, 8, 6), 1),
     "VotingWeightBalanced": ((3, 8, 6), 1),
     "VotingGate": ((3, 8, 6), 1),
@@ -584,6 +584,8 @@ NETWORK_RECIPES = {
     "RopeEmbedding": ((3, 8, 6), 1),
     "SinusoidEmbedding": ((3, 8, 6), 1),
     "WaveletRefinementModule": ((3, 8, 6), 2),
+    # DecisionHead needs marker_pos per batch, see test_decision_layers
+    # TextEmbedding needs integer ids, see test_embedding
     # PersistentMemory takes zero inputs -- connect() requires at least one
     # source, so it cannot be wired into a graph at all. See
     # test_persistent_memory_has_no_backward_shape_to_check below instead.
@@ -700,7 +702,6 @@ def test_branching_forward_shapes(branching_network):
     assert branching_network.activations["merge"].shape == (5, 8)
 
 
-@pytest.mark.slow
 def test_input_gradient_through_a_fan_out(branching_network):
     """the accumulation path: node `a` receives gradient from both branches"""
     rng = np.random.default_rng(0)
@@ -715,7 +716,6 @@ def test_input_gradient_through_a_fan_out(branching_network):
     assert relative_error(analytic, numeric) < GRADIENT_TOLERANCE
 
 
-@pytest.mark.slow
 @pytest.mark.parametrize("node_name", ("a", "b", "c", "out"))
 def test_parameter_gradients_through_a_fan_out(node_name, branching_network):
     rng = np.random.default_rng(0)
@@ -797,7 +797,10 @@ def test_name_based_add_still_wires_a_branch():
     output = net.forward(rng.normal(size=(5, 4)))
     assert output.shape == (5, 8)
     assert set(net.edges()) == {
-        ("input", "amp"), ("input", "freq"), ("amp", "stack"), ("freq", "stack"),
+        ("input", "amp"),
+        ("input", "freq"),
+        ("amp", "stack"),
+        ("freq", "stack"),
     }
 
 
@@ -840,9 +843,7 @@ def test_a_connected_layer_is_not_double_counted():
 
 
 def test_layers_come_back_in_graph_order(branching_network):
-    expected = [
-        node.layer for node in branching_network.nodes if not node.is_source
-    ]
+    expected = [node.layer for node in branching_network.nodes if not node.is_source]
     assert branching_network.layers == expected
 
 
@@ -939,7 +940,6 @@ def test_node_repr_names_its_sources(branching_network):
 
 
 # -------------    training end to end    --------------------------
-@pytest.mark.slow
 def test_branching_network_learns(regression_dataset):
     """
     A wrong fan-out would still descend, just more slowly, so require real

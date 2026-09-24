@@ -96,6 +96,16 @@ def test_multilabel_sets_every_listed_index():
     assert np.array_equal(encoded, [[1, 0, 1], [0, 1, 0]])
 
 
+def test_to_int_classes_round_trips_multilabel():
+    """
+    is_multilabel rounds each label on its own -- unlike the single-class
+    branch, there is no axis to argmax over, since more than one label can
+    be active per row.
+    """
+    encoded = to_multilabel([[0, 2], [1]], num_classes=3)
+    assert np.array_equal(to_int_classes(encoded, is_multilabel=True), encoded)
+
+
 @pytest.mark.parametrize("task", ("binary", "multiclass", "signal", "image"))
 def test_onehot_flag_widens_the_target(task, generator):
     _, y_data, _ = generator.generate(

@@ -1,7 +1,7 @@
 from typing import Optional
 
 import numpy as np
-from ml_tools.models.layers.layers import EPSILON, FullyConnectedLayer, Layer
+from ml_tools.models.layers.basal_layers import EPSILON, FullyConnectedLayer, Layer
 from numpy.typing import NDArray
 
 
@@ -58,19 +58,21 @@ class VotingBase(Layer):
 
     def forward(self,
                 incoming_x: NDArray,
-                training_now: bool = True,
+                training_now: Optional[bool] = None,
                 mask: Optional[NDArray] = None) -> NDArray:
         """
         Parameters
         ----------
         incoming_x : our incoming data, (..., input_shape) -- any number of leading batch/ sequence axes
-        training_now : whether the expert-load bias is updated. False (inference) leaves expert_bias untouched
+        training_now : whether the expert-load bias is updated. False (inference) leaves expert_bias untouched;
+            None follows the layer's train() / eval() mode
         mask : (...,) matching incoming_x's leading axes, 1 for a real token and 0 for padding
 
         Returns
         -------
         one vote per expert, (num_samples, num_experts)
         """
+        training_now = self.training if training_now is None else training_now
         self.in_shape = incoming_x.shape
         assert self.in_shape[-1] == self.input_shape, (
             f"cannot read trailing axis {self.in_shape[-1]} as input_shape "
@@ -454,7 +456,7 @@ class MixtureOfExperts(Layer):
 
     def forward(self,
                 hidden_state: NDArray,
-                training_now: bool = True,
+                training_now: Optional[bool] = None,
                 mask: Optional[NDArray] = None) -> NDArray:
         """
         Parameters
@@ -463,7 +465,8 @@ class MixtureOfExperts(Layer):
             axes -- routing runs independently per trailing-axis row
         training_now : whether the gate's load-balancing bias (see the class
             docstring) is allowed to update from this pass. False (e.g.
-            validation or inference) leaves it untouched.
+            validation or inference) leaves it untouched. None follows the
+            layer's train() / eval() mode.
         mask : (...,) matching hidden_state's leading axes, 1 for a real token
             and 0 for padding. Every expert still runs on every row
             regardless -- only the gate's load-balancing bias (see
@@ -475,6 +478,7 @@ class MixtureOfExperts(Layer):
         (..., hidden_dim): every shared expert's output, plus the top_k
         routed experts' output weighted by the gate, summed.
         """
+        training_now = self.training if training_now is None else training_now
         self._leading_shape = hidden_state.shape[:-1]
 
         shared_out = [expert(hidden_state) for expert in self.shared_experts]

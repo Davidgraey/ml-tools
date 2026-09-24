@@ -1,23 +1,13 @@
 """
-Activations and their derivatives.
-
-Every derivative registered in derivative_dictionary is a vector-Jacobian
-product: given (post-activation output, pre-activation z, upstream gradient) it
-returns the finished delta. These tests check that contract against finite
-differences of the activation itself, which is the only way to catch a
-derivative that is plausible but wrong -- the failure mode that had relu,
-relu_leaky, sigmoid and swish all returning incorrect gradients.
+Activations and their derivatives - testing for numeric stability
 """
 
 import numpy as np
 import pytest
-
-from ml_tools.models import activations
 from conftest import GRADIENT_TOLERANCE, numeric_gradient, relative_error
+from ml_tools.models import activations
 
-
-# mod_relu takes complex input and a bias vector, so it has its own contract
-# and is exercised separately below
+# mod_relu takes complex input and a bias vector
 ELEMENTWISE = ("linear", "relu", "relu_leaky", "sigmoid", "tanh", "swish")
 ALL_REGISTERED = tuple(activations.activation_dictionary)
 
@@ -34,12 +24,13 @@ def test_activation_preserves_shape(name):
     x_data = np.linspace(-3, 3, 24).reshape(4, 6)
     if name == "mod_relu":
         x_data = x_data + 1j * x_data[::-1]
-        assert activations.activation_dictionary[name](x_data, -0.2).shape == x_data.shape
+        assert (
+            activations.activation_dictionary[name](x_data, -0.2).shape == x_data.shape
+        )
     else:
         assert activations.activation_dictionary[name](x_data).shape == x_data.shape
 
 
-@pytest.mark.slow
 @pytest.mark.parametrize("name", ELEMENTWISE)
 def test_derivative_matches_finite_differences(name):
     """the VJP must equal d/dx of sum(upstream * activation(x))"""
@@ -58,7 +49,6 @@ def test_derivative_matches_finite_differences(name):
     assert relative_error(analytic, numeric) < GRADIENT_TOLERANCE
 
 
-@pytest.mark.slow
 def test_softmax_derivative_is_a_true_vjp():
     """
     softmax couples every element of a row, so its VJP cannot be a diagonal
@@ -83,7 +73,9 @@ def test_derivative_returns_upstream_shape(name):
     x_data = np.linspace(-2, 2, 12).reshape(3, 4)
     upstream = np.ones_like(x_data)
     activation = activations.activation_dictionary[name]
-    delta = activations.derivative_dictionary[name](activation(x_data), x_data, upstream)
+    delta = activations.derivative_dictionary[name](
+        activation(x_data), x_data, upstream
+    )
     assert delta.shape == upstream.shape
 
 
@@ -152,7 +144,6 @@ def test_mod_relu_zeroes_below_the_bias():
     assert abs(activations.mod_relu(z_values, -1.0)[0]) == pytest.approx(0.0)
 
 
-@pytest.mark.slow
 def test_mod_relu_derivative_matches_finite_differences():
     """
     Both returned gradients are checked. d_bias was the one that silently

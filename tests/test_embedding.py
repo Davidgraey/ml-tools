@@ -1,22 +1,17 @@
 """
-Embeddings: positional encodings and the exploratory embedding module.
-
-RoPE has strong properties worth asserting -- it must preserve vector norms,
-because it is a rotation, and the inner product between two positions must
-depend only on their separation. That relative-position property is the entire
-reason to use it.
-
-The sinusoid table is the additive counterpart, and its properties are the
-complements: it does not preserve norms, and what it must get right instead is
-that the offset it applies depends on position alone.
+Embeddings: token lookup tables, positional encodings and the exploratory
+embedding module.
 """
 
 import numpy as np
 import pytest
-
+from conftest import GRADIENT_TOLERANCE, input_gradient_error, numeric_gradient, relative_error
+from ml_tools.models.embedding.embedding import TextEmbedding
 from ml_tools.models.embedding.positional import RopeEmbedding, SinusoidEmbedding
-from conftest import GRADIENT_TOLERANCE, input_gradient_error
-
+from ml_tools.models.layers.basal_layers import FullyConnectedLayer
+from ml_tools.models.model_loss import MSELoss
+from ml_tools.models.neural_network import NeuralNetwork
+from ml_tools.models.optimizers import SGD, Adam
 
 SEQUENCE = 8
 DIMENSION = 6
@@ -79,7 +74,6 @@ def test_rope_inner_product_depends_only_on_separation(rope):
     assert np.allclose(separation_two, separation_two[0], atol=1e-8)
 
 
-@pytest.mark.slow
 def test_rope_gradient(rope, embedded_batch):
     assert input_gradient_error(rope, embedded_batch) < GRADIENT_TOLERANCE
 
@@ -221,7 +215,6 @@ def test_sinusoid_shares_the_rope_frequency_ladder(sinusoid, rope):
     assert np.allclose(table[:, 1::2], rope_cosine)
 
 
-@pytest.mark.slow
 def test_sinusoid_gradient(sinusoid, embedded_batch):
     assert input_gradient_error(sinusoid, embedded_batch) < GRADIENT_TOLERANCE
 
@@ -295,6 +288,125 @@ def test_sinusoid_interface(sinusoid, embedded_batch):
     sinusoid.backward(np.ones_like(output))
     sinusoid.zero_gradients()
     sinusoid.purge()
+
+
+# -------------    the token lookup table    ----------------------
+VOCABULARY = 10
+
+
+@pytest.fixture()
+def token_ids():
+    return np.random.default_rng(0).integers(0, VOCABULARY, size=(3, SEQUENCE))
+
+
+@pytest.fixture()
+def text_embedding():
+    return TextEmbedding(num_embeddings=VOCABULARY, embedding_dim=DIMENSION)
+
+
+def test_text_embedding_looks_up_rows(text_embedding, token_ids):
+    vectors = text_embedding.forward(token_ids)
+    assert vectors.shape == (3, SEQUENCE, DIMENSION)
+    assert np.array_equal(vectors[1, 2], text_embedding.weights[token_ids[1, 2]])
+
+
+def test_text_embedding_accepts_any_leading_shape(text_embedding):
+    assert text_embedding.forward(np.array(4)).shape == (DIMENSION,)
+    assert text_embedding.forward(np.arange(5)).shape == (5, DIMENSION)
+    assert text_embedding.forward(np.zeros((2, 3, 4), dtype=int)).shape == (2, 3, 4, DIMENSION)
+
+
+def test_text_embedding_weight_gradient(text_embedding, token_ids):
+    upstream = np.random.default_rng(1).normal(size=token_ids.shape + (DIMENSION,))
+    text_embedding.forward(token_ids)
+    text_embedding.backward(upstream)
+    numeric = numeric_gradient(
+        lambda: float((text_embedding.forward(token_ids) * upstream).sum()), text_embedding.weights
+    )
+    assert relative_error(text_embedding.gradient_weights, numeric) < GRADIENT_TOLERANCE
+
+
+def test_text_embedding_sums_gradients_of_repeated_tokens(text_embedding):
+    text_embedding.forward(np.array([3, 3, 5]))
+    text_embedding.backward(np.ones((3, DIMENSION)))
+    assert np.allclose(text_embedding.gradient_weights[3], 2.0)
+    assert np.allclose(text_embedding.gradient_weights[5], 1.0)
+    assert not np.delete(text_embedding.gradient_weights, [3, 5], axis=0).any()
+
+
+def test_text_embedding_ids_get_no_gradient(text_embedding, token_ids):
+    text_embedding.forward(token_ids)
+    grad = text_embedding.backward(np.ones(token_ids.shape + (DIMENSION,)))
+    assert grad.shape == token_ids.shape and not grad.any()
+
+
+def test_text_embedding_padding_row_is_zero_and_frozen(token_ids):
+    layer = TextEmbedding(VOCABULARY, DIMENSION, padding_idx=0)
+    ids = np.array([[0, 1, 0, 2]])
+    assert not layer.forward(ids)[0, [0, 2]].any()
+    optimizer = Adam(0.1)
+    for _ in range(3):
+        layer.forward(ids)
+        layer.backward(np.ones((1, 4, DIMENSION)))
+        optimizer.step([layer])
+    assert not layer.weights[0].any()
+    assert layer.weights[1].any()
+
+
+@pytest.mark.parametrize("bad_ids", (np.array([VOCABULARY]), np.array([-1])))
+def test_text_embedding_rejects_ids_outside_the_table(text_embedding, bad_ids):
+    with pytest.raises(IndexError):
+        text_embedding.forward(bad_ids)
+
+
+def test_text_embedding_rejects_fractional_ids(text_embedding):
+    with pytest.raises(TypeError):
+        text_embedding.forward(np.array([1.5]))
+    assert text_embedding.forward(np.array([2.0])).shape == (1, DIMENSION)
+
+
+def test_text_embedding_rejects_a_padding_idx_outside_the_table():
+    with pytest.raises(ValueError):
+        TextEmbedding(VOCABULARY, DIMENSION, padding_idx=VOCABULARY)
+
+
+def test_text_embedding_learns_target_vectors():
+    """each token's vector moves to its own target, and only the tokens seen move"""
+    rng = np.random.default_rng(3)
+    layer = TextEmbedding(VOCABULARY, DIMENSION)
+    targets = rng.normal(size=(VOCABULARY, DIMENSION))
+    ids = np.arange(VOCABULARY - 1)
+    unseen = layer.weights[-1].copy()
+    loss, optimizer = MSELoss(), SGD(10.0)
+    for _ in range(200):
+        loss(layer.forward(ids), targets[ids])
+        layer.backward(loss.backward())
+        optimizer.step([layer])
+    assert np.allclose(layer.weights[ids], targets[ids], atol=1e-3)
+    assert np.array_equal(layer.weights[-1], unseen)
+
+
+def test_text_embedding_feeds_a_network():
+    net = NeuralNetwork(input_shape=(SEQUENCE,))
+    embedded = net.connect(TextEmbedding(VOCABULARY, DIMENSION), net.input, name="tokens")
+    net.output = net.connect(FullyConnectedLayer(DIMENSION, 2, "linear"), embedded, name="out")
+    ids = np.random.default_rng(0).integers(0, VOCABULARY, size=(3, SEQUENCE))
+    assert embedded.out_shape == (SEQUENCE, DIMENSION)
+    assert net.forward(ids).shape == (3, SEQUENCE, 2)
+    assert net.backward(np.ones((3, SEQUENCE, 2))).shape == ids.shape
+    assert net.node("tokens").layer.gradient_weights.any()
+
+
+def test_text_embedding_interface(text_embedding, token_ids):
+    text_embedding.forward(token_ids)
+    text_embedding.backward(np.ones(token_ids.shape + (DIMENSION,)))
+    assert text_embedding.num_parameters == VOCABULARY * DIMENSION
+    assert set(text_embedding.get_gradients()) == {"gradient_weights"}
+    assert text_embedding.get_config() == {"num_embeddings": VOCABULARY, "embedding_dim": DIMENSION, "padding_idx": None}
+    text_embedding.zero_gradients()
+    assert not text_embedding.gradient_weights.any()
+    text_embedding.purge()
+    assert text_embedding.token_ids is None
 
 
 # -------------    the exploratory embedding module    -------------

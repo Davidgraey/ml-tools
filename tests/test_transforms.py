@@ -1,36 +1,14 @@
 """
 Transforms: probability calibration and the dimensionality projections.
-
-Calibration is checked two ways -- the fitted parameters must actually minimise
-the objective the fit claims to minimise, and the resulting map must be
-monotone, since a calibration that reorders its inputs is not a calibration.
-
-The projections are checked against the identities that define them, which is
-stronger than checking output shapes: PCA components must be uncorrelated with
-descending variance, and MCA row coordinates must satisfy the weighted inertia
-identity.
 """
 
 import numpy as np
 import pytest
-
 from ml_tools.transforms.calibrations import CalibrationType, ProbCalibration
 from ml_tools.transforms.projections import mca, pca
 from ml_tools.types import BasalTransform
 
-
 METHODS = ("platt", "isotonic", "spline")
-
-
-@pytest.fixture()
-def calibration_data():
-    """uncalibrated scores that correlate with a binary label"""
-    rng = np.random.default_rng(42)
-    count = 600
-    labels = rng.choice([1, 0], size=(count, 1))
-    scores = labels * rng.uniform(0.2, 0.9999, size=(count, 1))
-    scores = scores + rng.uniform(-0.2, 0.2, size=(count, 1))
-    return scores, labels
 
 
 def platt_objective(scores, labels, coefficient, intercept) -> float:
@@ -44,8 +22,7 @@ def platt_objective(scores, labels, coefficient, intercept) -> float:
     probabilities = np.clip(probabilities, 1e-15, 1 - 1e-15)
     return float(
         -np.sum(
-            targets * np.log(probabilities)
-            + (1 - targets) * np.log(1 - probabilities)
+            targets * np.log(probabilities) + (1 - targets) * np.log(1 - probabilities)
         )
     )
 
@@ -97,6 +74,25 @@ def test_calibration_outputs_probabilities(method, calibration_data):
 
 
 @pytest.mark.parametrize("method", METHODS)
+def test_calibration_improves_on_the_raw_scores(method, calibration_data):
+    """
+    calibration_data's raw scores are deliberately mis-scaled (see the
+    fixture), so a working calibrator should land closer to the true label
+    frequencies than the raw scores do -- a real behavioral claim, not just
+    that fit/predict run and stay in [0, 1].
+    """
+    scores, labels = calibration_data
+    calibrated = ProbCalibration(method=method, data_dimension=1).fit_predict(
+        scores, labels
+    )
+    raw_clipped = np.clip(scores, 0.0, 1.0)
+
+    raw_brier = np.mean((raw_clipped - labels) ** 2)
+    calibrated_brier = np.mean((calibrated - labels) ** 2)
+    assert calibrated_brier < raw_brier
+
+
+@pytest.mark.parametrize("method", METHODS)
 def test_calibration_rejects_mismatched_shapes(method, calibration_data):
     scores, labels = calibration_data
     with pytest.raises(AssertionError):
@@ -108,7 +104,6 @@ def test_unknown_method_raises():
         ProbCalibration(method="nonsense", data_dimension=1)
 
 
-@pytest.mark.slow
 def test_platt_reaches_the_optimum(calibration_data):
     """
     Compare against gradient descent run to convergence on the same objective.
@@ -120,21 +115,22 @@ def test_platt_reaches_the_optimum(calibration_data):
     model.fit(scores, labels)
 
     fitted = platt_objective(
-        scores, labels,
+        scores,
+        labels,
         float(np.ravel(model.platt_coefficient)[0]),
         float(np.ravel(model.platt_intercept)[0]),
     )
 
-    positives = (labels == 1).sum(axis=0)
+    # scalar (not axis=0, shape-(1,)) so float() below works under numpy>=2,
+    # which no longer implicitly converts a size-1 non-0d array
+    positives = (labels == 1).sum()
     negatives = len(labels) - positives
     targets = np.where(
         labels == 1, (positives + 1) / (positives + 2), 1.0 / (negatives + 2)
     )
     coefficient, intercept = 0.0, float(np.log((negatives + 1) / (positives + 1)))
     for _ in range(60000):
-        probabilities = 1.0 / (
-            1.0 + np.exp(-(coefficient * scores + intercept))
-        )
+        probabilities = 1.0 / (1.0 + np.exp(-(coefficient * scores + intercept)))
         residual = probabilities - targets
         coefficient -= 1e-4 * float((residual * scores).sum())
         intercept -= 1e-4 * float(residual.sum())
@@ -249,7 +245,9 @@ def test_pca_is_deterministic(regression_dataset):
             lambda rng: np.hstack([rng.normal(size=(50, 3)), np.zeros((50, 1))]),
             id="zero_column",
         ),
-        pytest.param(lambda rng: rng.normal(size=(4, 10)), id="fewer_rows_than_features"),
+        pytest.param(
+            lambda rng: rng.normal(size=(4, 10)), id="fewer_rows_than_features"
+        ),
         pytest.param(lambda rng: rng.normal(size=(50, 4, 3)), id="three_dimensional"),
     ),
 )
@@ -317,8 +315,8 @@ def test_mca_total_inertia_is_the_chi_square_statistic(onehot_table):
     residuals = (probability - expected) / np.sqrt(expected)
 
     _, singular, _ = np.linalg.svd(residuals, full_matrices=False)
-    assert np.sum(singular ** 2) == pytest.approx(np.sum(residuals ** 2))
-    assert np.sum(singular ** 2) < 10.0, "inertia is not on the expected scale"
+    assert np.sum(singular**2) == pytest.approx(np.sum(residuals**2))
+    assert np.sum(singular**2) < 10.0, "inertia is not on the expected scale"
 
 
 def test_mca_row_coordinates_satisfy_the_weighted_identity(onehot_table):
@@ -335,7 +333,7 @@ def test_mca_row_coordinates_satisfy_the_weighted_identity(onehot_table):
 
     axes = 4
     coordinates = mca(onehot_table, top_k_components=axes)
-    weighted = (row_mass[:, None] * coordinates ** 2).sum(axis=0)
+    weighted = (row_mass[:, None] * coordinates**2).sum(axis=0)
 
     assert np.allclose(weighted, singular[:axes] ** 2)
 

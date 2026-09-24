@@ -1,6 +1,6 @@
 import numpy as np
 from typing import Optional
-from ml_tools.models.layers.layers import Layer, FullyConnectedLayer, NormalizeLayer
+from ml_tools.models.layers.basal_layers import Layer, FullyConnectedLayer, NormalizeLayer
 import ml_tools.models.activations as activations
 from ml_tools.models.constants import GLOBAL_DTYPE, EPSILON, ANY_SHAPE
 from numpy.typing import NDArray
@@ -42,7 +42,7 @@ class FrequencyFFT(Layer):
         # (windows, samples per window), the window count left free since the
         # constructor only fixes its ceiling
         self.declare_shapes(
-            inputs=((window_size,),), outputs=((window_size,),)
+            inputs=((None, window_size),), outputs=((None, window_size),)
         )
 
         self.zero_gradients()
@@ -262,6 +262,7 @@ class FourierAttention(Layer):
         assert ni == no, (
             f"the feed forward residual needs matching widths, got ni={ni} no={no}"
         )
+        self.ni, self.no, self.use_2d = ni, no, use_2d
         self.fftlayer = FourierLayer(use_2d)
         self.norm_a = NormalizeLayer(ni=ni, shift_scale=False)
         self.fc = FullyConnectedLayer(ni=ni, no=no, activation_type="relu")
@@ -270,10 +271,12 @@ class FourierAttention(Layer):
         self.declare_shapes(inputs=((ni,),), outputs=((no,),))
         self.zero_gradients()
 
-    def forward(self, x_data: NDArray, training_now: bool = True, mask: Optional[NDArray] = None) -> NDArray:
+    def forward(self, x_data: NDArray, training_now: Optional[bool] = None, mask: Optional[NDArray] = None) -> NDArray:
         """mask : unused -- neither the FFT mixing nor the per-position norm
         and feed-forward sublayers need it (see FourierLayer.forward and
-        NormalizeLayer.forward); accepted for pass-through compatibility."""
+        NormalizeLayer.forward); accepted for pass-through compatibility.
+        training_now : None follows the layer's train() / eval() mode"""
+        training_now = self.training if training_now is None else training_now
         if self.fftlayer.use_2d:
             assert x_data.ndim >= 3, (
                 "use_2d mixes over the last two axes, which on a 2D "

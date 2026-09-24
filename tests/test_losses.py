@@ -2,9 +2,7 @@
 Loss functions.
 
 The property that matters most here is that backward() is the derivative of
-forward() -- including its reduction. A loss that averages over every element
-but divides its gradient by the batch size only is wrong by a factor of the
-feature count, which is invisible until you compare against finite differences.
+forward() -- including its reduction.
 """
 
 import numpy as np
@@ -35,7 +33,7 @@ def loss_gradient_error(loss, prediction, targets) -> float:
     return relative_error(analytic, numeric)
 
 
-@pytest.mark.slow
+
 @pytest.mark.parametrize("loss_class", SCALAR_LOSSES)
 @pytest.mark.parametrize("shape", ((6, 1), (6, 4)))
 def test_scalar_loss_gradient(loss_class, shape):
@@ -84,7 +82,7 @@ def test_mse_gradient_scales_with_size():
     assert np.allclose(loss.backward(), expected)
 
 
-@pytest.mark.slow
+
 @pytest.mark.parametrize(
     "task",
     (
