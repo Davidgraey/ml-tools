@@ -5,11 +5,11 @@ Shared utilities, distance metrics, and package-wide import health..
 import importlib
 import pkgutil
 
-import ml_tools
+import polyergalio
 import numpy as np
 import pytest
-from ml_tools import distances
-from ml_tools.utilities import (
+from polyergalio import distances
+from polyergalio.utilities import (
     flatten_containers,
     rolling_windows_nd,
     standardize_data,
@@ -25,11 +25,11 @@ METRICS = (
 # modules that cannot currently be imported, with the reason. Kept here so the
 # sweep below stays a single assertion and the exclusions are auditable.
 KNOWN_BROKEN_IMPORTS = {
-    "ml_tools.encoders.numeric_encoders": "bare `from encoders import ...`",
-    "ml_tools.encoders.categorical_encoders": "bare `from encoders import ...`",
-    "ml_tools.encoders.chronologic_encoders": "bare `from encoders import ...`",
-    "ml_tools.encoders.pipeline": "bare `from encoders import ...`",
-    "ml_tools.models.embedding._audio_encoding": "a script, executes on import",
+    "polyergalio.encoders.numeric_encoders": "bare `from encoders import ...`",
+    "polyergalio.encoders.categorical_encoders": "bare `from encoders import ...`",
+    "polyergalio.encoders.chronologic_encoders": "bare `from encoders import ...`",
+    "polyergalio.encoders.pipeline": "bare `from encoders import ...`",
+    "polyergalio.models.embedding._audio_encoding": "a script, executes on import",
 }
 
 
@@ -179,7 +179,7 @@ def test_norm_euclidian_distance_is_a_metric():
 def discover_modules():
     return sorted(
         module.name
-        for module in pkgutil.walk_packages(ml_tools.__path__, prefix="ml_tools.")
+        for module in pkgutil.walk_packages(polyergalio.__path__, prefix="polyergalio.")
     )
 
 

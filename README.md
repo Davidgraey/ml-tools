@@ -1,5 +1,5 @@
-# ML TOOLS
-![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
+# PolyerGalio
+![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 ![NumPy](https://img.shields.io/badge/numpy-%3E%3D1.20-blue)
 ![SciPy](https://img.shields.io/badge/scipy-%3E%3D1.7-blue)
 ![License](https://img.shields.io/github/license/davidgraey/ml-tools)
@@ -11,7 +11,7 @@
 
 ## Overview
 
-**ML Tools** is a collection of implemented machine learning methods ranging from  
+**PolyerGalio** (Greek for "multiple tools") is a collection of implemented machine learning methods ranging from  
 data encoding and processing pipelines to supervised learning and clustering.
 
 The focus of this repository is:
@@ -23,21 +23,35 @@ The focus of this repository is:
 All algorithms are implemented in **NumPy** and **SciPy**, with minimal external dependencies.
 
 ---
+## Installation
+
+```bash
+pip install polyergalio
+```
+
+For local development:
+
+```bash
+pip install -e ".[test]"
+```
+
+---
 ## Implemented Methods
 
 ### 🔹 Encoding and Embedding Creation
-`src/ml_tools/encoders/*`
+`src/polyergalio/encoders/*`
 - Categorical variable pipeline
 - Chronological variable (cyclical and absolute) pipeline
 - Numeric (normalized and raw) pipeline
 - Trainable Fourier Embedding pipeline
 - Trainable Text embedding pipeline
+- tokenization with sentencepiece
 
 ### 🔹 Toy Dataset Generation
-`src/ml_tools/generators/*`
+`src/polyergalio/generators/*`
 
 ### 🔹 Supervised Learning
-`src/ml_tools/models/supervised/*`
+`src/polyergalio/models/supervised/*`
 #### Scaled Conjugate Gradient (SCG)
 - SCG for gradient descent applied to regression and logistic regression 
   *(Møller); (Anderson)*
@@ -52,12 +66,19 @@ All algorithms are implemented in **NumPy** and **SciPy**, with minimal external
 - Relative Weights applied to logistic regression  
   *(Solís & Pasquier); (Tonidandel & LeBreton)*
 
+#### Tree Algorithms (EBM / EBTM)
+- Tree algorithms - Explainable Boosted-Tree Model (EBM)
+
 ### 🔹 Unsupervised Learning & Clustering
-`src/ml_tools/models/clustering/*`
+`src/polyergalio/models/clustering/*`
 #### Self-Organizing Maps
 - Self Organizing Maps, Parameterless Self-Organizing Maps - PLSOM  
   *(Kohonen); (Berglund & Sitte)*
   - Clustering and dimensionality reduction without hyperparameter adjustment
+- Growing Self Organizing Maps, Parameterless (grid)
+- Grid-free Growing Parameterless Self Organizing Maps
+  - FreeSOM - grows and shrinks under conditional updates
+  - *(novel)* fusion of Neural Gas and PLSOM
 
 
 #### Centroid Neural Networks (CENTNN)
@@ -73,7 +94,7 @@ All algorithms are implemented in **NumPy** and **SciPy**, with minimal external
 APIs may change as methods are refined and extended.
 
 ---
-## Authos and Contributors
+## Authors and Contributors
 - "David Graey", "graeyband@gmail.com"
 - "Dr Charles Anderson", "Chuck.Anderson@colostate.edu"
 

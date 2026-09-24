@@ -14,7 +14,7 @@ own forward pass, and that is what most of these tests assert.
 import numpy as np
 import pytest
 
-from ml_tools.generators import RandomDatasetGenerator
+from polyergalio.generators import RandomDatasetGenerator
 
 
 SEED = 42

@@ -13,14 +13,14 @@ import pickle
 
 import numpy as np
 import pytest
-from ml_tools.models.constants import DECISION_TYPES
-from ml_tools.models.layers.basal_layers import FullyConnectedLayer, Layer, NormalizeLayer
-from ml_tools.models.layers.decision_layers import DecisionHead
-from ml_tools.models.layers.mixture_layers import MixtureOfExperts
-from ml_tools.models.layers.operator_layers import LatentStack
-from ml_tools.models.model_loss import MSELoss
-from ml_tools.models.neural_network import INPUT_NAME, NeuralNetwork
-from ml_tools.models.optimizers import SGD
+from polyergalio.models.constants import DECISION_TYPES
+from polyergalio.models.layers.basal_layers import FullyConnectedLayer, Layer, NormalizeLayer
+from polyergalio.models.layers.decision_layers import DecisionHead
+from polyergalio.models.layers.mixture_layers import MixtureOfExperts
+from polyergalio.models.layers.operator_layers import LatentStack
+from polyergalio.models.model_loss import MSELoss
+from polyergalio.models.neural_network import INPUT_NAME, NeuralNetwork
+from polyergalio.models.optimizers import SGD
 from test_network import concrete_layers
 
 TRAIN_STEPS = 5
@@ -85,7 +85,7 @@ def package_layers() -> list[type]:
     return [
         layer_class
         for layer_class in concrete_layers()
-        if layer_class.__module__.startswith("ml_tools.")
+        if layer_class.__module__.startswith("polyergalio.")
         and layer_class.__name__ not in NOT_ROUND_TRIPPED
     ]
 

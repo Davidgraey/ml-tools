@@ -15,14 +15,14 @@ from conftest import (
     input_gradient_error,
     parameter_gradient_error,
 )
-from ml_tools.models.layers.fft_layers import (
+from polyergalio.models.layers.fft_layers import (
     FourierLayer,
     FrequencyFFT,
     InverseFourierLayer,
     hartley,
     hartley_2d,
 )
-from ml_tools.models.layers.basal_layers import (
+from polyergalio.models.layers.basal_layers import (
     DropoutLayer,
     FullyConnectedLayer,
     NormalizeLayer,
@@ -31,7 +31,7 @@ from ml_tools.models.layers.basal_layers import (
     shape_conflict,
     xavier,
 )
-from ml_tools.models.layers.operator_layers import LatentStack
+from polyergalio.models.layers.operator_layers import LatentStack
 
 ACTIVATIONS = ("linear", "relu", "relu_leaky", "sigmoid", "tanh", "swish", "softmax")
 

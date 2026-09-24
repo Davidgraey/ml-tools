@@ -11,7 +11,7 @@ make every downstream test meaningless.
 import numpy as np
 import pytest
 
-from ml_tools.generators.data_generators import (
+from polyergalio.generators.data_generators import (
     BOS_ID,
     EOS_ID,
     IMAGE_SHAPES,
@@ -503,7 +503,7 @@ def test_tiny_image_size(generator):
     strict=True,
 )
 def test_phase_mix_targets_are_not_all_zero():
-    from ml_tools.generators.periodic_signal_gen import make_phase_mix_dataset
+    from polyergalio.generators.periodic_signal_gen import make_phase_mix_dataset
 
     _, targets = make_phase_mix_dataset(n_samples=8, signal_len=32)
     assert np.abs(targets).max() > 0
@@ -515,7 +515,7 @@ def test_phase_mix_targets_are_not_all_zero():
     strict=True,
 )
 def test_multifreq_dataset_is_reproducible():
-    from ml_tools.generators.periodic_signal_gen import make_multifreq_dataset
+    from polyergalio.generators.periodic_signal_gen import make_multifreq_dataset
 
     np.random.seed(0)
     first = make_multifreq_dataset(batch_size=4, seq_len=16, hidden_dim=4)[0]

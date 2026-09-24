@@ -9,10 +9,10 @@ raising. Calling conventions here mirror each model's own __main__ demo.
 import numpy as np
 import pytest
 
-from ml_tools.generators.data_generators import to_onehot
-from ml_tools.models.constants import ClassificationTask
-from ml_tools.models.supervised.scg_regression import GradientDescent
-from ml_tools.models.supervised.trees.tree_models import (
+from polyergalio.generators.data_generators import to_onehot
+from polyergalio.models.constants import ClassificationTask
+from polyergalio.models.supervised.scg_regression import GradientDescent
+from polyergalio.models.supervised.trees.tree_models import (
     ExplainableBoostedTreeModel,
     SupervisedTreeModel,
 )

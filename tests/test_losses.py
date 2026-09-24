@@ -8,8 +8,8 @@ forward() -- including its reduction.
 import numpy as np
 import pytest
 
-from ml_tools.models.constants import ClassificationTask
-from ml_tools.models.model_loss import (
+from polyergalio.models.constants import ClassificationTask
+from polyergalio.models.model_loss import (
     CosineLoss,
     CrossEntropyLoss,
     MAELoss,

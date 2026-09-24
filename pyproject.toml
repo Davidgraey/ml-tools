@@ -2,10 +2,8 @@
 requires = ["setuptools >= 61.0"]
 build-backend = "setuptools.build_meta"
 
-dynamic = ["version"]
-
 [project]
-name = "ml-tools"
+name = "polyergalio"
 dynamic = ["version"]
 authors = [
     {name = "David Graey", email = "graeyband@gmail.com"},
@@ -17,29 +15,46 @@ dependencies = [
     "scipy"
 ]
 
-description = "tools for ML, supervised and unsupervised tasks"
+description = "From-scratch machine learning methods -- encoding, supervised learning, and clustering -- built on NumPy and SciPy"
 readme = "README.md"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["machine-learning", "numpy", "clustering", "self-organizing-map", "neural-network"]
 
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 [project.optional-dependencies]
-gui=["matplotlib.pyplot"]
-audio=["librosa", "wave"]
-test=["pytest"]
+gui = ["matplotlib"]
+audio = ["librosa"]
+test = ["pytest"]
 
+[tool.setuptools.dynamic]
+version = {attr = "polyergalio.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# src layout, so tests import ml_tools without an editable install
+# src layout, so tests import polyergalio without an editable install
 pythonpath = ["src", "tests"]
 addopts = "--strict-markers"
 markers = [
     "slow: finite-difference gradient checks, run with -m 'not slow' to skip",
 ]
 
-
 [project.urls]
-"Homepage" = "https://github.com/pypa/sampleproject"
-"Repository" = "https://github.com/me/spam.git"
-"Changelog" = "https://github.com/me/spam/blob/master/CHANGELOG.md"
-"Bug Tracker" = "https://github.com/pypa/sampleproject/issues"
+Homepage = "https://github.com/Davidgraey/ml-tools"
+Repository = "https://github.com/Davidgraey/ml-tools"
+Changelog = "https://github.com/Davidgraey/ml-tools/blob/main/CHANGES.md"
+"Bug Tracker" = "https://github.com/Davidgraey/ml-tools/issues"

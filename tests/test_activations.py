@@ -5,7 +5,7 @@ Activations and their derivatives - testing for numeric stability
 import numpy as np
 import pytest
 from conftest import GRADIENT_TOLERANCE, numeric_gradient, relative_error
-from ml_tools.models import activations
+from polyergalio.models import activations
 
 # mod_relu takes complex input and a bias vector
 ELEMENTWISE = ("linear", "relu", "relu_leaky", "sigmoid", "tanh", "swish")

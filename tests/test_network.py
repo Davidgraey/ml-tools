@@ -7,7 +7,7 @@ import inspect
 import numpy as np
 import pytest
 from conftest import GRADIENT_TOLERANCE, numeric_gradient, relative_error
-from ml_tools.models.layers.basal_layers import (
+from polyergalio.models.layers.basal_layers import (
     ANY_SHAPE,
     DropoutLayer,
     FullyConnectedLayer,
@@ -15,11 +15,11 @@ from ml_tools.models.layers.basal_layers import (
     NormalizeLayer,
     shape_conflict,
 )
-from ml_tools.models.layers.operator_layers import LatentStack
-from ml_tools.models.layers.spectre_layers import PersistentMemory, SpectreAttention
-from ml_tools.models.model_loss import MSELoss
-from ml_tools.models.neural_network import INPUT_NAME, NeuralNetwork, Node
-from ml_tools.models.optimizers import SGD
+from polyergalio.models.layers.operator_layers import LatentStack
+from polyergalio.models.layers.spectre_layers import PersistentMemory, SpectreAttention
+from polyergalio.models.model_loss import MSELoss
+from polyergalio.models.neural_network import INPUT_NAME, NeuralNetwork, Node
+from polyergalio.models.optimizers import SGD
 
 
 def as_float64(layer):
@@ -436,7 +436,7 @@ def concrete_layers():
     import importlib
     import pkgutil
 
-    import ml_tools.models as models
+    import polyergalio.models as models
 
     for info in pkgutil.walk_packages(models.__path__, f"{models.__name__}."):
         try:

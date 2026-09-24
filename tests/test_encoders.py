@@ -11,7 +11,7 @@ sequence-length parity.
 import numpy as np
 import pytest
 
-from ml_tools.encoders.audio_encoders import (
+from polyergalio.encoders.audio_encoders import (
     AudioProcessor,
     build_windows,
     frequency_axis,
@@ -22,12 +22,12 @@ from ml_tools.encoders.audio_encoders import (
     window_size_from_ms,
     windowed_spectrum,
 )
-from ml_tools.encoders.encoder_utils import (
+from polyergalio.encoders.encoder_utils import (
     calcualte_iqr_bounds,
     find_outliers,
     hash_string,
 )
-from ml_tools.encoders.encoders import Processor
+from polyergalio.encoders.encoders import Processor
 
 
 WINDOW_LENGTHS = (8, 9, 16, 17, 64, 65)
@@ -138,10 +138,10 @@ def test_hash_string_is_stable_and_varies():
 @pytest.mark.parametrize(
     "module",
     (
-        "ml_tools.encoders.numeric_encoders",
-        "ml_tools.encoders.categorical_encoders",
-        "ml_tools.encoders.chronologic_encoders",
-        "ml_tools.encoders.pipeline",
+        "polyergalio.encoders.numeric_encoders",
+        "polyergalio.encoders.categorical_encoders",
+        "polyergalio.encoders.chronologic_encoders",
+        "polyergalio.encoders.pipeline",
     ),
 )
 @pytest.mark.xfail(

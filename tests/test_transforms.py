@@ -4,9 +4,9 @@ Transforms: probability calibration and the dimensionality projections.
 
 import numpy as np
 import pytest
-from ml_tools.transforms.calibrations import CalibrationType, ProbCalibration
-from ml_tools.transforms.projections import mca, pca
-from ml_tools.types import BasalTransform
+from polyergalio.transforms.calibrations import CalibrationType, ProbCalibration
+from polyergalio.transforms.projections import mca, pca
+from polyergalio.types import BasalTransform
 
 METHODS = ("platt", "isotonic", "spline")
 

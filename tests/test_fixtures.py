@@ -8,7 +8,7 @@ the fixtures as the rest of the suite actually consumes them.
 
 import numpy as np
 
-from ml_tools.generators import RandomDatasetGenerator
+from polyergalio.generators import RandomDatasetGenerator
 
 SEED = 42
 

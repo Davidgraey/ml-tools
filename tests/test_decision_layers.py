@@ -1,17 +1,17 @@
 import numpy as np
 import pytest
 from conftest import GRADIENT_TOLERANCE, numeric_gradient, relative_error
-from ml_tools.generators import RandomDatasetGenerator
-from ml_tools.generators.data_generators import (
+from polyergalio.generators import RandomDatasetGenerator
+from polyergalio.generators.data_generators import (
     CLS_ID,
     MARK_ID,
     SEP_ID,
     TOKEN_OFFSET,
     build_decision_sequence,
 )
-from ml_tools.models.constants import DECISION_TYPES, MASKED_LOGIT
-from ml_tools.models.model_loss import DecisionLoss
-from ml_tools.models.layers.decision_layers import (
+from polyergalio.models.constants import DECISION_TYPES, MASKED_LOGIT
+from polyergalio.models.model_loss import DecisionLoss
+from polyergalio.models.layers.decision_layers import (
     DecisionHead,
     decision_type_ids,
     calibrated_probabilities,
@@ -22,8 +22,8 @@ from ml_tools.models.layers.decision_layers import (
     masked_softmax,
     option_bucket,
 )
-from ml_tools.models.neural_network import NeuralNetwork
-from ml_tools.models.optimizers import SGD, Adam
+from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.optimizers import SGD, Adam
 
 BATCH, SEQUENCE, HIDDEN = 4, 9, 6
 BINARY, CHOICE, SCORE = (kind.value for kind in DECISION_TYPES)

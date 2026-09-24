@@ -4,8 +4,8 @@ testing clustering process behaviors
 
 import numpy as np
 import pytest
-from ml_tools.models.clustering.centroid_network import CentroidNeuralNetwork
-from ml_tools.models.clustering.cluster_metrics import (
+from polyergalio.models.clustering.centroid_network import CentroidNeuralNetwork
+from polyergalio.models.clustering.cluster_metrics import (
     calinski_harabasz_index,
     contingency_matrix,
     davies_bouldin_index,
@@ -14,8 +14,8 @@ from ml_tools.models.clustering.cluster_metrics import (
     mutual_information_score,
     silhouette_score,
 )
-from ml_tools.models.clustering.gplsom_clustering import GPLSOM
-from ml_tools.models.clustering.plsom_clustering import PLSOM
+from polyergalio.models.clustering.gplsom_clustering import GPLSOM
+from polyergalio.models.clustering.plsom_clustering import PLSOM
 
 LATTICES = ((4, 4), (3, 5), (5, 3), (2, 9))
 

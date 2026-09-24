@@ -6,12 +6,12 @@ embedding module.
 import numpy as np
 import pytest
 from conftest import GRADIENT_TOLERANCE, input_gradient_error, numeric_gradient, relative_error
-from ml_tools.models.embedding.embedding import TextEmbedding
-from ml_tools.models.embedding.positional import RopeEmbedding, SinusoidEmbedding
-from ml_tools.models.layers.basal_layers import FullyConnectedLayer
-from ml_tools.models.model_loss import MSELoss
-from ml_tools.models.neural_network import NeuralNetwork
-from ml_tools.models.optimizers import SGD, Adam
+from polyergalio.models.embedding.embedding import TextEmbedding
+from polyergalio.models.embedding.positional import RopeEmbedding, SinusoidEmbedding
+from polyergalio.models.layers.basal_layers import FullyConnectedLayer
+from polyergalio.models.model_loss import MSELoss
+from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.optimizers import SGD, Adam
 
 SEQUENCE = 8
 DIMENSION = 6
@@ -83,7 +83,7 @@ def test_rope_is_safe_for_the_optimizer(rope, embedded_batch):
     RoPE has nothing to learn, so SGD should find no gradients to apply and
     skip it entirely rather than stepping a fixed rotation.
     """
-    from ml_tools.models.optimizers import SGD
+    from polyergalio.models.optimizers import SGD
 
     output = rope.forward(embedded_batch)
     rope.backward(np.ones_like(output))
@@ -234,7 +234,7 @@ def test_sinusoid_follows_the_parameterless_convention(sinusoid, embedded_batch)
 
 
 def test_sinusoid_is_safe_for_the_optimizer(sinusoid, embedded_batch):
-    from ml_tools.models.optimizers import SGD
+    from polyergalio.models.optimizers import SGD
 
     output = sinusoid.forward(embedded_batch)
     sinusoid.backward(np.ones_like(output))
@@ -415,7 +415,7 @@ def test_embedding_module_helpers_are_shape_preserving():
     band_gated_fft and learnable_fft are early sketches. Assert only what they
     promise -- a gate applied in the frequency domain returns the input shape.
     """
-    from ml_tools.models.embedding import embedding
+    from polyergalio.models.embedding import embedding
 
     rng = np.random.default_rng(0)
     x_data = rng.normal(size=(2, 8, 4))
@@ -436,4 +436,4 @@ def test_wavelet_utils_imports():
     """the module had a syntax error on its matplotlib import"""
     pytest.importorskip("scipy.signal")
     importlib = __import__("importlib")
-    importlib.import_module("ml_tools.models.embedding.wavelet_utils")
+    importlib.import_module("polyergalio.models.embedding.wavelet_utils")

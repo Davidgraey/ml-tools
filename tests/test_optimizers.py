@@ -4,16 +4,16 @@ Optimizers and the parameter-update contract.
 
 import numpy as np
 import pytest
-from ml_tools.models.layers.fft_layers import FourierAttention
-from ml_tools.models.layers.basal_layers import (
+from polyergalio.models.layers.fft_layers import FourierAttention
+from polyergalio.models.layers.basal_layers import (
     DropoutLayer,
     FullyConnectedLayer,
     NormalizeLayer,
     RMSNormLayer,
 )
-from ml_tools.models.model_loss import MSELoss
-from ml_tools.models.neural_network import NeuralNetwork
-from ml_tools.models.optimizers import SGD, Optimizer
+from polyergalio.models.model_loss import MSELoss
+from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.optimizers import SGD, Optimizer
 
 PARAMETERISED_LAYERS = (
     lambda: FullyConnectedLayer(4, 3, "relu"),
@@ -156,9 +156,9 @@ def test_network_reduces_regression_loss(regression_dataset):
 
 
 def test_classifier_learns_a_separable_problem(multiclass_dataset):
-    from ml_tools.generators.data_generators import to_onehot
-    from ml_tools.models.constants import ClassificationTask
-    from ml_tools.models.model_loss import CrossEntropyLoss
+    from polyergalio.generators.data_generators import to_onehot
+    from polyergalio.models.constants import ClassificationTask
+    from polyergalio.models.model_loss import CrossEntropyLoss
 
     x_data, y_data, _ = multiclass_dataset
     targets = to_onehot(y_data, 4)
@@ -189,9 +189,9 @@ def test_multilabel_classifier_learns(multilabel_dataset):
     layer/CrossEntropyLoss(MULTILABEL) path the same way the multinomial case
     above covers its own loss branch.
     """
-    from ml_tools.models.activations import sigmoid
-    from ml_tools.models.constants import ClassificationTask
-    from ml_tools.models.model_loss import CrossEntropyLoss
+    from polyergalio.models.activations import sigmoid
+    from polyergalio.models.constants import ClassificationTask
+    from polyergalio.models.model_loss import CrossEntropyLoss
 
     x_data, y_data, _ = multilabel_dataset
 
