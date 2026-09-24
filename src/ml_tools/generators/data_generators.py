@@ -2,6 +2,16 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import numpy as np
+from ml_tools.models.constants import (
+    BOS_ID,
+    CLS_ID,
+    DECISION_TYPES,
+    EOS_ID,
+    MARK_ID,
+    PAD_ID,
+    SEP_ID,
+    TOKEN_OFFSET,
+)
 from numpy.typing import NDArray
 
 
@@ -16,7 +26,9 @@ def to_onehot(class_array: NDArray, num_classes=None) -> NDArray:
 def to_int_classes(onehot_array: NDArray, is_multilabel: bool = False) -> NDArray:
     """Convert one-hot style array into an integer rep of the class number apparently I cannot spell integer"""
     if is_multilabel:
-        int_array = np.round(onehot_array, axis=-1).astype(int)
+        # elementwise: every label rounds to 0/1 on its own, there is no
+        # axis to reduce over the way argmax reduces to a single class
+        int_array = np.round(onehot_array).astype(int)
     else:
         int_array = np.argmax(onehot_array, axis=-1).astype(int)
     return int_array
@@ -39,6 +51,33 @@ def token_accuracy(predicted_ids: NDArray, target_ids: NDArray, mask: Optional[N
     return float(correct.sum() / max(int(mask.sum()), 1))
 
 
+def build_decision_sequence(header: list, options: list[list], state: list, max_len: Optional[int] = None) -> tuple[list, list]:
+    """
+    Lay out one decision question as
+        [CLS] header [SEP] [MARK] option0 [MARK] option1 ... [SEP] state [SEP]
+
+    Parameters
+    ----------
+    header : token ids for the question type and instructions
+    options : token ids per option, in answer-index order
+    state : token ids for the serialized state
+    max_len : truncate the state so the sequence fits, if given
+
+    Returns
+    -------
+    ids, and the position of each option's MARK_ID
+    """
+    ids = [CLS_ID, *header, SEP_ID]
+    markers = []
+    for option in options:
+        markers.append(len(ids))
+        ids.extend([MARK_ID, *option])
+    ids.append(SEP_ID)
+    room = len(state) if max_len is None else max(0, max_len - len(ids) - 1)
+    ids.extend([*state[:room], SEP_ID])
+    return ids, markers
+
+
 def sequence_exact_match(predicted_ids: NDArray, target_ids: NDArray, mask: Optional[NDArray] = None) -> float:
     """Fraction of rows where every non-padded position of predicted_ids equals target_ids."""
     predicted_ids, target_ids = np.asarray(predicted_ids), np.asarray(target_ids)
@@ -56,12 +95,6 @@ IMAGE_SHAPES = ("disc", "rect", "cross", "ring")
 CLUSTER_SHAPES = ("gaussian", "elongated", "disc", "rect", "cross", "ring", "moon")
 SEQUENCE_TASKS = ("copy", "reverse", "sort", "cipher", "add")
 
-# reserved ids shared by every sequence task; content tokens (or, for "add",
-# digits and the "+" separator) start at TOKEN_OFFSET
-PAD_ID = 0
-BOS_ID = 1
-EOS_ID = 2
-TOKEN_OFFSET = 3
 
 # floor for the signal duration, so a length-1 request cannot divide by zero
 EPSILON_TIME = 1e-12
@@ -100,6 +133,11 @@ class GenConfig:
     min_seq_length: int = 4  # for copy/reverse/sort/cipher
     max_seq_length: int = 10  # for copy/reverse/sort/cipher
     num_digits: int = 3  # for "add": digits per addend
+
+    # for decision
+    decision_types: tuple = tuple(DECISION_TYPES)  # DECISION_TYPES members or values to draw
+    num_choices: int = 4  # options per choice question
+    num_levels: int = 4  # ordered levels per score question
 
 
 class RandomDatasetGenerator:
@@ -194,6 +232,7 @@ class RandomDatasetGenerator:
             "signal",
             "image",
             "sequence",
+            "decision",
         ],
         **kwargs,
     ):
@@ -215,6 +254,8 @@ class RandomDatasetGenerator:
             return self._image(config)
         if task == "sequence":
             return self._sequence(config)
+        if task == "decision":
+            return self._decision(config)
         raise ValueError(f"Unknown task: {task}")
 
     # --------------- Task Implementations ---------------
@@ -810,6 +851,106 @@ class RandomDatasetGenerator:
         if config.verbose:
             print(f"Sequence[{task}]: encoder{encoder_input.shape}, decoder{decoder_target.shape}")
         return encoder_input, decoder_target, meta
+
+    # --------------- Decision ---------------
+
+    def _decision_words(self, config: GenConfig) -> dict[str, int]:
+        """Content-token ids standing in for the words a real tokenizer would emit."""
+        type_names = [kind.name.lower() for kind in DECISION_TYPES]
+        names = [*type_names, "false", "true", *(f"level_{i}" for i in range(config.num_levels))]
+        return {name: TOKEN_OFFSET + i for i, name in enumerate(names)}
+
+    def _state_without(self, items: NDArray, excluded: list, length: int) -> list:
+        allowed = np.setdiff1d(items, excluded)
+        return list(self.rng.choice(allowed, size=length))
+
+    def _plant(self, state: list, token: int, copies: int) -> list:
+        for _ in range(copies):
+            state.insert(int(self.rng.integers(0, len(state) + 1)), token)
+        return state
+
+    def _decision_sample(self, kind: DECISION_TYPES, items: NDArray, words: dict, length: int, config: GenConfig):
+        """One question: header, options, state and the answer option index."""
+        if kind == DECISION_TYPES.CHOICE:
+            candidates = list(self.rng.choice(items, size=config.num_choices, replace=False))
+            answer = int(self.rng.integers(config.num_choices))
+            state = self._state_without(items, candidates, length)
+            state = self._plant(state, candidates[answer], 1)
+            return [words["choice"]], [[token] for token in candidates], state, answer
+
+        query = int(self.rng.choice(items))
+        state = self._state_without(items, [query], length)
+        if kind == DECISION_TYPES.SCORE:
+            answer = int(self.rng.integers(config.num_levels))
+            options = [[words[f"level_{i}"]] for i in range(config.num_levels)]
+        else:
+            answer = int(self.rng.integers(2))
+            options = [[words["false"]], [words["true"]]]
+        return [words[kind.name.lower()], query], options, self._plant(state, query, answer), answer
+
+    def _decision(self, config: GenConfig):
+        """
+        Typed decision questions for validating an encoder-only system-one head.
+
+        Each row is one question laid out by `build_decision_sequence`:
+            BINARY -- whether the query token appears, options [false, true]
+            CHOICE -- which of num_choices option tokens appears in the state
+            SCORE  -- how many times the query token appears, as one of
+                      num_levels ordered levels
+
+        `X` is the padded token ids and `y` the answer option index. `meta`
+        carries DecisionHead's forward kwargs: `marker_pos`, `token_mask` and
+        `decisiontypes` (DECISION_TYPES values), plus `attention_mask` and
+        `words`, the ids used for type names, false/true and level labels.
+        """
+        type_ids = [DECISION_TYPES(kind).value for kind in config.decision_types]
+        if config.num_choices < 2 or config.num_levels < 2:
+            raise ValueError("num_choices and num_levels must each be at least 2")
+        if config.vocab_size <= config.num_choices:
+            raise ValueError("vocab_size must exceed num_choices so non-answers can be kept out of the state")
+
+        words = self._decision_words(config)
+        items = np.arange(config.vocab_size) + TOKEN_OFFSET + len(words)
+        lengths = self._sequence_content_lengths(config.num_samples, config.min_seq_length, config.max_seq_length)
+        decisiontypes = self.rng.choice(type_ids, size=config.num_samples)
+
+        rows, markers, answers = [], [], []
+        for kind, length in zip(decisiontypes, lengths):
+            header, options, state, answer = self._decision_sample(
+                DECISION_TYPES(int(kind)), items, words, int(length), config
+            )
+            ids, positions = build_decision_sequence(header, options, state)
+            rows.append(ids)
+            markers.append(positions)
+            answers.append(answer)
+
+        n = config.num_samples
+        width = max(len(ids) for ids in rows)
+        options = max(len(positions) for positions in markers)
+        X = np.full((n, width), PAD_ID, dtype=int)
+        marker_pos = np.zeros((n, options), dtype=int)
+        token_mask = np.zeros((n, options), dtype=bool)
+        for i, (ids, positions) in enumerate(zip(rows, markers)):
+            X[i, :len(ids)] = ids
+            marker_pos[i, :len(positions)] = positions
+            token_mask[i, :len(positions)] = True
+
+        meta = dict(
+            attention_mask=X != PAD_ID,
+            marker_pos=marker_pos,
+            token_mask=token_mask,
+            decisiontypes=decisiontypes.astype(int),
+            words=words,
+            item_offset=int(items[0]),
+            vocab_size=int(items[-1]) + 1,
+            pad_id=PAD_ID,
+            cls_id=CLS_ID,
+            sep_id=SEP_ID,
+            mark_id=MARK_ID,
+        )
+        if config.verbose:
+            print(f"Decision: X{X.shape}, options up to {options}, types={[DECISION_TYPES(kind).name for kind in type_ids]}")
+        return X, np.asarray(answers, dtype=int), meta
 
 
 # Example usage:
