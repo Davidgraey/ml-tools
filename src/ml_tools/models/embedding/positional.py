@@ -1,7 +1,7 @@
 import numpy as np
 from typing import Optional
 from numpy.typing import NDArray
-from ml_tools.models.layers.layers import Layer
+from ml_tools.models.layers.basal_layers import Layer
 
 
 class RopeEmbedding(Layer):

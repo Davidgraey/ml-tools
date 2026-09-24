@@ -1,10 +1,10 @@
 from scipy.io import wavfile
 import numpy as np
 from ml_tools.utilities import rolling_windows_nd, standardize_data
-from ml_tools.models.layers.operators import LatentStack
+from ml_tools.models.layers.operator_layers import LatentStack
 from ml_tools.models.model_loss import MSELoss
 from ml_tools.models.optimizers import SGD
-from ml_tools.models.layers.layers import (
+from ml_tools.models.layers.basal_layers import (
     FrequencyFFT,
     FullyConnectedLayer,
     DropoutLayer,
