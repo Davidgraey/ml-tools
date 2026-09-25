@@ -8,7 +8,7 @@ forward pass answers every question (no chain-of-thought, no decoding loop),
 which is the "system one" part: one Spectre mixing pass over the sequence,
 then one shared scorer read off the [MARK] positions.
 
-Run: python system_one_decision_example.py
+Run: python NNet_system_one_decision_example.py
 """
 
 from polyergalio.generators.data_generators import RandomDatasetGenerator

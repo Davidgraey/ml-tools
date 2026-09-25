@@ -21,6 +21,8 @@ from polyergalio.models.layers.mixture_layers import (
     VotingWeightBalanced,
 )
 from polyergalio.models.layers.spectre_layers import (
+    HeadGate,
+    HeadProjection,
     PersistentMemory,
     SpectreAttention,
     SpectreDecoderAttention,
