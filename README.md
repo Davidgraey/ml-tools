@@ -1,4 +1,4 @@
-# PolyerGalio
+# PolyErgalio
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 ![NumPy](https://img.shields.io/badge/numpy-%3E%3D1.20-blue)
 ![SciPy](https://img.shields.io/badge/scipy-%3E%3D1.7-blue)
@@ -11,7 +11,7 @@
 
 ## Overview
 
-**PolyerGalio** (Greek for "multiple tools") is a collection of implemented machine learning methods ranging from  
+**PolyErgalio** (Greek for "multiple tools") is a collection of implemented machine learning methods ranging from  
 data encoding and processing pipelines to supervised learning and clustering.
 
 The focus of this repository is:
