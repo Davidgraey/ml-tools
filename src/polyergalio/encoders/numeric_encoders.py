@@ -8,8 +8,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from encoders import Processor
-from encoder_utils import calcualte_iqr_bounds, find_outliers
+from polyergalio.encoders.encoder_utils import calcualte_iqr_bounds, find_outliers
+from polyergalio.encoders.encoders import Processor
 
 
 class NuemricNormalizeProcessor(Processor):

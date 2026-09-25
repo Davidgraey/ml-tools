@@ -212,6 +212,52 @@ def test_a_healthy_graph_validates_clean(branching_network):
     assert branching_network.validate() == []
 
 
+def test_prune_drops_a_node_that_feeds_nothing():
+    net = NeuralNetwork()
+    main = net.connect(FullyConnectedLayer(4, 3, "relu"), net.input, name="main")
+    net.connect(FullyConnectedLayer(4, 8, "relu"), net.input, name="orphan")
+    net.output = main
+
+    dropped = net.prune()
+
+    assert dropped == ["orphan"]
+    assert [node.name for node in net.nodes] == [INPUT_NAME, "main"]
+    assert net.validate() == []
+
+
+def test_prune_keeps_an_ancestor_shared_with_a_dead_branch():
+    net = NeuralNetwork()
+    shared = net.connect(FullyConnectedLayer(4, 6, "relu"), net.input, name="shared")
+    live = net.connect(FullyConnectedLayer(6, 2, "linear"), shared, name="live")
+    net.connect(FullyConnectedLayer(6, 8, "relu"), shared, name="dead")
+    net.output = live
+
+    dropped = net.prune()
+
+    assert dropped == ["dead"]
+    assert [node.name for node in net.nodes] == [INPUT_NAME, "shared", "live"]
+    assert [consumer.name for consumer in shared.consumers] == ["live"]
+
+
+def test_prune_leaves_a_healthy_graph_alone(branching_network):
+    before = [node.name for node in branching_network.nodes]
+    assert branching_network.prune() == []
+    assert [node.name for node in branching_network.nodes] == before
+
+
+def test_a_pruned_network_still_runs(branching_network):
+    live_output = branching_network.output
+    branching_network.connect(
+        FullyConnectedLayer(6, 1, "linear"), branching_network.node("a"), name="dead"
+    )
+    branching_network.output = live_output
+    branching_network.prune()
+
+    x = np.random.default_rng(0).normal(size=(2, 4))
+    output = branching_network.forward(x)
+    assert output.shape == (2, 2)
+
+
 # -------------    shapes checked while wiring    ------------------
 def test_a_width_mismatch_is_caught_at_the_wiring_line():
     """

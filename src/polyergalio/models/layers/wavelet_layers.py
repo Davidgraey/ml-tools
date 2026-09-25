@@ -94,13 +94,9 @@ class WaveletRefinementModule(Layer):
         descriptor-conditioned channel gate
         coefficient modulation
 
-    Descriptor forms
-    ----------------
-    Global descriptor:
-        (B, D)
+    Global descriptor (B, D)
 
-    Position-wise descriptor:
-        (B, N, D)
+    Position-wise descriptor (B, N, D)
 
     In the global case, the learned channel gate is broadcast over
     sequence positions before being pooled to wavelet resolution.

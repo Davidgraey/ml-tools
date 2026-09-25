@@ -1,6 +1,8 @@
 from typing import Optional
 
 import numpy as np
+from numpy.typing import NDArray
+
 from polyergalio.models.constants import (
     DECISION_TYPES,
     EPSILON,
@@ -14,7 +16,7 @@ from polyergalio.models.layers.basal_layers import (
     RMSNormLayer,
     xavier,
 )
-from numpy.typing import NDArray
+from polyergalio.models.layers.mixture_layers import MixtureOfExperts
 
 
 # -------------    question types    -------------------------------
@@ -235,19 +237,30 @@ class DecisionHead(Layer):
         self.type_embedding = 0.1 * xavier(self.RNG, ni=num_types, no=hidden_dim)
         self.embedding_norm = NormalizeLayer(ni=hidden_dim)
 
-        self.trunk_a = FullyConnectedLayer(
-            ni=hidden_dim, no=head_hidden, activation_type=activation_type
-        )
-        self.trunk_b = FullyConnectedLayer(
-            ni=head_hidden, no=hidden_dim, activation_type=activation_type
-        )
+        self.trunk_a = MixtureOfExperts(input_dim=hidden_dim,
+                                        hidden_dim=hidden_dim,
+                                        num_shared_experts=4,
+                                        num_routed_experts=16,
+                                        top_k=4,
+                                        routed_scaling=1.5,
+                                        num_groups=8,
+                                        top_groups=8,
+                                        activation_type=activation_type)
+
         self.trunk_mid_norm = RMSNormLayer(ni=hidden_dim)
-        self.trunk_c = FullyConnectedLayer(
-            ni=hidden_dim, no=head_hidden, activation_type="linear"
-        )
+
+        self.trunk_b = MixtureOfExperts(input_dim=hidden_dim,
+                                        hidden_dim=hidden_dim,
+                                        num_shared_experts=4,
+                                        num_routed_experts=16,
+                                        top_k=4,
+                                        routed_scaling=2.5,
+                                        num_groups=8,
+                                        top_groups=8,
+                                        activation_type=activation_type)
 
         self.scorer = FullyConnectedLayer(
-            ni=head_hidden, no=1, activation_type="linear", is_output=True
+            ni=hidden_dim, no=1, activation_type="linear", is_output=True
         )
         self.act_head = FullyConnectedLayer(
             ni=hidden_dim, no=2, activation_type="linear", is_output=True
@@ -261,15 +274,6 @@ class DecisionHead(Layer):
 
     def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
         return ((None,),)
-
-    # def named_sublayers(self) -> dict[str, Layer]:
-    #     """Parameterized sublayers, keyed as the optimizer sees them."""
-    #     return {
-    #         "norm": self.norm,
-    #         "trunk": self.trunk,
-    #         "scorer": self.scorer,
-    #         "act_head": self.act_head,
-    #     }
 
     def forward(
         self,
@@ -309,8 +313,8 @@ class DecisionHead(Layer):
 
         type_vector = self.type_embedding[self.decisiontype]
         markers = hidden_state[self.rows, self.marker_pos]
-        xs = self.trunk_mid_norm(self.trunk_b(self.trunk_a(self.embedding_norm(markers))))
-        xs = self.trunk_c(xs + type_vector[:, None, :])
+        mixed = self.trunk_mid_norm(self.trunk_a(self.embedding_norm(markers), mask=self.token_mask))
+        xs = self.trunk_b(mixed + type_vector[:, None, :], mask=self.token_mask)
 
         scores = self.scorer(xs)[..., 0]
 
@@ -351,9 +355,8 @@ class DecisionHead(Layer):
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         grad_scores = np.where(self.token_mask, incoming_grad, 0.0)[..., None]
-        grad_typed = self.trunk_c.backward(self.scorer.backward(grad_scores))
-        grad_trunk = self.trunk_b.backward(self.trunk_mid_norm.backward(grad_typed))
-        grad_normed = self.trunk_a.backward(grad_trunk)
+        grad_typed = self.trunk_b.backward(self.scorer.backward(grad_scores))
+        grad_normed = self.trunk_a.backward(self.trunk_mid_norm.backward(grad_typed))
         grad_markers = self.embedding_norm.backward(grad_normed) * self.token_mask[..., None]
 
         grad_hidden = np.zeros(self.hidden_shape, dtype=GLOBAL_DTYPE)
@@ -383,7 +386,6 @@ class DecisionHead(Layer):
             "trunk_a": self.trunk_a.get_weights(for_serialize=for_serialize),
             "trunk_b": self.trunk_b.get_weights(for_serialize=for_serialize),
             "trunk_mid_norm": self.trunk_mid_norm.get_weights(for_serialize=for_serialize),
-            "trunk_c": self.trunk_c.get_weights(for_serialize=for_serialize),
             "scorer": self.scorer.get_weights(for_serialize=for_serialize),
             "act_head": self.act_head.get_weights(for_serialize=for_serialize),
         }
@@ -397,7 +399,6 @@ class DecisionHead(Layer):
         self.trunk_a.set_weights(weights.get("trunk_a"))
         self.trunk_b.set_weights(weights.get("trunk_b"))
         self.trunk_mid_norm.set_weights(weights.get("trunk_mid_norm"))
-        self.trunk_c.set_weights(weights.get("trunk_c"))
         self.scorer.set_weights(weights.get("scorer"))
         self.act_head.set_weights(weights.get("act_head"))
 
@@ -408,7 +409,6 @@ class DecisionHead(Layer):
             "trunk_a": self.trunk_a.get_gradients(),
             "trunk_b": self.trunk_b.get_gradients(),
             "trunk_mid_norm": self.trunk_mid_norm.get_gradients(),
-            "trunk_c": self.trunk_c.get_gradients(),
             "scorer": self.scorer.get_gradients(),
             "act_head": self.act_head.get_gradients(),
         }
@@ -420,7 +420,6 @@ class DecisionHead(Layer):
         trunk_a: Optional[dict] = None,
         trunk_b: Optional[dict] = None,
         trunk_mid_norm: Optional[dict] = None,
-        trunk_c: Optional[dict] = None,
         scorer: Optional[dict] = None,
         act_head: Optional[dict] = None,
     ) -> None:
@@ -434,8 +433,6 @@ class DecisionHead(Layer):
             self.trunk_b.update_weights(**trunk_b)
         if trunk_mid_norm:
             self.trunk_mid_norm.update_weights(**trunk_mid_norm)
-        if trunk_c:
-            self.trunk_c.update_weights(**trunk_c)
         if scorer:
             self.scorer.update_weights(**scorer)
         if act_head:
@@ -447,7 +444,6 @@ class DecisionHead(Layer):
         self.trunk_a.zero_gradients()
         self.trunk_b.zero_gradients()
         self.trunk_mid_norm.zero_gradients()
-        self.trunk_c.zero_gradients()
         self.scorer.zero_gradients()
         self.act_head.zero_gradients()
 
@@ -456,7 +452,6 @@ class DecisionHead(Layer):
         self.trunk_a.purge()
         self.trunk_b.purge()
         self.trunk_mid_norm.purge()
-        self.trunk_c.purge()
         self.scorer.purge()
         self.act_head.purge()
         self.hidden_shape = None
@@ -476,7 +471,6 @@ class DecisionHead(Layer):
             + self.trunk_a.num_parameters
             + self.trunk_b.num_parameters
             + self.trunk_mid_norm.num_parameters
-            + self.trunk_c.num_parameters
             + self.scorer.num_parameters
             + self.act_head.num_parameters
         )
@@ -489,7 +483,3 @@ class DecisionHead(Layer):
 
     def __repr__(self):
         return self.__str__()
-
-
-if __name__ == "__main__":
-    from polyergalio.models.model_loss import DecisionLoss

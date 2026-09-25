@@ -47,7 +47,7 @@ def markers():
 
 
 def build_head(**kwargs):
-    return DecisionHead(hidden_dim=HIDDEN, head_hidden=8, activation_type="tanh", **kwargs)
+    return DecisionHead(hidden_dim=HIDDEN, head_hidden=8, activation_type="tanh", **kwargs).eval()
 
 
 def featurize(X, meta):
@@ -144,18 +144,23 @@ def test_input_gradient(encoded, markers):
     assert relative_error(analytic, numeric) < GRADIENT_TOLERANCE
 
 
-@pytest.mark.parametrize("owner,parameter,gradient_name", (
-    ("embedding_norm", "scale_gamma", "gradient_gamma"),
-    ("trunk_a", "weights", "gradient_weights"),
-    ("trunk_b", "weights", "gradient_weights"),
-    ("trunk_mid_norm", "scale_gamma", "gradient_gamma"),
-    ("trunk_c", "bias", "gradient_bias"),
-    ("scorer", "weights", "gradient_weights"),
-    (None, "type_embedding", "gradient_type_embedding"),
-))
-def test_parameter_gradients(encoded, markers, owner, parameter, gradient_name):
+PARAMETER_OWNERS = {
+    "embedding_norm": (lambda head: head.embedding_norm, "scale_gamma", "gradient_gamma"),
+    "trunk_a_shared": (lambda head: head.trunk_a.shared_experts[0].down_proj, "weights", "gradient_weights"),
+    "trunk_a_gate": (lambda head: head.trunk_a.gate.stack[0], "weights", "gradient_weights"),
+    "trunk_mid_norm": (lambda head: head.trunk_mid_norm, "scale_gamma", "gradient_gamma"),
+    "trunk_b_shared": (lambda head: head.trunk_b.shared_experts[0].gate_proj, "weights", "gradient_weights"),
+    "trunk_b_gate": (lambda head: head.trunk_b.gate.stack[0], "weights", "gradient_weights"),
+    "scorer": (lambda head: head.scorer, "weights", "gradient_weights"),
+    "type_embedding": (lambda head: head, "type_embedding", "gradient_type_embedding"),
+}
+
+
+@pytest.mark.parametrize("owner", PARAMETER_OWNERS)
+def test_parameter_gradients(encoded, markers, owner):
     head = build_head()
-    layer = head if owner is None else getattr(head, owner)
+    find, parameter, gradient_name = PARAMETER_OWNERS[owner]
+    layer = find(head)
     upstream = np.random.default_rng(11).normal(size=markers["marker_pos"].shape) * markers["token_mask"]
     head.forward(encoded, **markers)
     head.backward(upstream)
@@ -229,15 +234,14 @@ def test_interface(encoded, markers):
     head = build_head()
     head.forward(encoded, **markers)
     head.backward(np.ones(markers["marker_pos"].shape))
-    layers = {"embedding_norm", "trunk_a", "trunk_b", "trunk_mid_norm", "trunk_c", "scorer", "act_head"}
+    layers = {"embedding_norm", "trunk_a", "trunk_b", "trunk_mid_norm", "scorer", "act_head"}
     assert set(head.get_gradients()) == layers | {"gradient_type_embedding"}
     assert set(head.get_weights(for_serialize=True)) == layers | {"type_embedding"}
-    assert head.num_parameters == (
-        3 * HIDDEN + 2 * HIDDEN + (HIDDEN * 8 + 8) + (8 * HIDDEN + HIDDEN)
-        + HIDDEN + (HIDDEN * 8 + 8) + (8 + 1) + (HIDDEN * 2 + 2)
+    assert head.num_parameters == head.type_embedding.size + sum(
+        getattr(head, name).num_parameters for name in layers
     )
     head.purge()
-    assert head.act_logits is None and head.trunk_a.input is None
+    assert head.act_logits is None and head.trunk_a.output is None
 
 
 # -------------    loss    -----------------------------------------

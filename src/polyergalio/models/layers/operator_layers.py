@@ -610,3 +610,53 @@ class ShiftRight(Layer):
 
     def __repr__(self):
         return self.__str__()
+
+class MaskGather(Layer):
+    """
+    Selects specific positions out of a (batch, sequence, hidden) tensor
+    for a downstream head to run on; scatters the gradient back into the
+    full shape on the way back. No learnable parameters.
+
+    Input shape: (batch, sequence, hidden)
+    Output shape: (num_selected, hidden) -- flattened across batch and
+        sequence, since a downstream head only needs a bag of vectors,
+        not which row or position each one came from
+    """
+    preserves_shape = False
+
+    def __init__(self):
+        super().__init__()
+        self.declare_shapes(inputs=((None, None, None),), outputs=((None, None),))
+        self.select_mask = None
+        self.in_shape = None
+        self.zero_gradients()
+
+    def forward(self, incoming_x, mask=None, target_mask=None):
+        """mask : (batch, sequence) bool/0-1, which positions are valid (NOT padding)
+        target_mask: (batch, sequence) bool/0-1, which positions to pass forward (for training tasks like MLM)
+        None keeps everything."""
+        self.in_shape = incoming_x.shape
+
+        if mask is not None:
+            self.select_mask = np.asarray(mask, dtype=bool)
+        else:
+            self.select_mask = np.ones(incoming_x.shape[:2], dtype=bool)
+
+        if target_mask is not None:
+            self.select_mask &= np.asarray(target_mask, dtype=bool)
+
+        return incoming_x[self.select_mask]
+
+    def backward(self, incoming_grad):
+        full_grad = np.zeros(self.in_shape, dtype=incoming_grad.dtype)
+        full_grad[self.select_mask] = incoming_grad
+        return full_grad
+
+    def update_weights(self): pass
+    def zero_gradients(self): pass
+    def get_weights(self, for_serialize=False): return {} if for_serialize else None
+    def get_gradients(self): return {}
+    def purge(self): self.select_mask = None; self.in_shape = None
+
+    @property
+    def num_parameters(self): return 0

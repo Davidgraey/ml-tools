@@ -2,23 +2,24 @@
 ------------------------ Categorical preprocessing / encoders ------------------------------
 --------------------------------------------------------------------------------------------
 """
+
 from collections import Counter
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from encoders import Processor
+from polyergalio.encoders.encoders import Processor
 
 
 class CategoricalProcessor(Processor):
     def __init__(
-            self,
-            target: str,
-            col_idx: Optional[int] = None,
-            rare_encoding_threshold: Optional[float] = None,
-            min_classes_for_rare_qualification: int = 15,
-            for_target: bool = False,
+        self,
+        target: str,
+        col_idx: Optional[int] = None,
+        rare_encoding_threshold: Optional[float] = None,
+        min_classes_for_rare_qualification: int = 15,
+        for_target: bool = False,
     ):
         """
         Processor class - for encoding categorical variables.
@@ -71,7 +72,9 @@ class CategoricalProcessor(Processor):
             _counts = values[self.target].value_counts().to_dict()
             _counts = {k: int(v) for k, v in _counts.items()}
 
-        return {k: v for k, v in sorted(_counts.items(), key=lambda kv: kv[1], reverse=True)}
+        return {
+            k: v for k, v in sorted(_counts.items(), key=lambda kv: kv[1], reverse=True)
+        }
 
     def fit(self, values: iter) -> bool:
         """
@@ -95,7 +98,7 @@ class CategoricalProcessor(Processor):
                 rare_labels = []
             else:
                 valids = items[: self.rare_qualify]
-                rare_labels = items[self.rare_qualify:]
+                rare_labels = items[self.rare_qualify :]
         else:
             raise NotImplementedError("not yet implemented")
 

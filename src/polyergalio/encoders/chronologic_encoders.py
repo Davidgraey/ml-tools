@@ -9,14 +9,15 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-from encoders import Processor
-from encoder_constants import DELTA_LOOKUP, Period
-from encoder_utils import (
+from polyergalio.encoders.encoder_constants import DELTA_LOOKUP, Period
+from polyergalio.encoders.encoder_utils import (
     DISPATCHER,
     INVERT_DISPATCHER,
     convert_timestamp,
     localize_timestamp,
 )
+from polyergalio.encoders.encoders import Processor
+
 
 # ------------------------- Time Processors -------------------------
 class TimeCycleProcessor(Processor):

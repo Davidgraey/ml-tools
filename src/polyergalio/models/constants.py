@@ -3,7 +3,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 GLOBAL_DTYPE = np.float64
-GLOBAL_COMPLEX_DTYPE = np.complex64
+GLOBAL_COMPLEX_DTYPE = np.complex128
 EPSILON = 1e-15
 ANY_SHAPE = (None,)
 

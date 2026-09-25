@@ -1,3 +1,7 @@
-import logging
-
-log = logging.getLogger(__name__)
+# up-import our encoders
+from polyergalio.encoders.encoders import Processor
+from polyergalio.encoders.audio_encoders import AudioProcessor
+from polyergalio.encoders.categorical_encoders import CategoricalProcessor
+from polyergalio.encoders.chronologic_encoders import TimeCycleProcessor, TimeAbsoluteProcessor
+from polyergalio.encoders.numeric_encoders import NuemricNormalizeProcessor, NuemricStandardizeProcessor
+from polyergalio.encoders.text_encoders import TextProcessor

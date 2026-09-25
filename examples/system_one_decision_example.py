@@ -63,11 +63,16 @@ def build_network(vocab_size: int, sequence_length: int, padding_idx: int) -> Ne
     return net
 
 
-def accuracy(logits, y, kwargs: dict) -> float:
-    """Fraction of rows decoded correctly against the generator's answers."""
+def row_correctness(logits, y, kwargs: dict):
+    """(batch,) 1.0 where the decoded answer matches the generator's answer."""
     probabilities = masked_softmax(logits, kwargs["token_mask"])
     decisions = decode_decisions(probabilities, kwargs["decisiontypes"])
-    return float(decision_correct(decisions, y, kwargs["decisiontypes"]).mean())
+    return decision_correct(decisions, y, kwargs["decisiontypes"])
+
+
+def accuracy(logits, y, kwargs: dict) -> float:
+    """Fraction of rows decoded correctly against the generator's answers."""
+    return float(row_correctness(logits, y, kwargs).mean())
 
 
 def main():
@@ -101,19 +106,24 @@ def main():
     loss_fn = DecisionLoss(ordinal_weight=0.25)
     optimizer = SGD(LEARNING_RATE)
 
+    head = net.node("decision_head").layer
+
     net.train()
     for step in range(TRAIN_STEPS):
         net.zero_gradients()
         logits = net.forward(X, **kwargs)
         loss = loss_fn(logits, y, kwargs["token_mask"], kwargs["decisiontypes"])
+        act_loss = head.score_act(row_correctness(logits, y, kwargs))
         net.backward(loss_fn.backward())
         optimizer.step(net.layers)
         if step % 50 == 0:
-            print(f"step {step:4d}  loss {loss:.4f}")
+            print(f"step {step:4d}  loss {loss:.4f}  act loss {act_loss:.4f}")
 
     net.eval()
     logits = net.forward(X, **kwargs)
     print(f"accuracy after training: {accuracy(logits, y, kwargs):.3f}")
+    escalated = head.escalate()
+    print(f"escalated to system two: {escalated.mean():.3f} of rows")
 
 
 if __name__ == "__main__":

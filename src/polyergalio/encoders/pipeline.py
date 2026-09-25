@@ -15,10 +15,11 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import scipy
+
 # import sentencepiece as spm
 from numpy.typing import NDArray
 
-from encoders import Processor
+from polyergalio.encoders.encoders import Processor
 
 log = logging.getLogger(__name__)
 
@@ -130,7 +131,6 @@ class UniversalPipeline:
 
         self.nan_idxs = []
 
-
     def add_encoder(self, new_encoder: Processor) -> None:
         """
         add an unfitted encoder to the pipeline object - be sure to use the column's target and index
@@ -162,7 +162,9 @@ class UniversalPipeline:
         -------
         bool - True if successful
         """
-        for e_i, (idx, name, proc) in enumerate(sorted(self._encoders, key=lambda x: x[0])):
+        for e_i, (idx, name, proc) in enumerate(
+            sorted(self._encoders, key=lambda x: x[0])
+        ):
             self._order[idx] = name
             if e_i != idx:
                 raise ValueError(
@@ -222,7 +224,9 @@ class UniversalPipeline:
         metalist = [v.metadata for v in self.encoders.values()]
         for values in metalist:
             for target, meta_dict in values.items():
-                output_mapping.update({target: (meta_dict["idx"], meta_dict["output_dimension"])})
+                output_mapping.update(
+                    {target: (meta_dict["idx"], meta_dict["output_dimension"])}
+                )
 
         return output_mapping
 
@@ -289,14 +293,22 @@ class UniversalPipeline:
             ) as executor:
                 for vari_name, encoder in self.encoders.items():
                     if encoder.additional_targets is None:
-                        tasks.update({executor.submit(encoder.encode, _data[vari_name]): vari_name})
+                        tasks.update(
+                            {
+                                executor.submit(
+                                    encoder.encode, _data[vari_name]
+                                ): vari_name
+                            }
+                        )
                     else:
                         dict_targs = encoder.additional_targets
                         additional_kwargs = {k: _data[v] for k, v in dict_targs.items()}
                         tasks.update(
                             {
                                 executor.submit(
-                                    encoder.encode, _data[vari_name], **additional_kwargs
+                                    encoder.encode,
+                                    _data[vari_name],
+                                    **additional_kwargs,
                                 ): vari_name
                             }
                         )
@@ -316,7 +328,6 @@ class UniversalPipeline:
 
         encoded = expand_list_col(completed, meta_dict=self.metadata)
         log.debug("Completed Encoding")
-
 
         return encoded
 
@@ -361,7 +372,12 @@ class UniversalPipeline:
         Inplace operation - On load, we need to make sure that the encoders are ordered correctly. So call this.
         """
         self.encoders = OrderedDict(
-            {k: v for k, v in sorted(self.encoders.items(), key=lambda item: item[1].variable_idx)}
+            {
+                k: v
+                for k, v in sorted(
+                    self.encoders.items(), key=lambda item: item[1].variable_idx
+                )
+            }
         )
 
     @property
@@ -386,7 +402,9 @@ class UniversalPipeline:
             variable_names: list = meta_dict["variable_names"]
             if len(variable_names) != outs_count:
                 # we'll need to extend the name to include additional columns (should only apply to text encoders now)
-                variable_names = [f"{variable_names[0]}_{idx}" for idx in range(0, outs_count)]
+                variable_names = [
+                    f"{variable_names[0]}_{idx}" for idx in range(0, outs_count)
+                ]
 
             output_columns.extend(variable_names)
             current_index += outs_count
@@ -445,7 +463,9 @@ class UniversalPipeline:
         for meta_dict in self.metadata.values():
             # tracker: int = meta_dict["idx"] + 1
             outs_count: int = meta_dict["output_dimension"]
-            if (meta_dict["enc_type"] == "numeric") or meta_dict["enc_type"] == "chronological":
+            if (meta_dict["enc_type"] == "numeric") or meta_dict[
+                "enc_type"
+            ] == "chronological":
                 for n in range(outs_count):
                     numeric_idxs.append(current_index + n)
 
@@ -538,9 +558,9 @@ class UniversalPipeline:
 
 
 def save_pipeline(
-        pipeline: UniversalPipeline,
-        base_path: str = "../../../data/",
-        filename: str = "pipeline"
+    pipeline: UniversalPipeline,
+    base_path: str = "../../../data/",
+    filename: str = "pipeline",
 ):
     """
     This would mean directories, packagelist, versioning on serialization
@@ -591,13 +611,14 @@ def save_pipeline(
         with open(pickle_name, mode="wb") as f:
             pickle.dump(enc_obj, f, protocol=pickle.DEFAULT_PROTOCOL)  # 4
 
-
     pipeline.encoders = {}
     gc.collect()
     # serialize the pipeline "shell object" (without encoders or VAE)
     with open(f"{base_path}{filename}pipeline.pkl", mode="wb") as f:
         pickle.dump(pipeline, f, protocol=pickle.DEFAULT_PROTOCOL)  # 4
-    packlist.append(f"---------\n pipeline written to {base_path}{filename}pipeline.pkl")
+    packlist.append(
+        f"---------\n pipeline written to {base_path}{filename}pipeline.pkl"
+    )
     packlist.append(f"{pipeline.metadata}")
 
     packlist = "\n".join(packlist)
@@ -650,7 +671,6 @@ def load_pipeline(filename: str = "pipeline") -> UniversalPipeline:
             pipeline = pickle.load(f)
     else:
         raise FileNotFoundError("pipeline file not found")
-
 
     encoder_files = os.scandir(f"{filename}encoders/")
     # unordered load here; but we'll sort encoders later by their target_idx

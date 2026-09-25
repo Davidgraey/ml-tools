@@ -1,3 +1,13 @@
+0.1.1
+=====================
+Reformatted several key layers (MoE) and Decision System-One. check examples.
+    - models/layers Spectre layers now truer-to-paper (individual heads, not a shared represetnation)
+    - models/layers MoE router now has routing, bias and factor included
+    - models/layers DecisionHead extended with MOE trunks
+    - models/layers added in the GatherLayer and other token / attention mask / target mask behaviors for Language models
+    - encoders/ Text Encoder and tokenizers extended with additional training tasks (BART, Bert, electra)
+- TODO: add Hyena / H3 FFT as an option. 
+
 0.1.0
 =====================
 Renamed the package from ml_tools to polyergalio and prepared for PyPI

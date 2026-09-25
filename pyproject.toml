@@ -12,7 +12,8 @@ authors = [
 dependencies = [
     "matplotlib",
     "numpy",
-    "scipy"
+    "scipy",
+    "sentencepiece"
 ]
 
 description = "From-scratch machine learning methods -- encoding, supervised learning, and clustering -- built on NumPy and SciPy"

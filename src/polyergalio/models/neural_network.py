@@ -132,6 +132,27 @@ class NeuralNetwork:
     or sequentially, when there is nothing to branch::
 
         net = NeuralNetwork([layer_a, layer_b, layer_c])
+
+    Swapping a trained network's head means connecting a new node to an
+    already-trained node and retargeting the output -- not editing an
+    existing edge. Node sources are fixed at construction, which is what
+    keeps the graph acyclic and insertion order a valid topological order;
+    nothing rewires a node once it exists.
+
+        new_head = net.connect(NewHead(...), net.node("encoder_out"))
+        net.output = new_head
+
+    The old head is now unreachable from `net.output` and stops training
+    (`backward()` only walks nodes reachable from the output), though it
+    still runs forward every pass until pruned; `net.validate()` flags it.
+
+    To freeze the encoder while fine-tuning only the new head, control
+    which layers the optimizer touches: `optimizer.step()` takes whatever
+    layer list you hand it, so `optimizer.step([new_head_layer])` instead
+    of `optimizer.step(net.layers)` trains only the head. `backward()`
+    still has to flow gradient through the encoder's layers to reach it
+    (that's unavoidable), but nothing forces you to apply those encoder
+    gradients.
     """
 
     def __init__(
@@ -561,6 +582,49 @@ class NeuralNetwork:
                 f"{layer.__class__.__name__} is registered but not connected"
             )
         return problems
+
+    def prune(self) -> list[str]:
+        """
+        Drop nodes that are no longer ancestors of the current output.
+
+        A branch left behind by retargeting `net.output` elsewhere (e.g.
+        swapping a trained network's head) keeps running forward every
+        pass and cluttering `layers()`, `summary()`, and serialization,
+        even though `backward()` already ignores it -- `validate()` flags
+        it but leaves it in place. This removes such nodes outright, by
+        walking `.sources` back from the output and dropping anything
+        that walk never reaches. It only ever removes nodes; edges among
+        the ones that remain are untouched.
+
+        Returns
+        -------
+        names of the nodes removed, in their original graph order
+        """
+        reachable = {self._input}
+        frontier = [self.output]
+        while frontier:
+            node = frontier.pop()
+            if node in reachable:
+                continue
+            reachable.add(node)
+            frontier.extend(node.sources)
+
+        kept = [node for node in self._nodes if node in reachable]
+        dropped = [node for node in self._nodes if node not in reachable]
+        dropped_layers = {node.layer for node in dropped}
+
+        for node in kept:
+            node.consumers = [
+                consumer for consumer in node.consumers if consumer in reachable
+            ]
+
+        object.__setattr__(self, "_nodes", kept)
+        object.__setattr__(
+            self,
+            "_registered",
+            [layer for layer in self._registered if layer not in dropped_layers],
+        )
+        return [node.name for node in dropped]
 
     # ------------- serialization
     def serialize(self) -> dict:

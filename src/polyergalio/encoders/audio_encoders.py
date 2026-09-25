@@ -7,12 +7,13 @@ from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
-from polyergalio.encoders.encoders import Processor
-from polyergalio.models.constants import EPSILON
-from polyergalio.utilities import rolling_windows_nd, standardize_data
 from numpy.typing import NDArray
 from scipy.io import wavfile
 from scipy.signal import decimate
+
+from polyergalio.encoders.encoders import Processor
+from polyergalio.models.constants import EPSILON
+from polyergalio.utilities import rolling_windows_nd, standardize_data
 
 
 def downsample_sequence(
@@ -402,83 +403,3 @@ class AudioProcessor(Processor):
             f"AudioProcessor at {self.sample_rate} Hz, {self.window_size} sample "
             f"windows overlapping {self.num_overlap}, encoding to {units}"
         )
-
-
-if __name__ == "__main__":
-    SAMPLE_RATE = 8000
-    DURATION_SECONDS = 1.0
-    WINDOW_MS = 20.0
-
-    # frequency, amplitude. All three land on bin centres at this window size,
-    # so the encoded peaks can be checked against the tones that made them.
-    TONES = ((250.0, 1.0), (1000.0, 0.5), (2500.0, 0.25))
-
-    seconds = np.arange(int(SAMPLE_RATE * DURATION_SECONDS)) / SAMPLE_RATE
-    waveform = sum(
-        amplitude * np.sin(2 * np.pi * frequency * seconds)
-        for frequency, amplitude in TONES
-    )
-
-    print("---- source signal ----")
-    print(f"{waveform.size} samples at {SAMPLE_RATE} Hz")
-    for frequency, amplitude in TONES:
-        print(f"  tone {frequency:7.1f} Hz at amplitude {amplitude}")
-
-    # ---- the stages, one at a time ----
-    window_size = window_size_from_ms(SAMPLE_RATE, WINDOW_MS)
-    num_overlap = window_size // 3
-
-    windows = build_windows(waveform, window_size, num_overlap)
-    spectrum = windowed_spectrum(windows)
-    power = to_power(spectrum, window_size=window_size)
-    decibels = to_decibels(power)
-    freqs = frequency_axis(window_size, SAMPLE_RATE)
-
-    print("\n---- staged encoding ----")
-    print(f"window_size      {window_size} samples ({WINDOW_MS} ms)")
-    print(f"num_overlap      {num_overlap} samples")
-    print(f"bin width        {freqs[1] - freqs[0]:.1f} Hz")
-    print(f"windows           {windows.shape}")
-    print(f"spectrum         {spectrum.shape}  {spectrum.dtype}")
-    print(f"power, decibels  {power.shape}, {decibels.shape}")
-
-    # each tone should show up as the loudest bin near its own frequency
-    mean_power = power.mean(axis=0)
-    print("\n---- recovered peaks ----")
-    for frequency, amplitude in TONES:
-        nearby = np.abs(freqs - frequency) <= 100.0
-        detected = freqs[nearby][np.argmax(mean_power[nearby])]
-        loudest = 10 * np.log10(mean_power[nearby].max() / mean_power.max())
-        print(
-            f"  expected {frequency:7.1f} Hz -> found {detected:7.1f} Hz"
-            f"   {loudest:+6.2f} dB relative to the strongest tone"
-        )
-
-    # ---- the same thing through the Processor interface ----
-    processor = AudioProcessor(
-        sample_rate=SAMPLE_RATE, window_ms=WINDOW_MS, overlap_ratio=1 / 3
-    )
-    features = processor.fit_encode(waveform)
-
-    print(f"\n---- {processor} ----")
-    print(f"features   {features.shape}")
-    print(f"is_fitted  {processor.is_fitted}")
-    for key, value in processor.metadata.items():
-        print(f"  {key:16s} {value}")
-
-    reconstruction = processor.inverse(features)
-    overlap = min(reconstruction.size, waveform.size)
-    interior = slice(window_size, overlap - window_size)
-    print(f"\nreconstruction   {reconstruction.shape}")
-    print(
-        "interior error   "
-        f"{np.abs(reconstruction[interior] - waveform[interior]).max():.2e}"
-    )
-
-    # ---- plots ----
-    visible = slice(0, int(0.05 * SAMPLE_RATE))
-    plot_waveform(waveform[visible], SAMPLE_RATE)
-    plot_spectrogram(features, processor.freqs)
-    plot_window_spectra(
-        processor.spectrum, processor.freqs, index=10, window_size=window_size
-    )
