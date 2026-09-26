@@ -11,6 +11,7 @@ APP_DIR = Path(__file__).resolve().parent
 for folder in (APP_DIR.parent / "src", APP_DIR.parent / "examples", APP_DIR):
     sys.path.insert(0, str(folder))
 
+import clustering_layers_tab
 import clustering_tab
 import moe_routing_tab
 import relative_weights_tab
@@ -34,6 +35,7 @@ CATEGORIES = {
         "System one decision": system_one_tab.render,
         "Spectre encoder-decoder": spectre_tab.render,
         "MoE routing": moe_routing_tab.render,
+        "Clustering layers": clustering_layers_tab.render,
     },
     "Text": {
         "Token distortions": text_distortions_tab.render,

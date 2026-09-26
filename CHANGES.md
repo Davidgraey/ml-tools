@@ -1,3 +1,10 @@
+0.1.13
+=====================
+Modified our layers -- check examples.
+    - Modified clustering mechanisms to work as Network Layers -- need to continue work here
+    - added text and MLM examples
+    - added Hyena implementation 
+
 0.1.1
 =====================
 Reformatted several key layers (MoE) and Decision System-One. check examples.
