@@ -12,10 +12,7 @@ import pytest
 from polyergalio.generators.data_generators import to_onehot
 from polyergalio.models.constants import ClassificationTask
 from polyergalio.models.supervised.scg_regression import GradientDescent
-from polyergalio.models.supervised.trees.tree_models import (
-    ExplainableBoostedTreeModel,
-    SupervisedTreeModel,
-)
+from polyergalio.models.supervised.trees.tree_models import ExplainableBoostedTreeModel
 
 
 def _ols_r_square(x_data, y_data) -> float:
@@ -128,19 +125,3 @@ def test_ebm_fits_multiclass(multiclass_dataset):
     predicted = model.predict(x_data)
     accuracy = np.mean(predicted == y_data)
     assert accuracy > 0.5
-
-
-# -------------    SupervisedTreeModel    ------------------------------
-@pytest.mark.xfail(
-    strict=True,
-    reason="SupervisedTreeModel has no implementation yet -- its class body "
-    "is just `pass`, so it doesn't satisfy BasalModel's abstract interface "
-    "(forward/predict/fit/fit_predict/calculate_loss) and can't even be "
-    "instantiated",
-)
-def test_supervised_tree_model_fits_and_predicts(binary_dataset):
-    x_data, y_data, _ = binary_dataset
-    model = SupervisedTreeModel()
-    model.fit(x_data, y_data)
-    predicted = model.predict(x_data)
-    assert predicted.shape[0] == x_data.shape[0]

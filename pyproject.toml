@@ -13,7 +13,8 @@ dependencies = [
     "matplotlib",
     "numpy",
     "scipy",
-    "sentencepiece"
+    "sentencepiece",
+    "streamlit"
 ]
 
 description = "From-scratch machine learning methods -- encoding, supervised learning, and clustering -- built on NumPy and SciPy"
@@ -36,6 +37,7 @@ classifiers = [
 
 [project.optional-dependencies]
 gui = ["matplotlib"]
+app = ["streamlit", "pandas", "matplotlib"]
 audio = ["librosa"]
 test = ["pytest"]
 dev = ["pytest", "coverage", "build", "twine"]
@@ -56,15 +58,10 @@ skip_covered = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
 # src layout, so tests import polyergalio without an editable install
 pythonpath = ["src", "tests"]
 addopts = "--strict-markers"
 markers = [
     "slow: finite-difference gradient checks, run with -m 'not slow' to skip",
 ]
-
-[project.urls]
-Homepage = "https://github.com/Davidgraey/ml-tools"
-Repository = "https://github.com/Davidgraey/ml-tools"
-Changelog = "https://github.com/Davidgraey/ml-tools/blob/main/CHANGES.md"
-"Bug Tracker" = "https://github.com/Davidgraey/ml-tools/issues"

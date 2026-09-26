@@ -47,6 +47,8 @@ IMPLEMENTED_TASKS = (
     DistortionTask.NEXT_SENTENCE,
     DistortionTask.SPAN_BOUNDARY,
     DistortionTask.REPLACED_TOKEN,
+    DistortionTask.TOKEN_DELETION,
+    DistortionTask.TEXT_INFILLING,
 )
 
 PAD_VALUES = {
@@ -80,6 +82,9 @@ class TextProcessor(Processor):
         span_geometric_p: float = 0.2,
         max_span_length: int = 10,
         negative_sentence_prob: float = 0.5,
+        delete_prob: float = 0.15,
+        infill_prob: float = 0.3,
+        infill_poisson_lambda: float = 3.0,
         random_seed: Optional[int] = None,
     ):
         """
@@ -95,6 +100,9 @@ class TextProcessor(Processor):
         span_geometric_p : p of the geometric distribution span lengths are drawn from
         max_span_length : longest span SPAN_BOUNDARY masks
         negative_sentence_prob : chance NEXT_SENTENCE pairs a random sentence
+        delete_prob : fraction of content tokens TOKEN_DELETION removes
+        infill_prob : fraction of content TEXT_INFILLING covers with spans
+        infill_poisson_lambda : mean of the Poisson distribution TEXT_INFILLING draws span lengths from
         random_seed : seed for every random draw
         """
         super().__init__(target, col_idx)
@@ -116,6 +124,9 @@ class TextProcessor(Processor):
         self.span_geometric_p = span_geometric_p
         self.max_span_length = max_span_length
         self.negative_sentence_prob = negative_sentence_prob
+        self.delete_prob = delete_prob
+        self.infill_prob = infill_prob
+        self.infill_poisson_lambda = infill_poisson_lambda
         self.rng = np.random.default_rng(random_seed)
 
         self.special_ids = np.array(
@@ -367,6 +378,105 @@ class TextProcessor(Processor):
         sample["labels"][0] = int(is_next)
         return sample
 
+    def token_deletion(self, text: str) -> dict:
+        """
+        BART token deletion, encoder-only form. Content tokens are removed
+        outright, with no [MASK] left behind, at delete_prob. Every
+        remaining position after [CLS] is scored: label 1 where a token
+        was deleted immediately before it ([SEP] catches a deletion at the
+        end), so a run of several deletions in a row is still one label,
+        carried by the position right after the run.
+
+        original_ids (padded, undistorted) is included alongside the
+        shared fields, for a future reconstruction decoder -- BART's
+        actual objective.
+        """
+        original = self.single_sequence(text)
+        content = self.content_positions(original)
+        deleted = content[self.rng.random(content.size) < self.delete_prob]
+
+        deleted_before = np.zeros(original.size, dtype=bool)
+        deleted_before[deleted + 1] = True
+
+        kept = np.flatnonzero(~np.isin(np.arange(original.size), deleted))
+        sample = self.blank_sample(original[kept])
+        sample["target_mask"][1:] = True
+        sample["labels"][1:] = deleted_before[kept][1:].astype(int)
+        sample["original_ids"] = original
+        return sample
+
+    def text_infilling(self, text: str) -> dict:
+        """
+        BART text infilling, encoder-only form. Spans over content
+        positions -- lengths drawn from Poisson(infill_poisson_lambda),
+        clipped to max_span_length, covering up to infill_prob of the
+        content -- are each collapsed to a single [MASK]; a 0-length span
+        inserts a [MASK] where nothing was missing. Spans stay one token
+        apart. Scored at each [MASK]; label is the span's original
+        length, so the head is a (max_span_length + 1)-way classifier.
+
+        original_ids (padded, undistorted) is included alongside the
+        shared fields, for a future reconstruction decoder -- BART's
+        actual objective. Reconstruction itself needs a decoder; this
+        encoder-only variant predicts span length instead.
+        """
+        original = self.single_sequence(text)
+        content = self.content_positions(original)
+        budget = max(1, int(round(self.infill_prob * content.size))) if content.size else 0
+        covered = np.zeros(original.size, dtype=bool)
+
+        spans: list[tuple[int, int]] = []
+        used_starts: set[int] = set()
+        for _ in range(10 * (budget + 1)):
+            if spans and int(covered.sum()) >= budget:
+                break
+            length = min(int(self.rng.poisson(self.infill_poisson_lambda)), self.max_span_length)
+
+            if length == 0:
+                if not content.size:
+                    continue
+                anchor = int(self.rng.choice(content))
+                if covered[anchor] or anchor in used_starts:
+                    continue
+                used_starts.add(anchor)
+                spans.append((anchor, 0))
+                continue
+
+            remaining = budget - int(covered.sum())
+            length = min(length, remaining, content.size)
+            if length <= 0:
+                continue
+            start = self.rng.integers(0, content.size - length + 1)
+            positions = content[start: start + length]
+            if covered[positions[0] - 1: positions[-1] + 2].any() or int(positions[0]) in used_starts:
+                continue
+            covered[positions] = True
+            used_starts.add(int(positions[0]))
+            spans.append((int(positions[0]), length))
+
+        spans.sort()
+        new_ids, target_mask, labels = [], [], []
+        cursor = 0
+        for start, length in spans:
+            new_ids.extend(original[cursor:start])
+            target_mask.extend([False] * (start - cursor))
+            labels.extend([0] * (start - cursor))
+
+            new_ids.append(self.special.MASK)
+            target_mask.append(True)
+            labels.append(length)
+            cursor = start + length
+
+        new_ids.extend(original[cursor:])
+        target_mask.extend([False] * (original.size - cursor))
+        labels.extend([0] * (original.size - cursor))
+
+        sample = self.blank_sample(np.array(new_ids, dtype=int))
+        sample["target_mask"] = np.array(target_mask, dtype=bool)
+        sample["labels"] = np.array(labels, dtype=int)
+        sample["original_ids"] = original
+        return sample
+
     # ------------- stubbed distortions
     def sentence_order(self, text: str) -> dict:
         """
@@ -383,22 +493,6 @@ class TextProcessor(Processor):
         punctuation stripped; label each token 1 where a new sentence begins.
         """
         raise NotImplementedError("sentence_boundary is stubbed")
-
-    def token_deletion(self, text: str) -> dict:
-        """
-        BART token deletion: drop random tokens outright (no [MASK] left
-        behind); predict, per remaining position, whether a token was
-        deleted immediately before it.
-        """
-        raise NotImplementedError("token_deletion is stubbed")
-
-    def text_infilling(self, text: str) -> dict:
-        """
-        BART text infilling: replace each span with a single [MASK], so the
-        model must also infer how many tokens are missing. Reconstruction
-        needs a decoder; an encoder-only variant can predict span length.
-        """
-        raise NotImplementedError("text_infilling is stubbed")
 
     def sentence_permutation(self, text: str) -> dict:
         """
@@ -445,7 +539,7 @@ class TextProcessor(Processor):
         batch = {}
         fields = [name for name, value in samples[0].items() if isinstance(value, np.ndarray)]
         for name in fields:
-            fill = self.special.PAD if name == "input_ids" else PAD_VALUES[name]
+            fill = self.special.PAD if name in ("input_ids", "original_ids") else PAD_VALUES[name]
             dtype = bool if name == "target_mask" else int
             padded = np.full((len(samples), self.max_length), fill, dtype=dtype)
             for row, sample in enumerate(samples):
@@ -459,7 +553,7 @@ if __name__ == "__main__":
     import tempfile
     from pathlib import Path
 
-    from polyergalio.encoders.tokenizer_fitting import fit_tokenizer
+    from polyergalio.encoders.tokenizer import fit_tokenizer
 
     corpus = [
         "The river runs past the old mill. Children fish there in the morning. "

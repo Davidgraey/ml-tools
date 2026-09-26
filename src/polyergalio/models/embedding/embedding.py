@@ -5,7 +5,8 @@ from typing import Optional
 
 import numpy as np
 from polyergalio.models.constants import ANY_SHAPE, GLOBAL_DTYPE
-from polyergalio.models.layers.basal_layers import Layer, xavier
+from polyergalio.models.layers.basal_layers import Layer
+from polyergalio.models.weight_initialization import get_weight_init
 from numpy.typing import NDArray
 
 
@@ -21,13 +22,16 @@ class TextEmbedding(Layer):
     Output shape: (..., embedding_dim)
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: Optional[int] = None, special_tokens: Optional[dict] = None):
+    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: Optional[int] = None, special_tokens: Optional[dict] = None,
+                 initialization: str = "truncated_normal", initialization_kwargs: Optional[dict] = None):
         """
         Parameters
         ----------
         num_embeddings : vocabulary size, the number of rows in the table
         embedding_dim : width of each token's vector
         padding_idx : optional id whose vector is fixed at zero and never trained
+        initialization : any WEIGHT_INIT_DISPATCHER name; fan-in is the vocabulary, so a fixed-scale init is the default
+        initialization_kwargs : keyword arguments bound to the initializer
         """
         super().__init__()
         if padding_idx is not None and not 0 <= padding_idx < num_embeddings:
@@ -36,10 +40,13 @@ class TextEmbedding(Layer):
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
         self.special_tokens = special_tokens
+        self.initialization = initialization
+        self.initialization_kwargs = dict(initialization_kwargs or {})
 
         self.declare_shapes(inputs=(ANY_SHAPE,), outputs=((embedding_dim,),))
 
-        self.weights = xavier(self.RNG, ni=num_embeddings, no=embedding_dim).astype(GLOBAL_DTYPE)
+        initializer = get_weight_init(initialization, **self.initialization_kwargs)
+        self.weights = initializer(self.RNG, ni=num_embeddings, no=embedding_dim)
 
         if padding_idx is not None:
             self.weights[padding_idx] = 0.0

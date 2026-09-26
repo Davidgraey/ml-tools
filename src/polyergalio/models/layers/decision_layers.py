@@ -14,9 +14,9 @@ from polyergalio.models.layers.basal_layers import (
     Layer,
     NormalizeLayer,
     RMSNormLayer,
-    xavier,
 )
 from polyergalio.models.layers.mixture_layers import MixtureOfExperts
+from polyergalio.models.weight_initialization import get_weight_init
 
 
 # -------------    question types    -------------------------------
@@ -213,6 +213,8 @@ class DecisionHead(Layer):
         num_types: int = len(DECISION_TYPES),
         activation_type: str = "swish",
         act_weight: float = 1.0,
+        type_initialization: str = "truncated_normal",
+        type_initialization_kwargs: Optional[dict] = None,
     ):
         """
         Parameters
@@ -222,6 +224,8 @@ class DecisionHead(Layer):
         num_types : number of question types, see DECISION_TYPES
         activation_type : activation for trunk_a and trunk_b
         act_weight : scale on the act loss gradient
+        type_initialization : WEIGHT_INIT_DISPATCHER name for the question-type embedding
+        type_initialization_kwargs : keyword arguments bound to that initializer
         """
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -234,10 +238,14 @@ class DecisionHead(Layer):
 
         self.declare_shapes(inputs=((None, None, hidden_dim),), outputs=((None,),))
 
-        self.type_embedding = 0.1 * xavier(self.RNG, ni=num_types, no=hidden_dim)
+        self.type_initialization = type_initialization
+        self.type_initialization_kwargs = dict(type_initialization_kwargs or {})
+        type_initializer = get_weight_init(type_initialization, **self.type_initialization_kwargs)
+        self.type_embedding = type_initializer(self.RNG, ni=num_types, no=hidden_dim)
         self.embedding_norm = NormalizeLayer(ni=hidden_dim)
 
         self.trunk_a = MixtureOfExperts(input_dim=hidden_dim,
+                                        upscale_dim=2 * hidden_dim,
                                         hidden_dim=hidden_dim,
                                         num_shared_experts=4,
                                         num_routed_experts=16,
@@ -250,6 +258,7 @@ class DecisionHead(Layer):
         self.trunk_mid_norm = RMSNormLayer(ni=hidden_dim)
 
         self.trunk_b = MixtureOfExperts(input_dim=hidden_dim,
+                                        upscale_dim=2 * hidden_dim,
                                         hidden_dim=hidden_dim,
                                         num_shared_experts=4,
                                         num_routed_experts=16,

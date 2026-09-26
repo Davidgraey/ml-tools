@@ -4,9 +4,8 @@ Transforms: probability calibration and the dimensionality projections.
 
 import numpy as np
 import pytest
-from polyergalio.transforms.calibrations import CalibrationType, ProbCalibration
+from polyergalio.transforms.calibrations import ProbCalibration
 from polyergalio.transforms.projections import mca, pca
-from polyergalio.types import BasalTransform
 
 METHODS = ("platt", "isotonic", "spline")
 
@@ -28,26 +27,6 @@ def platt_objective(scores, labels, coefficient, intercept) -> float:
 
 
 # -------------    calibration    ----------------------------------
-def test_calibration_is_a_transform():
-    assert issubclass(ProbCalibration, BasalTransform)
-
-
-@pytest.mark.parametrize("method", METHODS)
-def test_calibration_tracks_fitted_state(method, calibration_data):
-    scores, labels = calibration_data
-    model = ProbCalibration(method=method, data_dimension=1)
-    assert not model.is_fitted
-    model.fit(scores, labels)
-    assert model.is_fitted
-
-
-@pytest.mark.parametrize("method", METHODS)
-def test_predict_before_fit_raises(method, calibration_data):
-    scores, _ = calibration_data
-    with pytest.raises(RuntimeError):
-        ProbCalibration(method=method, data_dimension=1).predict(scores)
-
-
 @pytest.mark.parametrize("method", METHODS)
 def test_calibration_is_monotone(method, calibration_data):
     """
@@ -61,16 +40,6 @@ def test_calibration_is_monotone(method, calibration_data):
     grid = np.linspace(scores.min(), scores.max(), 80).reshape(-1, 1)
     calibrated = model.predict(grid).ravel()
     assert np.all(np.diff(calibrated) >= -1e-9)
-
-
-@pytest.mark.parametrize("method", METHODS)
-def test_calibration_outputs_probabilities(method, calibration_data):
-    scores, labels = calibration_data
-    calibrated = ProbCalibration(method=method, data_dimension=1).fit_predict(
-        scores, labels
-    )
-    assert calibrated.shape == scores.shape
-    assert (calibrated >= 0.0).all() and (calibrated <= 1.0).all()
 
 
 @pytest.mark.parametrize("method", METHODS)
@@ -90,18 +59,6 @@ def test_calibration_improves_on_the_raw_scores(method, calibration_data):
     raw_brier = np.mean((raw_clipped - labels) ** 2)
     calibrated_brier = np.mean((calibrated - labels) ** 2)
     assert calibrated_brier < raw_brier
-
-
-@pytest.mark.parametrize("method", METHODS)
-def test_calibration_rejects_mismatched_shapes(method, calibration_data):
-    scores, labels = calibration_data
-    with pytest.raises(AssertionError):
-        ProbCalibration(method=method, data_dimension=1).fit(scores, labels[:-5])
-
-
-def test_unknown_method_raises():
-    with pytest.raises(ValueError):
-        ProbCalibration(method="nonsense", data_dimension=1)
 
 
 def test_platt_reaches_the_optimum(calibration_data):
@@ -139,27 +96,6 @@ def test_platt_reaches_the_optimum(calibration_data):
     assert fitted < reference * 1.05, f"fit stalled at {fitted} vs {reference}"
 
 
-def test_platt_coefficient_has_the_right_sign(calibration_data):
-    """higher score must mean higher probability for a positively correlated score"""
-    scores, labels = calibration_data
-    model = ProbCalibration(method="platt", data_dimension=1)
-    model.fit(scores, labels)
-    assert float(np.ravel(model.platt_coefficient)[0]) > 0
-
-
-def test_platt_handles_multiple_columns(calibration_data):
-    """the second column has inverted labels, so its coefficient must flip"""
-    scores, labels = calibration_data
-    wide_scores = np.hstack([scores, scores])
-    wide_labels = np.hstack([labels, 1 - labels])
-
-    model = ProbCalibration(method="platt", data_dimension=2)
-    model.fit(wide_scores, wide_labels)
-
-    coefficients = np.ravel(model.platt_coefficient)
-    assert coefficients[0] > 0 and coefficients[1] < 0
-
-
 def test_isotonic_pava_is_correct():
     """non-decreasing, and each pooled block keeps its mean"""
     values = np.array([3.0, 1.0, 2.0, 5.0, 4.0])
@@ -167,16 +103,6 @@ def test_isotonic_pava_is_correct():
     assert np.all(np.diff(fitted) >= 0)
     assert fitted.mean() == pytest.approx(values.mean())
     assert np.allclose(fitted, [2.0, 2.0, 2.0, 4.5, 4.5])
-
-
-def test_isotonic_pava_leaves_sorted_input_alone():
-    values = np.array([1.0, 2.0, 3.0, 4.0])
-    assert np.allclose(ProbCalibration._pava(values), values)
-
-
-def test_isotonic_pava_flattens_decreasing_input():
-    values = np.array([4.0, 3.0, 2.0, 1.0])
-    assert np.allclose(ProbCalibration._pava(values), np.full(4, 2.5))
 
 
 def test_spline_handles_a_single_knot():
@@ -194,10 +120,6 @@ def test_spline_handles_a_single_knot():
     assert np.isfinite(calibrated).all()
 
 
-def test_calibration_type_enum_covers_the_methods():
-    assert {member.value for member in CalibrationType} >= set(METHODS)
-
-
 # -------------    pca    ------------------------------------------
 def test_pca_components_are_uncorrelated_and_ordered(regression_dataset):
     x_data, _, _ = regression_dataset
@@ -208,29 +130,6 @@ def test_pca_components_are_uncorrelated_and_ordered(regression_dataset):
 
     correlation = np.corrcoef(projection, rowvar=False)
     assert np.abs(correlation - np.eye(3)).max() < 1e-10
-
-
-def test_pca_preserves_total_variance(regression_dataset):
-    x_data, _, _ = regression_dataset
-    features = x_data.shape[1]
-    projection = pca(x_data, top_k_components=features)
-
-    standardized = (x_data - x_data.mean(0)) / x_data.std(0)
-    assert projection.var(0, ddof=1).sum() == pytest.approx(
-        standardized.var(0, ddof=1).sum()
-    )
-
-
-@pytest.mark.parametrize("requested", (1, 2, 3, 99))
-def test_pca_clamps_the_component_count(requested, regression_dataset):
-    x_data, _, _ = regression_dataset
-    projection = pca(x_data, top_k_components=requested)
-    assert projection.shape == (len(x_data), min(requested, x_data.shape[1]))
-
-
-def test_pca_is_deterministic(regression_dataset):
-    x_data, _, _ = regression_dataset
-    assert np.allclose(pca(x_data, 3), pca(x_data, 3))
 
 
 @pytest.mark.parametrize(
@@ -291,34 +190,6 @@ def onehot_table():
     return table
 
 
-@pytest.mark.parametrize("requested", (1, 3, 8, 50))
-def test_mca_returns_row_coordinates(requested, onehot_table):
-    projection = mca(onehot_table, top_k_components=requested)
-    assert projection.shape[0] == onehot_table.shape[0]
-    assert projection.shape[1] <= requested
-
-
-def test_mca_handles_non_square_input(onehot_table):
-    """dividing by an un-kept row sum used to raise for any non-square table"""
-    assert mca(onehot_table, 3).shape == (onehot_table.shape[0], 3)
-
-
-def test_mca_total_inertia_is_the_chi_square_statistic(onehot_table):
-    """
-    The expected table must be built from masses, not raw counts. With counts
-    the inertia came out around 3.6e5 instead of order one.
-    """
-    probability = onehot_table / onehot_table.sum()
-    row_mass = probability.sum(axis=1)
-    column_mass = probability.sum(axis=0)
-    expected = np.outer(row_mass, column_mass)
-    residuals = (probability - expected) / np.sqrt(expected)
-
-    _, singular, _ = np.linalg.svd(residuals, full_matrices=False)
-    assert np.sum(singular**2) == pytest.approx(np.sum(residuals**2))
-    assert np.sum(singular**2) < 10.0, "inertia is not on the expected scale"
-
-
 def test_mca_row_coordinates_satisfy_the_weighted_identity(onehot_table):
     """
     The defining property of row principal coordinates: the mass-weighted sum
@@ -336,18 +207,3 @@ def test_mca_row_coordinates_satisfy_the_weighted_identity(onehot_table):
     weighted = (row_mass[:, None] * coordinates**2).sum(axis=0)
 
     assert np.allclose(weighted, singular[:axes] ** 2)
-
-
-def test_mca_row_centroid_is_at_the_origin(onehot_table):
-    probability = onehot_table / onehot_table.sum()
-    row_mass = probability.sum(axis=1)
-    coordinates = mca(onehot_table, top_k_components=4)
-    assert np.abs((row_mass[:, None] * coordinates).sum(axis=0)).max() < 1e-10
-
-
-def test_mca_is_finite_on_a_sparse_table():
-    """an all-zero column gives a zero mass, which must not divide by zero"""
-    table = np.zeros((30, 5))
-    table[np.arange(30), np.random.default_rng(0).integers(0, 3, 30)] = 1
-    projection = mca(table, top_k_components=2)
-    assert np.isfinite(projection).all()

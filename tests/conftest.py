@@ -148,13 +148,6 @@ def as_float64(layer):
     return layer
 
 
-# -------------    generator fixtures    ---------------------------
-# ------------------------------------------------------------------
-@pytest.fixture()
-def base_fixture():
-    return True
-
-
 @pytest.fixture()
 def generator():
     return RandomDatasetGenerator(random_seed=SEED)
@@ -196,34 +189,6 @@ def clustering_dataset(generator):
     return generator.generate(
         task="clustering", num_samples=600, num_features=2, num_clusters=4,
         noise_scale=0.4, verbose=False,
-    )
-
-
-@pytest.fixture()
-def signal_dataset(generator):
-    return generator.generate(
-        task="signal", num_samples=100, signal_length=128, sample_rate=1000,
-        num_classes=5, verbose=False,
-    )
-
-
-@pytest.fixture()
-def image_dataset(generator):
-    return generator.generate(
-        task="image", num_samples=80, image_size=16, num_classes=4, verbose=False
-    )
-
-
-@pytest.fixture()
-def sequence_dataset(generator):
-    """
-    encoder/decoder token sequences (a sort task): X is the encoder input,
-    y is the decoder target, meta carries decoder_input and the padding
-    masks -- see RandomDatasetGenerator._sequence's docstring.
-    """
-    return generator.generate(
-        task="sequence", num_samples=150, sequence_task="sort", vocab_size=12,
-        min_seq_length=4, max_seq_length=10, verbose=False,
     )
 
 

@@ -100,6 +100,41 @@ def plot_final_predictions(
     plt.show()
 
 
+def plot_prototype_layouts(
+    scenario_name: str, x_data: NDArray, truth: NDArray, layouts: dict
+) -> None:
+    """
+    One subplot per layer: the data colored by its true cluster, with the
+    layer's prototypes on top, joined into a mesh where the layer has a lattice.
+
+    Parameters
+    ----------
+    scenario_name : title label
+    x_data : the data points the layers were trained on
+    truth : true cluster label per point
+    layouts : layer name -> (prototype weights, (rows, cols) lattice shape or None)
+    """
+    columns = min(2, len(layouts))
+    rows = -(-len(layouts) // columns)
+    fig, axes = plt.subplots(rows, columns, figsize=(5.5 * columns, 4.5 * rows), squeeze=False)
+    fig.suptitle(f"{scenario_name}: prototype layout")
+    for ax in axes.flat[len(layouts):]:
+        ax.axis("off")
+    for ax, (name, (weights, shape)) in zip(axes.flat, layouts.items()):
+        for color_idx, label in enumerate(np.unique(truth)):
+            points = x_data[truth == label]
+            ax.scatter(points[:, 0], points[:, 1], color=COLORS(color_idx), s=8, alpha=0.4)
+        if shape is None:
+            ax.scatter(weights[:, 0], weights[:, 1], color="crimson", marker="X", edgecolor="black", s=60)
+        else:
+            _draw_grid_mesh(ax, weights, shape)
+        ax.set_title(f"{name} ({len(weights)} prototypes)")
+        ax.set_xticks([])
+        ax.set_yticks([])
+    plt.tight_layout()
+    plt.show()
+
+
 def _draw_grid_mesh(ax, weights: NDArray, shape: tuple) -> None:
     """The row/column mesh a PLSOM-family grid draws, on shared axes."""
     rows, cols = shape

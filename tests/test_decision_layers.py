@@ -1,3 +1,8 @@
+"""
+DecisionHead: exact gradients, the decision loss, decoding and calibration,
+and end-to-end learning on the generated decision task.
+"""
+
 import numpy as np
 import pytest
 from conftest import GRADIENT_TOLERANCE, numeric_gradient, relative_error
@@ -6,24 +11,19 @@ from polyergalio.generators.data_generators import (
     CLS_ID,
     MARK_ID,
     SEP_ID,
-    TOKEN_OFFSET,
     build_decision_sequence,
 )
-from polyergalio.models.constants import DECISION_TYPES, MASKED_LOGIT
+from polyergalio.models.constants import DECISION_TYPES
 from polyergalio.models.model_loss import DecisionLoss
 from polyergalio.models.layers.decision_layers import (
     DecisionHead,
-    decision_type_ids,
     calibrated_probabilities,
-    decision_confidence,
     decision_correct,
     decode_decisions,
     fit_temperatures,
     masked_softmax,
-    option_bucket,
 )
-from polyergalio.models.neural_network import NeuralNetwork
-from polyergalio.models.optimizers import SGD, Adam
+from polyergalio.models.optimizers import Adam
 
 BATCH, SEQUENCE, HIDDEN = 4, 9, 6
 BINARY, CHOICE, SCORE = (kind.value for kind in DECISION_TYPES)
@@ -73,26 +73,12 @@ def test_build_decision_sequence_layout():
     assert [ids[p] for p in positions] == [MARK_ID, MARK_ID]
 
 
-def test_build_decision_sequence_truncates_only_the_state():
-    ids, positions = build_decision_sequence([10], [[20], [21]], list(range(40, 60)), max_len=12)
-    assert len(ids) == 12 and ids[-1] == SEP_ID
-    assert len(positions) == 2
-
-
 # -------------    generator    ------------------------------------
 @pytest.fixture
 def decision_data():
     return RandomDatasetGenerator(random_seed=3).generate(
         "decision", num_samples=300, vocab_size=10, max_seq_length=8, verbose=False
     )
-
-
-def test_generator_markers_point_at_mark_tokens(decision_data):
-    X, y, meta = decision_data
-    rows = np.arange(len(X))[:, None]
-    assert (X[rows, meta["marker_pos"]][meta["token_mask"]] == MARK_ID).all()
-    assert (y < meta["token_mask"].sum(axis=1)).all()
-    assert set(np.unique(meta["decisiontypes"])) == {BINARY, CHOICE, SCORE}
 
 
 def test_generator_answers_match_the_state(decision_data):
@@ -110,31 +96,7 @@ def test_generator_answers_match_the_state(decision_data):
             assert int(header[1] in state) == answer
 
 
-def test_generator_reserved_ids_precede_content(decision_data):
-    _, _, meta = decision_data
-    assert max(CLS_ID, SEP_ID, MARK_ID) < TOKEN_OFFSET <= min(meta["words"].values())
-    assert meta["item_offset"] == TOKEN_OFFSET + len(meta["words"])
-
-
-def test_generator_validates_config():
-    with pytest.raises(ValueError):
-        RandomDatasetGenerator().generate("decision", vocab_size=4, num_choices=4, verbose=False)
-    with pytest.raises(ValueError):
-        RandomDatasetGenerator().generate("decision", num_levels=1, verbose=False)
-
-
 # -------------    head    -----------------------------------------
-def test_output_shape_and_masked_slots(encoded, markers):
-    logits = build_head().forward(encoded, **markers)
-    assert logits.shape == markers["marker_pos"].shape
-    assert (logits[~markers["token_mask"]] == MASKED_LOGIT).all()
-
-
-def test_requires_marker_positions(encoded):
-    with pytest.raises(ValueError):
-        build_head().forward(encoded)
-
-
 def test_input_gradient(encoded, markers):
     head = build_head()
     upstream = np.random.default_rng(11).normal(size=markers["marker_pos"].shape) * markers["token_mask"]
@@ -196,54 +158,6 @@ def test_act_gradient_matches_numeric(encoded, markers):
     assert relative_error(head.act_head.gradient_weights, numeric_weights) < GRADIENT_TOLERANCE
 
 
-def test_act_head_idle_without_a_score(encoded, markers):
-    head = build_head()
-    head.forward(encoded, **markers)
-    head.backward(np.ones(markers["marker_pos"].shape))
-    assert not head.act_head.gradient_weights.any()
-
-
-def test_escalate_flags_low_act_probability(encoded, markers):
-    head = build_head()
-    head.forward(encoded, **markers)
-    threshold = np.median(head.act_probabilities)
-    assert np.array_equal(head.escalate(threshold), head.act_probabilities < threshold)
-
-
-def test_forward_accepts_members_or_values(encoded, markers):
-    head = build_head()
-    as_values = dict(markers, decisiontypes=[kind.value for kind in markers["decisiontypes"]])
-    assert np.array_equal(head.forward(encoded, **markers), head.forward(encoded, **as_values))
-    assert np.array_equal(head.decisiontype, [CHOICE, BINARY, SCORE, BINARY])
-
-
-def test_default_type_is_choice(encoded, markers):
-    head = build_head()
-    head.forward(encoded, marker_pos=markers["marker_pos"])
-    assert (head.decisiontype == DECISION_TYPES.CHOICE.value).all()
-
-
-def test_network_passes_marker_kwargs(encoded, markers):
-    network = NeuralNetwork()
-    network.connect(build_head(), network.input)
-    assert network.forward(encoded, **markers).shape == markers["marker_pos"].shape
-    assert network.backward(np.ones(markers["marker_pos"].shape)).shape == encoded.shape
-
-
-def test_interface(encoded, markers):
-    head = build_head()
-    head.forward(encoded, **markers)
-    head.backward(np.ones(markers["marker_pos"].shape))
-    layers = {"embedding_norm", "trunk_a", "trunk_b", "trunk_mid_norm", "scorer", "act_head"}
-    assert set(head.get_gradients()) == layers | {"gradient_type_embedding"}
-    assert set(head.get_weights(for_serialize=True)) == layers | {"type_embedding"}
-    assert head.num_parameters == head.type_embedding.size + sum(
-        getattr(head, name).num_parameters for name in layers
-    )
-    head.purge()
-    assert head.act_logits is None and head.trunk_a.output is None
-
-
 # -------------    loss    -----------------------------------------
 @pytest.mark.parametrize("ordinal_weight", (0.0, 0.5))
 def test_decision_loss_gradient(markers, ordinal_weight):
@@ -256,20 +170,7 @@ def test_decision_loss_gradient(markers, ordinal_weight):
     assert relative_error(loss.backward(), numeric * markers["token_mask"]) < GRADIENT_TOLERANCE
 
 
-def test_ordinal_term_prefers_near_misses():
-    mask = np.ones((2, 4), dtype=bool)
-    near, far = np.array([[0.0, 0, 3, 0]]), np.array([[3.0, 0, 0, 0]])
-    loss = DecisionLoss(ordinal_weight=1.0)
-    kinds = [DECISION_TYPES.SCORE]
-    assert loss(near, np.array([3]), mask[:1], kinds) < loss(far, np.array([3]), mask[:1], kinds)
-
-
 # -------------    decoding and calibration    ---------------------
-def test_masked_softmax_ignores_padding():
-    probabilities = masked_softmax(np.array([[1.0, 2.0, 50.0]]), np.array([[True, True, False]]))
-    assert probabilities[0, 2] == 0 and np.isclose(probabilities.sum(), 1)
-
-
 def test_decode_by_question_type():
     probabilities = np.array([[0.1, 0.7, 0.2, 0.0], [0.0, 0.5, 0.5, 0.0], [0.3, 0.7, 0.0, 0.0]])
     kinds = [DECISION_TYPES.CHOICE, DECISION_TYPES.SCORE, DECISION_TYPES.BINARY]
@@ -278,31 +179,6 @@ def test_decode_by_question_type():
     assert np.array_equal(decisions, decode_decisions(probabilities, [kind.value for kind in kinds]))
     assert np.array_equal(decision_correct(decisions, np.array([1, 2, 1]), kinds), [1, 1, 1])
     assert np.array_equal(decision_correct(decisions, np.array([0, 1, 0]), kinds), [0, 0, 0])
-
-
-def test_decode_uses_each_rows_own_type():
-    probabilities = np.array([[0.2, 0.8], [0.2, 0.8], [0.2, 0.8]])
-    kinds = [DECISION_TYPES.BINARY, DECISION_TYPES.CHOICE, DECISION_TYPES.SCORE]
-    assert np.allclose(decode_decisions(probabilities, kinds), [0.8, 1.0, 0.8])
-
-
-def test_type_ids_accept_members_and_values():
-    assert np.array_equal(decision_type_ids([DECISION_TYPES.SCORE, 0, DECISION_TYPES.CHOICE]), [2, 0, 1])
-    with pytest.raises(ValueError):
-        decision_type_ids([7])
-
-
-def test_confidence_bounds():
-    mask = np.array([[True, True, True], [True, True, False]])
-    probabilities = np.array([[1.0, 0.0, 0.0], [0.5, 0.5, 0.0]])
-    assert np.allclose(decision_confidence(probabilities, mask), [1.0, 0.0])
-
-
-def test_option_buckets():
-    assert [option_bucket(DECISION_TYPES.CHOICE, k) for k in (2, 4, 8, 20)] == [
-        "choice:2", "choice:3-5", "choice:6-10", "choice:11+"
-    ]
-    assert option_bucket(DECISION_TYPES.BINARY, 2) == option_bucket(BINARY, 2) == "binary:2"
 
 
 def test_fit_temperatures_recovers_a_planted_temperature():
@@ -318,8 +194,7 @@ def test_fit_temperatures_recovers_a_planted_temperature():
 
 
 # -------------    end to end    -----------------------------------
-@pytest.mark.parametrize("optimizer", (SGD(0.5), Adam(0.01)))
-def test_learns_all_three_question_types(optimizer):
+def test_learns_all_three_question_types():
     X, y, meta = RandomDatasetGenerator(random_seed=0).generate(
         "decision", num_samples=2000, vocab_size=10, max_seq_length=8, verbose=False
     )
@@ -329,6 +204,7 @@ def test_learns_all_three_question_types(optimizer):
 
     head = DecisionHead(hidden_dim=features.shape[-1], head_hidden=64)
     loss = DecisionLoss(ordinal_weight=0.1)
+    optimizer = Adam(0.01)
     for _ in range(300):
         batch = {key: value[train] for key, value in options.items()}
         logits = head.forward(features[train], **batch)

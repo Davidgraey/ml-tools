@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 from polyergalio.models.constants import EPSILON, SIGMA_ZERO, LAMBDA_MAX, LAMBDA_MIN
 from typing import Optional
 from polyergalio.models.constants import ClassificationTask
+from polyergalio.models.weight_initialization import get_weight_init
 from polyergalio.models.model_loss import (
     cross_entropy,
     cross_entropy_derivative,
@@ -29,11 +30,7 @@ from polyergalio.types import BasalModel
 
 
 class GradientDescent(BasalModel):
-    # fields that fully determine a fitted model's prediction-time state, on
-    # top of BasalModel's core (x_means, x_stds) -- serialize()/unserialize()
-    # snapshot and restore exactly these via _capture_state/_restore_state.
     # y_means/y_stds stay None for a classification task (see init_standardize)
-    # and restore as None, which predict() never reads in that case.
     _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
         "weights", "y_means", "y_stds",
     )
@@ -68,10 +65,7 @@ class GradientDescent(BasalModel):
             reg_alpha  # balance between lasso L1 (0.0) ridge L2 (1.0)
         )
 
-        # only populated by init_standardize for a regression task -- set here
-        # (rather than left undefined) so a classification model always has
-        # them, same as BasalModel's x_means/x_stds, and _capture_state never
-        # hits a missing attribute
+        self.weights = None
         self.y_means = None
         self.y_stds = None
 
@@ -119,17 +113,8 @@ class GradientDescent(BasalModel):
         -------
         None
         """
-        # init with kaiming:
-        ws = self.RNG.normal(
-            loc=0.0,
-            scale=np.sqrt(2 / self.input_dimension),
-            size=(self.input_dimension + 1, n_outputs),
-        )
-
-        # add zero for has_bias_presentbias / intercept value
-        ws[0, :] = 0
-        # log.info(f'kaiming init built {ws.shape} coefficients')
-        self.weights = ws
+        coefficients = get_weight_init("kaiming")(self.RNG, ni=self.input_dimension, no=n_outputs)
+        self.weights = np.vstack([np.zeros((1, n_outputs)), coefficients])
 
     def standardize(self, data_array: NDArray, mean: NDArray, stds: NDArray) -> NDArray:
         """standardize our data to 0 mean 1 std"""
@@ -245,7 +230,8 @@ class GradientDescent(BasalModel):
         lamb = 1e-6
         lamb_ = 0
 
-        vector = self.get_weights().reshape(-1, 1)
+        self._weight_shape = self.weights.shape
+        vector = self.weights.reshape(-1, 1).copy()
         grad_new, _ = self._calculate_gradients(x_data, y_data)
         grad_new = -1 * grad_new.reshape(-1, 1)
         r_new = grad_new.copy()
@@ -494,70 +480,7 @@ class GradientDescent(BasalModel):
         """get the residuals from the last fit"""
         return self.residuals
 
-    def get_weights(self):
-        """return a copy of the weights"""
-        self._weight_shape = self.weights.shape
-        return copy.deepcopy(self.weights)
-
-    def get_config(self) -> dict:
-        """constructor hyperparameters, JSON-safe"""
-        task = self.task
-        return {
-            "task": task.value if isinstance(task, ClassificationTask) else task,
-            "divisi": self.divisi,
-            "reg_lambda": self.reg_lambda,
-            "reg_alpha": self.reg_alpha,
-            "use_elastic_reg": self.use_elastic_reg,
-            "early_termination": self.early_termination,
-        }
-
-    def serialize(self) -> dict:
-        """
-        Package the fitted model for inference: type, config, and just the
-        weights predict() needs (_structural_state_keys).
-
-        Returns
-        -------
-        dict
-            {"type", "config", "weights"}, where weights holds the beta
-            coefficients and the standardization stats for both x and y.
-        """
-        return {
-            "type": self.__class__.__name__,
-            "config": self.get_config(),
-            "weights": self._capture_state(),
-        }
-
-    @classmethod
-    def unserialize(cls, payload: dict) -> "GradientDescent":
-        """
-        Reconstruct a fitted model for inference from serialize()'s output.
-
-        Parameters
-        ----------
-        payload : dict, as returned by serialize()
-
-        Returns
-        -------
-        GradientDescent
-            fitted, ready for predict() (and for fit() to continue training)
-        """
-        config = payload["config"]
-        task = config["task"]
-        if task != "regression":
-            task = ClassificationTask(task)
-
-        model = cls(
-            task=task,
-            divisi=config["divisi"],
-            reg_lambda=config["reg_lambda"],
-            reg_alpha=config["reg_alpha"],
-            use_elastic_reg=config["use_elastic_reg"],
-            early_termination=config["early_termination"],
-        )
-        model._restore_state(payload["weights"])
-        # weights include the bias row, so this is the true input dimension
-        model.input_dimension = model.weights.shape[0] - 1
-        model.full_init = True
-
-        return model
+    def set_weights(self, weights: dict) -> None:
+        super().set_weights(weights)
+        self.input_dimension = self.weights.shape[0] - 1
+        self.full_init = True

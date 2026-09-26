@@ -1,4 +1,5 @@
 from enum import Enum
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -29,7 +30,7 @@ class DECISION_TYPES(Enum):
     BINARY = 0
     CHOICE = 1
     SCORE = 2
-    
+
 
 class ClassificationTask(Enum):
     BINARY = "binary"
