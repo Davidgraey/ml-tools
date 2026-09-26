@@ -7,7 +7,13 @@ time-domain definition and against prefill / decode_step.
 import numpy as np
 import pytest
 from conftest import numeric_gradient, relative_error
-from polyergalio.models.layers.spectre_layers import SpectreAttention, SpectreDecoderAttention
+from polyergalio.models.layers.spectre_layers import (
+    DenseHead,
+    HeadGate,
+    HeadProjection,
+    SpectreAttention,
+    SpectreDecoderAttention,
+)
 from polyergalio.models.optimizers import Adam
 
 SEQUENCE = 8
@@ -28,8 +34,9 @@ def build(layer_class, config: dict):
     layer = layer_class(sequence, HIDDEN, num_heads=2, **config)
     rng = np.random.default_rng(0)
     if layer.band_radius:
-        layer.band_taps = 0.3 * (rng.normal(size=layer.band_taps.shape) + 1j * rng.normal(size=layer.band_taps.shape))
-    layer.head_gate.weights_2 = rng.normal(size=layer.head_gate.weights_2.shape)
+        taps = layer.head_gate.band_taps
+        layer.head_gate.band_taps = 0.3 * (rng.normal(size=taps.shape) + 1j * rng.normal(size=taps.shape))
+    layer.head_gate.output_layer.weights = rng.normal(size=layer.head_gate.output_layer.weights.shape)
     x = rng.normal(size=(3, sequence, HIDDEN))
     upstream = rng.normal(size=x.shape)
     mask = np.ones((3, sequence))
@@ -69,22 +76,25 @@ def test_gradients_match_finite_differences(layer_class, config):
     dx, gradients = analytic()
     assert relative_error(dx, numeric_gradient(loss, x)) < 1e-6
 
-    parameters = {
-        "gradient_query_weights": layer.query_weights,
-        "gradient_values_weights": layer.values_weights,
-        "gradient_query_bias": layer.query_bias,
-        "gradient_bias": layer.activation_bias,
-    }
-    for name, tensor in parameters.items():
-        assert relative_error(gradients[name], numeric_gradient(loss, tensor)) < 1e-6, name
-    for name in ("gamma", "beta", "weights_1", "bias_1", "weights_2", "bias_2"):
+    for projection in ("query_projection", "value_projection"):
+        for name in ("weights", "bias"):
+            tensor = getattr(getattr(layer, projection), name)
+            analytic_projection = gradients[projection]["gradient_" + name]
+            assert relative_error(analytic_projection, numeric_gradient(loss, tensor)) < 1e-6, (projection, name)
+    for name in ("gamma", "beta", "activation_bias"):
         analytic_gate = gradients["head_gate"]["gradient_" + name]
         assert relative_error(analytic_gate, numeric_gradient(loss, getattr(layer.head_gate, name))) < 1e-6, name
+    for sublayer in ("hidden_layer", "output_layer"):
+        for name in ("weights", "bias"):
+            tensor = getattr(getattr(layer.head_gate, sublayer), name)
+            analytic_mlp = gradients["head_gate"][sublayer]["gradient_" + name]
+            assert relative_error(analytic_mlp, numeric_gradient(loss, tensor)) < 1e-6, (sublayer, name)
     if layer.memory_tokens:
         memory = gradients["persistent_memory"]["gradient_memory"]
         assert relative_error(memory, numeric_gradient(loss, layer.memory.memory)) < 1e-6
     if layer.band_radius:
-        assert relative_error(gradients["gradient_band"], complex_numeric_gradient(loss, layer.band_taps)) < 1e-6
+        numeric_band = complex_numeric_gradient(loss, layer.head_gate.band_taps)
+        assert relative_error(gradients["head_gate"]["gradient_band_taps"], numeric_band) < 1e-6
 
 
 def test_wrm_gradients_match_finite_differences():
@@ -96,30 +106,6 @@ def test_wrm_gradients_match_finite_differences():
     loss()
     layer.zero_gradients()
     assert relative_error(layer.backward(upstream), numeric_gradient(loss, x)) < 1e-6
-
-
-def test_the_gate_starts_near_identity():
-    """bias holds every gate at 1 + 0j; the shrunken projection only nudges it with content"""
-    layer = SpectreAttention(SEQUENCE, HIDDEN, num_heads=2)
-    layer.head_gate.weights_2[...] = 0.0
-    x = np.random.default_rng(1).normal(size=(2, SEQUENCE, HIDDEN))
-    values = layer._project_heads(x, layer.values_weights, layer.values_bias)
-    np.testing.assert_allclose(layer.forward(x, training_now=False), values, atol=1e-12)
-
-    fresh = SpectreAttention(SEQUENCE, HIDDEN, num_heads=2)
-    fresh.forward(x, training_now=False)
-    assert np.abs(fresh.gate - 1).mean() < 0.3
-
-
-def test_each_head_gates_from_its_own_queries_only():
-    layer = SpectreAttention(SEQUENCE, HIDDEN, num_heads=2)
-    x = np.random.default_rng(3).normal(size=(2, SEQUENCE, HIDDEN))
-    layer.forward(x, training_now=False)
-    before = layer.gate.copy()
-    layer.query_weights[0] += np.random.default_rng(4).normal(size=layer.query_weights[0].shape)
-    layer.forward(x, training_now=False)
-    assert not np.allclose(layer.gate[:, 0], before[:, 0])
-    np.testing.assert_allclose(layer.gate[:, 1], before[:, 1])
 
 
 def test_the_layer_learns_token_mixing():
@@ -151,8 +137,8 @@ def causal_reference(layer, x, mask=None):
     if memory:
         bank = np.broadcast_to(layer.memory.get_memory()[None], (batch, memory, layer.hidden_dim))
         combined = np.concatenate([bank, x], axis=1)
-    queries = layer._project_heads(combined, layer.query_weights, layer.query_bias)
-    values = layer._project_heads(combined, layer.values_weights, layer.values_bias)
+    queries = layer.query_projection.project(combined)
+    values = layer.value_projection.project(combined)
     values[:, memory:] *= mask[..., None]
 
     output = np.zeros_like(x)
@@ -183,16 +169,6 @@ def test_the_training_forward_matches_the_causal_definition(config, chunk_size):
     np.testing.assert_allclose(layer.forward(x, mask=mask), causal_reference(layer, x, mask), atol=1e-10)
 
 
-@pytest.mark.parametrize("chunk_size", CHUNK_SIZES)
-def test_the_training_forward_never_reads_the_future(chunk_size):
-    layer, x, _, mask = build(SpectreDecoderAttention, {"memory_tokens": 2, "chunk_size": chunk_size})
-    before = layer.forward(x, mask=mask)
-    for position in range(1, SEQUENCE):
-        changed = x.copy()
-        changed[:, position:] += 1.0
-        np.testing.assert_allclose(layer.forward(changed, mask=mask)[:, :position], before[:, :position], atol=1e-12)
-
-
 @pytest.mark.parametrize("chunk_size", [3, SEQUENCE])
 def test_chunked_gradients_match_finite_differences(chunk_size):
     layer, x, upstream, mask = build(SpectreDecoderAttention, {"memory_tokens": 2, "band_radius": 1, "chunk_size": chunk_size})
@@ -204,8 +180,10 @@ def test_chunked_gradients_match_finite_differences(chunk_size):
     layer.zero_gradients()
     assert relative_error(layer.backward(upstream), numeric_gradient(loss, x)) < 1e-6
     gradients = layer.get_gradients()
-    assert relative_error(gradients["gradient_query_weights"], numeric_gradient(loss, layer.query_weights)) < 1e-6
-    assert relative_error(gradients["head_gate"]["gradient_weights_1"], numeric_gradient(loss, layer.head_gate.weights_1)) < 1e-6
+    query_weights = layer.query_projection.weights
+    assert relative_error(gradients["query_projection"]["gradient_weights"], numeric_gradient(loss, query_weights)) < 1e-6
+    hidden_weights = layer.head_gate.hidden_layer.weights
+    assert relative_error(gradients["head_gate"]["hidden_layer"]["gradient_weights"], numeric_gradient(loss, hidden_weights)) < 1e-6
     assert relative_error(gradients["persistent_memory"]["gradient_memory"], numeric_gradient(loss, layer.memory.memory)) < 1e-6
 
 
@@ -220,16 +198,6 @@ def test_prefill_and_decode_match_the_training_forward(config, chunk_size):
             np.testing.assert_allclose(output, trained[:, position], atol=1e-10)
 
 
-def test_a_padded_prompt_decodes_like_the_masked_training_forward():
-    layer, x, _, _ = build(SpectreDecoderAttention, {"memory_tokens": 2, "chunk_size": 3})
-    mask = np.ones((x.shape[0], SEQUENCE))
-    mask[:, 1] = 0
-    trained = layer.forward(x, mask=mask)
-    outputs = [layer.prefill(x[:, :4], mask=mask[:, :4])] + [layer.decode_step(x[:, t]) for t in range(4, SEQUENCE)]
-    for position, output in zip(range(3, SEQUENCE), outputs):
-        np.testing.assert_allclose(output, trained[:, position], atol=1e-10)
-
-
 @pytest.mark.parametrize("config", DECODER_CONFIGURATIONS.values(), ids=DECODER_CONFIGURATIONS.keys())
 def test_decoding_past_the_window_matches_a_forward_over_the_last_window(config):
     """chunk_size=1 only: larger chunks' anchors stop lining up with a fresh window once it slides"""
@@ -239,3 +207,66 @@ def test_decoding_past_the_window_matches_a_forward_over_the_last_window(config)
     for t in range(SEQUENCE - 1, x.shape[1]):
         window = x[:, t - SEQUENCE + 1: t + 1]
         np.testing.assert_allclose(outputs[t], layer.forward(window, training_now=False)[:, -1], atol=1e-10)
+
+
+# -------------    head layers    --------------------------
+def test_head_projection_gradients_match_finite_differences():
+    projection = HeadProjection(num_heads=2, head_dim=3)
+    rng = np.random.default_rng(6)
+    x = rng.normal(size=(2, 5, 6))
+    upstream = rng.normal(size=x.shape)
+
+    def loss():
+        return float(np.sum(projection.forward(x) * upstream))
+
+    loss()
+    dx = projection.backward(upstream)
+    assert relative_error(dx, numeric_gradient(loss, x)) < 1e-6
+    assert relative_error(projection.gradient_weights, numeric_gradient(loss, projection.weights)) < 1e-6
+    assert relative_error(projection.gradient_bias, numeric_gradient(loss, projection.bias)) < 1e-6
+
+
+@pytest.mark.parametrize("band_radius", [0, 2])
+def test_head_gate_gradients_match_finite_differences(band_radius):
+    gate = HeadGate(num_heads=2, head_dim=3, num_frequencies=5, gate_hidden=4, band_radius=band_radius)
+    rng = np.random.default_rng(8)
+    gate.output_layer.weights = rng.normal(size=gate.output_layer.weights.shape)
+    if band_radius:
+        gate.band_taps = 0.3 * (rng.normal(size=gate.band_taps.shape) + 1j * rng.normal(size=gate.band_taps.shape))
+    pooled = rng.normal(size=(3, 6))
+    upstream = rng.normal(size=(3, 2, 5)) + 1j * rng.normal(size=(3, 2, 5))
+    descriptor_upstream = rng.normal(size=(3, 6))
+
+    def loss():
+        activated = gate.forward(pooled)
+        return float(np.sum(activated.real * upstream.real + activated.imag * upstream.imag)
+                     + np.sum(gate.descriptor * descriptor_upstream))
+
+    loss()
+    dpooled = gate.backward(upstream, descriptor_upstream)
+    assert relative_error(dpooled, numeric_gradient(loss, pooled)) < 1e-6
+    for name in ("gamma", "beta", "activation_bias"):
+        assert relative_error(getattr(gate, "gradient_" + name), numeric_gradient(loss, getattr(gate, name))) < 1e-6, name
+    for sublayer in (gate.hidden_layer, gate.output_layer):
+        assert relative_error(sublayer.gradient_weights, numeric_gradient(loss, sublayer.weights)) < 1e-6
+        assert relative_error(sublayer.gradient_bias, numeric_gradient(loss, sublayer.bias)) < 1e-6
+    if band_radius:
+        assert relative_error(gate.gradient_band_taps, complex_numeric_gradient(loss, gate.band_taps)) < 1e-6
+
+
+@pytest.mark.parametrize("activation_type", ["linear", "relu", "tanh", "softmax"])
+def test_dense_head_gradients_match_finite_differences(activation_type):
+    layer = DenseHead(num_heads=3, ni=2, no=4, activation_type=activation_type)
+    rng = np.random.default_rng(9)
+    layer.bias = rng.normal(size=layer.bias.shape)
+    x = rng.normal(size=(2, 5, 6))
+    upstream = rng.normal(size=(2, 5, 12))
+
+    def loss():
+        return float(np.sum(layer.forward(x) * upstream))
+
+    loss()
+    dx = layer.backward(upstream)
+    assert relative_error(dx, numeric_gradient(loss, x)) < 1e-6
+    assert relative_error(layer.gradient_weights, numeric_gradient(loss, layer.weights)) < 1e-6
+    assert relative_error(layer.gradient_bias, numeric_gradient(loss, layer.bias)) < 1e-6

@@ -190,6 +190,13 @@ class SentencePieceTokenizer:
         """Return total vocabulary size."""
         return self.sp.get_piece_size()
 
+    def id_to_piece(self, token_id: int) -> str:
+        """
+        The vocabulary piece for one token id, special tokens included as
+        their literal piece string (e.g. "<mask>"), unlike decode().
+        """
+        return self.sp.id_to_piece(int(token_id))
+
     def is_special_token(self, token_id: int) -> bool:
         """Check if token id is special."""
         special_ids = {

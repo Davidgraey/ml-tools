@@ -149,7 +149,7 @@ class ProbCalibration(BasalTransform):
         }
 
     @classmethod
-    def unserialize(cls, payload: dict) -> "ProbCalibration":
+    def deserialize(cls, payload: dict) -> "ProbCalibration":
         """
         Reconstruct a fitted calibrator for inference from serialize()'s
         output.

@@ -5,7 +5,6 @@ from polyergalio.models.layers.basal_layers import (
     EPSILON,
     FullyConnectedLayer,
     Layer,
-    xavier,
 )
 from numpy.typing import NDArray
 
@@ -447,37 +446,43 @@ class VotingGate(VotingBase):
 
 class Expert(Layer):
     """
-    Swish feed-forward expert,
-       downsample (swish( upsample(x) * gate ))
+    Gated feed-forward expert, down_proj(gate_proj(x) * up_proj(x))
 
-    Input shape: (..., hidden_dim)
+    Input shape: (..., input_dim)
+    Projected shape: (..., upscale_dim)
     Output shape: (..., hidden_dim)
     """
 
-    preserves_shape = True
-
-    def __init__(self, hidden_dim: int, expert_hidden: int, activation_type: str = "swish"):
+    def __init__(
+        self,
+        input_dim: int,
+        upscale_dim: int,
+        hidden_dim: int,
+        activation_type: str = "swish",
+    ):
         """
         Parameters
         ----------
-        hidden_dim : width of the incoming/outgoing hidden state
-        expert_hidden : intermediate width
+        input_dim : width of the incoming hidden state
+        upscale_dim : width of the gated projection
+        hidden_dim : width of the outgoing hidden state
         activation_type : activation on the gate projection; swish makes this SwiGLU
         """
         super().__init__()
+        self.input_dim = input_dim
+        self.upscale_dim = upscale_dim
         self.hidden_dim = hidden_dim
-        self.expert_hidden = int(expert_hidden * 1.5)
         self.activation_type = activation_type
-        self.declare_shapes(inputs=((hidden_dim,),), outputs=((hidden_dim,),))
+        self.declare_shapes(inputs=((input_dim,),), outputs=((hidden_dim,),))
 
         self.gate_proj = FullyConnectedLayer(
-            ni=hidden_dim, no=expert_hidden, activation_type=activation_type
+            ni=input_dim, no=upscale_dim, activation_type=activation_type
         )
         self.up_proj = FullyConnectedLayer(
-            ni=hidden_dim, no=expert_hidden, activation_type="linear"
+            ni=input_dim, no=upscale_dim, activation_type="linear"
         )
         self.down_proj = FullyConnectedLayer(
-            ni=expert_hidden, no=hidden_dim, activation_type="linear"
+            ni=upscale_dim, no=hidden_dim, activation_type="linear"
         )
 
         self.gated = None
@@ -544,7 +549,10 @@ class Expert(Layer):
         return sum(layer.num_parameters for layer in self.named_sublayers().values())
 
     def __str__(self):
-        return f"ExpertFFN, {self.activation_type}-gated, {self.hidden_dim} -> {self.expert_hidden} -> {self.hidden_dim}"
+        return (
+            f"Expert, {self.activation_type}-gated, "
+            f"{self.input_dim} -> {self.upscale_dim} -> {self.hidden_dim}"
+        )
 
     def __repr__(self):
         return self.__str__()
@@ -568,6 +576,7 @@ class MixtureOfExperts(Layer):
     def __init__(
         self,
         input_dim: int,
+        upscale_dim: int,
         hidden_dim: int,
         num_shared_experts: int,
         num_routed_experts: int,
@@ -582,17 +591,17 @@ class MixtureOfExperts(Layer):
         """
         Parameters
         ----------
-        hidden_dim : width of the incoming/outgoing hidden state
+        input_dim : width of the incoming hidden state
+        upscale_dim : width of each expert's gated projection
+        hidden_dim : width of the outgoing hidden state
         num_shared_experts : experts every token passes through
         num_routed_experts : size of the routed expert pool the gate chooses top_k from
         top_k : routed experts per token, 2 <= top_k <= num_routed_experts -- the renormalised gate has no gradient at 1
-        gate_hidden : None (default, DeepSeek) scores experts with one projection; an int adds a relu hidden layer
         activation_type : the experts' gate-projection activation, swish for SwiGLU
         gate_activation : "sigmoid" (default, DeepSeek-V3) scores experts independently; "softmax" makes them compete
         bias_update_speed : gamma, the step of the load-balancing bias update
         routed_scaling : multiplier on the routed experts' combined output (DeepSeek-V3 uses 2.5)
         num_groups, top_groups : group-limited routing, see VotingBase. None routes over every expert
-        random_seed : seeds expert initialisation, so no two experts start identical
         """
         super().__init__()
         assert num_shared_experts >= 0, "num_shared_experts must be >= 0"
@@ -601,6 +610,7 @@ class MixtureOfExperts(Layer):
         )
 
         self.input_dim = input_dim
+        self.upscale_dim = upscale_dim
         self.hidden_dim = hidden_dim
         self.num_shared_experts = num_shared_experts
         self.num_routed_experts = num_routed_experts
@@ -614,19 +624,18 @@ class MixtureOfExperts(Layer):
 
         self.declare_shapes(inputs=((input_dim,),), outputs=((hidden_dim,),))
 
-
         self.shared_experts = tuple(
-            Expert(input_dim, hidden_dim, activation_type)
+            Expert(input_dim, upscale_dim, hidden_dim, activation_type)
             for _ in range(num_shared_experts)
         )
         self.routed_experts = tuple(
-            Expert(input_dim, hidden_dim, activation_type)
+            Expert(input_dim, upscale_dim, hidden_dim, activation_type)
             for _ in range(num_routed_experts)
         )
 
         self.gate = VotingWeightBalanced(
             input_shape=input_dim,
-            hidden_size=hidden_dim,
+            hidden_size=None,
             num_experts=num_routed_experts,
             top_k=top_k,
             gate_activation=gate_activation,
@@ -652,7 +661,7 @@ class MixtureOfExperts(Layer):
         """
         Parameters
         ----------
-        hidden_state : (..., hidden_dim), any number of leading batch/sequence axes
+        hidden_state : (..., input_dim), any number of leading batch/sequence axes
         training_now : whether the gate's load-balancing bias updates this pass; None follows train() / eval()
         mask : (...,) matching hidden_state's leading axes, 1 for a real token and 0 for padding
 
@@ -662,9 +671,9 @@ class MixtureOfExperts(Layer):
         """
         training_now = self.training if training_now is None else training_now
         self.in_shape = hidden_state.shape
-        rows = hidden_state.reshape(-1, self.hidden_dim)
+        rows = hidden_state.reshape(-1, self.input_dim)
 
-        output = np.zeros_like(rows)
+        output = np.zeros((rows.shape[0], self.hidden_dim), dtype=rows.dtype)
         for expert in self.shared_experts:
             output = output + expert(rows)
 
@@ -685,15 +694,15 @@ class MixtureOfExperts(Layer):
             self.expert_rows.append(chosen)
             self.expert_outputs.append(expert_out)
 
-        self.output = output.reshape(self.in_shape)
+        self.output = output.reshape(self.in_shape[:-1] + (self.hidden_dim,))
         return self.output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         grad_rows = incoming_grad.reshape(-1, self.hidden_dim)
-        grad_hidden = np.zeros_like(grad_rows)
+        grad_input = np.zeros((grad_rows.shape[0], self.input_dim), dtype=grad_rows.dtype)
 
         for expert in self.shared_experts:
-            grad_hidden = grad_hidden + expert.backward(grad_rows)
+            grad_input = grad_input + expert.backward(grad_rows)
 
         gate_grad = np.zeros_like(self.gate_weights)
         for e, expert in enumerate(self.routed_experts):
@@ -702,17 +711,15 @@ class MixtureOfExperts(Layer):
                 expert.zero_gradients()
                 continue
             upstream = grad_rows[chosen]
-            grad_hidden[chosen] += expert.backward(
+            grad_input[chosen] += expert.backward(
                 self.routed_scaling * self.gate_weights[chosen, e : e + 1] * upstream
             )
             gate_grad[chosen, e] = self.routed_scaling * np.sum(
                 upstream * expert_out, axis=-1
             )
 
-        grad_hidden = grad_hidden + self.gate.backward(gate_grad).reshape(
-            grad_hidden.shape
-        )
-        return grad_hidden.reshape(self.in_shape)
+        grad_input = grad_input + self.gate.backward(gate_grad).reshape(grad_input.shape)
+        return grad_input.reshape(self.in_shape)
 
     def named_sublayers(self) -> dict[str, Layer]:
         named = {f"shared_{n}": e for n, e in enumerate(self.shared_experts, start=1)}
@@ -766,7 +773,7 @@ class MixtureOfExperts(Layer):
         return (
             f"MixtureOfExperts, {self.num_shared_experts} shared + top "
             f"{self.top_k} of {self.num_routed_experts} routed experts, "
-            f"hidden_dim {self.hidden_dim}"
+            f"{self.input_dim} -> {self.upscale_dim} -> {self.hidden_dim}"
         )
 
     def __repr__(self):

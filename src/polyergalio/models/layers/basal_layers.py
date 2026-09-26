@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
 import polyergalio.models.activations as activations
+from polyergalio.models.weight_initialization import get_weight_init
 import numpy as np
 from polyergalio.models.constants import (
     ANY_SHAPE,
@@ -14,30 +15,6 @@ from polyergalio.models.constants import (
 )
 from numpy.typing import NDArray
 
-
-# -------------    weight initilization functions    ---------------
-def xavier(rng, ni: int, no: int) -> NDArray:
-    return rng.normal(loc=0.0, scale=1 / np.sqrt(ni), size=(ni, no)).astype(
-        dtype=GLOBAL_DTYPE
-    )
-
-
-def kaiming(rng, ni: int, no: int) -> NDArray:
-    """weight init function for linear / relu functions with zero bias"""
-    return rng.normal(loc=0.0, scale=np.sqrt(2 / ni), size=(ni, no)).astype(
-        dtype=GLOBAL_DTYPE
-    )
-
-
-weight_init = {
-    "linear": kaiming,
-    "relu": kaiming,
-    "relu_leaky": kaiming,
-    "swish": kaiming,
-    "sigmoid": xavier,
-    "tanh": xavier,
-    "softmax": xavier,
-}
 
 
 def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
@@ -242,13 +219,23 @@ class Layer(ABC):
 
 # TODO: build ENUMS for activations
 class FullyConnectedLayer(Layer):
-    def __init__(self, ni: int, no: int, activation_type: str, is_output: bool = False):
+    def __init__(
+        self,
+        ni: int,
+        no: int,
+        activation_type: str,
+        is_output: bool = False,
+        initialization_override: Optional[str] = None,
+        initialization_kwargs: Optional[dict] = None,
+    ):
         """
         **********ARGUMENTS**********
         :param ni: number of input units
         :param no: number of output units
         :param activation_type: string isdentifying activation type, 'linear', 'sigmoid', 'tanh', etc.
         :param is_output: boolean flag designating if this is an output layer or hidden layer
+        :param initialization_override: any WEIGHT_INIT_DISPATCHER name, used instead of the activation's default
+        :param initialization_kwargs: keyword arguments bound to the initializer, e.g. {"std": 0.01}
         """
         super().__init__()
         self.ni: int = ni
@@ -262,7 +249,13 @@ class FullyConnectedLayer(Layer):
         ]
 
         self.is_output: bool = is_output
-        self.weights: NDArray = weight_init[activation_type](self.RNG, ni=ni, no=no)
+
+        self.initialization_override = initialization_override
+        self.initialization_kwargs = dict(initialization_kwargs or {})
+        initializer = get_weight_init(
+            initialization_override or activation_type, **self.initialization_kwargs
+        )
+        self.weights: NDArray = initializer(self.RNG, ni=ni, no=no)
         self.shape: tuple = self.weights.shape
         self.bias: NDArray = np.zeros((1, no), dtype=GLOBAL_DTYPE)
         self.declare_shapes(inputs=((ni,),), outputs=((no,),))

@@ -38,11 +38,7 @@ class PLSOM(BasalModel):
     sample:pseudo-clustering:cluster membership chain.
     """
 
-    # fields that fully determine a fitted map's structure and weights, on top
-    # of BasalModel's core (x_means, x_stds) -- _capture_state/_restore_state
-    # (inherited from BasalModel) snapshot exactly these. Growing subclasses
-    # extend this tuple further with their own structural fields
-    # (network_shape, etc).
+    # Growing subclasses extend this tuple with their own structural fields
     _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
         "weights",
         "hit_map",
@@ -137,6 +133,7 @@ class PLSOM(BasalModel):
         self.THETAMAX = theta_max if theta_max else width
 
         # TODO: add feedback messaging if invalid selection. Convert to Enum distances
+        self.distance = distance
         self.distance_function = DISTANCE_DICT[distance]
 
         self.n_iter = 0
@@ -323,7 +320,7 @@ class PLSOM(BasalModel):
                 if val_error < self.best_val_error - self.min_delta:
                     self.best_val_error = val_error
                     self.best_epoch = step
-                    self._best_state = self._capture_state()
+                    self._best_state = self.get_weights(for_serialize=True)
                     epochs_without_improvement = 0
                 else:
                     epochs_without_improvement += 1
@@ -337,7 +334,7 @@ class PLSOM(BasalModel):
                     break
 
         if _x_val is not None and self.restore_best and self._best_state is not None:
-            self._restore_state(self._best_state)
+            self.set_weights(self._best_state)
 
         if self.verbose or verbose:
             self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
@@ -625,9 +622,15 @@ class PLSOM(BasalModel):
 
         return prediction
 
-    @property
-    def params(self):
-        return self.weights
+    def get_config(self) -> dict:
+        config = super().get_config()
+        config.update(
+            input_dim=self.input_dimension,
+            theta_min=self.THETAMIN,
+            theta_max=self.THETAMAX,
+            lock_seed=self.seed,
+        )
+        return config
 
 
 if __name__ == "__main__":

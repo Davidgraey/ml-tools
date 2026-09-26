@@ -17,7 +17,6 @@ things follow from that:
 """
 
 import inspect
-import pickle
 import time
 from typing import Iterable, Optional
 
@@ -682,17 +681,6 @@ class NeuralNetwork:
 
         net.output = by_name[serialized_dict["output"]]
         return net
-
-    def save(self, path: str) -> None:
-        """pickle serialize() to a single file -- weights are raw ndarrays, not JSON-safe"""
-        with open(path, mode="wb") as f:
-            pickle.dump(self.serialize(), f, protocol=pickle.DEFAULT_PROTOCOL)
-
-    @classmethod
-    def load(cls, path: str) -> 'NeuralNetwork':
-        """the inverse of save()"""
-        with open(path, mode="rb") as f:
-            return cls.deserialize(pickle.load(f))
 
     def train(self, mode: bool = True) -> 'NeuralNetwork':
         """switch the network and every layer in it between training and inference"""

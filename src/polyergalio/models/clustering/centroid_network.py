@@ -12,9 +12,6 @@ EPSILON = 1e-12
 
 
 class CentroidNeuralNetwork(BasalModel):
-    # fields that fully determine a fitted model's prediction-time state, on
-    # top of BasalModel's core (x_means, x_stds) -- serialize()/unserialize()
-    # snapshot and restore exactly these via _capture_state/_restore_state.
     # The per-k growth history (centroid tracker, label tracker, metrics) is
     # training-time bookkeeping and deliberately left out.
     _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
@@ -381,7 +378,7 @@ class CentroidNeuralNetwork(BasalModel):
         num_centroids : how many of the fitted centroids to classify against.
             Defaults to every centroid currently held (e.g. all of them, for a
             freshly fit model, or just the optimal set, for one restored via
-            unserialize()). Pass get_optimal()'s best count explicitly to pick
+            deserialize()). Pass get_optimal()'s best count explicitly to pick
             the optimal k from a still-in-memory fitted model.
 
         Returns
@@ -479,75 +476,16 @@ class CentroidNeuralNetwork(BasalModel):
             self._label_tracker[best_scoring]
         )
 
-    def get_config(self) -> dict:
-        """constructor hyperparameters, JSON-safe"""
-        return {
-            "max_clusters": self.max_clusters,
-            "seed": self.seed,
-            "epsilon": self.epsilon,
-        }
-
-    def serialize(self) -> dict:
+    def get_weights(self, for_serialize: bool = False) -> dict:
         """
-        Package the fitted model for inference: type, config, and just the
-        weights predict() needs (_structural_state_keys). The per-k growth
-        history (centroid tracker, label tracker, metrics) is training-time
-        bookkeeping and is left out.
-
-        Returns
-        -------
-        dict
-            {"type", "config", "weights"}, where weights holds the optimal
-            (standardized-space) centroids and the standardization stats.
+        Fitted state; when serializing, centroids are cut to the optimal
+        cluster count and the per-k growth history is left out.
         """
-        best_scoring, _, _ = self.get_optimal()
-
-        # _capture_state reads the CURRENT self.centroids -- swap in just the
-        # optimal-k slice for the snapshot, then put the full growth history
-        # back so this call has no side effect on an in-memory model
-        full_centroids = self.centroids
-        self.centroids = self._centroid_tracker[best_scoring]
-        try:
-            weights = self._capture_state()
-        finally:
-            self.centroids = full_centroids
-
-        return {
-            "type": self.__class__.__name__,
-            "config": self.get_config(),
-            "weights": weights,
-        }
-
-    @classmethod
-    def unserialize(cls, payload: dict) -> "CentroidNeuralNetwork":
-        """
-        Reconstruct a fitted model for inference from serialize()'s output.
-
-        Only the optimal centroids and standardization stats are restored.
-        The growth-history trackers and metrics stay at their fresh-instance
-        defaults, so get_optimal() and growth_history() are not usable on the
-        result -- call predict() instead.
-
-        Parameters
-        ----------
-        payload : dict, as returned by serialize()
-
-        Returns
-        -------
-        CentroidNeuralNetwork
-            fitted, ready for predict()
-        """
-        config = payload["config"]
-
-        model = cls(
-            max_clusters=config["max_clusters"],
-            seed=config["seed"],
-            epsilon=config["epsilon"],
-        )
-        model._restore_state(payload["weights"])
-        model._is_fitted = True
-
-        return model
+        state = super().get_weights(for_serialize)
+        if for_serialize and self._centroid_tracker:
+            best_scoring, _, _ = self.get_optimal()
+            state["centroids"] = copy.deepcopy(self._centroid_tracker[best_scoring])
+        return state
 
 
 # Example usage:

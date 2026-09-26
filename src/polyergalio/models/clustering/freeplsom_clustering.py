@@ -130,6 +130,7 @@ class FreePLSOM(PLSOM):
         self._theta_max_auto = theta_max is None
         self.THETAMAX = theta_max if theta_max else 1.0
 
+        self.distance = distance
         self.distance_function = DISTANCE_DICT[distance]
 
         self.n_iter = 0

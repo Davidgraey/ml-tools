@@ -114,12 +114,9 @@ def mod_relu(x: NDArray, bias: float = -0.2) -> NDArray:
 
 
 # ===================== and their derivatives ======================
-# Every derivative below is a vector-Jacobian product: it returns the
-# finished delta, not a local factor for the caller to multiply.
 #   gradient -- the post-activation output of the forward pass
 #   x        -- the pre-activation z of the forward pass
 #   upstream -- incoming dL/d(output)
-
 
 @derivative
 def sigmoid_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray:
@@ -173,20 +170,6 @@ def mod_relu_derivative(z, beta, dout, eps=1e-8):
     d_bias = (proj * mask).sum(axis=0)
     d_z = mask * (dout * scale + z * proj * (-beta / r_safe**2))
     return d_bias, d_z
-# def mod_relu_derivative(gradient: NDArray, bias: float = -0.2) -> NDArray:
-#     """
-#      modrelu = z / |z| * max(|z| +b, 0)
-#     """
-#     magnitude = np.abs(gradient)
-#     mask = (magnitude + bias) > 0
-#
-#     with np.errstate(divide='ignore', invalid='ignore'):
-#         gradient = mask * (gradient / magnitude)
-#
-#     gradient[np.isnan(gradient)] = 0
-#
-#     return gradient * mask
-
 
 
 if __name__ == "__main__":
