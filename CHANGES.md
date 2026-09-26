@@ -1,4 +1,13 @@
-0.1.13
+0.1.3
+=====================
+Aligned BasalModel with the Layer ABC and added differentiable clustering layers.
+    - check examples/NNet_clustering_layers_example.py and the app
+    - types BasalModel: subclass registry, serialization and matching Layers more closely
+    - removed BasalModel params
+    - models/layers/clustering_layers.py: CentroidLayer, PLSOMLayer, GPLSOMLayer, FreePLSOMLayer -- soft-assignment prototype layers with their own clustering energy
+    - examples/NNet_clustering_layers_example.py
+
+0.1.2
 =====================
 Modified our layers -- check examples.
     - Modified clustering mechanisms to work as Network Layers -- need to continue work here
