@@ -2,9 +2,21 @@ from abc import ABC, abstractmethod
 import numpy as np
 from polyergalio.models.layers import Layer
 
+
+def scale_gradients(value, factor: float):
+    """Scale a gradient, or a nested dict of gradients, by factor."""
+    if isinstance(value, dict):
+        return {key: scale_gradients(sub, factor) for key, sub in value.items()}
+    return factor * value
+
+
 class Optimizer(ABC):
     """
     Abstract base class for all optimizers.
+
+    Layers with adaptive = False (the clustering layers) are never rescaled or
+    given state by adaptive optimizers (Adam), which apply a plain gradient
+    step at the layer's own learning_rate instead. SGD treats every layer alike.
     """
 
     def __init__(self):
@@ -22,6 +34,12 @@ class Optimizer(ABC):
         """
         pass
 
+
+    def fixed_step(self, layer: Layer, gradients: dict) -> None:
+        """Plain gradient step at the layer's own learning_rate, for non-adaptive layers under adaptive optimizers."""
+        layer.update_weights(
+            **{key: scale_gradients(sub, layer.learning_rate) for key, sub in gradients.items()}
+        )
 
     def zero_gradients(self, layers: list[Layer]):
         """
@@ -48,17 +66,6 @@ class SGD(Optimizer):
         self.max_norm = 1.0
         self.do_clipping = clip_gradients  # TODO: fix this
 
-
-    def _scale(self, value):
-        """
-        Gradient dictionaries nest as deep as the layers do -- a block holding a
-        block holding a layer
-        scaling should be applied recursively rather than assuming one level.
-        """
-        if isinstance(value, dict):
-            return {key: self._scale(sub) for key, sub in value.items()}
-        return self.learning_rate * value
-
     def step(self, layers: list[Layer]) -> None:
 
         for layer in layers:
@@ -66,9 +73,8 @@ class SGD(Optimizer):
             if not delta_grads:
                 continue
 
-            # matching keys via unpacking delta gradients
             layer.update_weights(
-                **{key: self._scale(sub) for key, sub in delta_grads.items()}
+                **{key: scale_gradients(sub, self.learning_rate) for key, sub in delta_grads.items()}
             )
 
 
@@ -132,6 +138,9 @@ class Adam(Optimizer):
         for layer in layers:
             delta_grads = layer.get_gradients()
             if not delta_grads:
+                continue
+            if not layer.adaptive:
+                self.fixed_step(layer, delta_grads)
                 continue
 
             layer.update_weights(**{key: self.update(sub, (layer, key), momentum_update, ridge_update)

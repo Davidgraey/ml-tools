@@ -64,10 +64,16 @@ class PrototypeLayer(Layer):
     Output shape: (..., K) for assignment and distance, (..., input_dim) for
     quantized, (..., 2) for coordinates. K is declared as a wildcard on
     layers that grow.
+
+    Not adaptive: SGD steps the prototypes at its own rate, and adaptive
+    optimizers (Adam) apply a plain gradient step at learning_rate instead of
+    their rescaling, so the epsilon and Lloyd step sizes are kept and no
+    optimizer state has to follow structural changes.
     """
 
     positions: Optional[NDArray] = None
     grows: bool = False
+    adaptive: bool = False
 
     def __init__(
         self,
@@ -76,6 +82,7 @@ class PrototypeLayer(Layer):
         temperature: float = 1.0,
         energy_weight: float = 1.0,
         output_type: str = "assignment",
+        learning_rate: float = 1.0,
     ):
         super().__init__()
         if output_type not in OUTPUT_TYPES:
@@ -88,6 +95,7 @@ class PrototypeLayer(Layer):
         self.temperature = temperature
         self.energy_weight = energy_weight
         self.output_type = output_type
+        self.learning_rate = learning_rate
 
         self.weights = self.RNG.normal(0.0, 0.1, size=(num_prototypes, input_dim)).astype(GLOBAL_DTYPE)
         self.initialized = False
@@ -274,9 +282,10 @@ class CentroidLayer(PrototypeLayer):
         temperature: float = 1.0,
         energy_weight: float = 1.0,
         output_type: str = "assignment",
+        learning_rate: float = 1.0,
     ):
         self.num_centroids = num_centroids
-        super().__init__(num_centroids, input_dim, temperature, energy_weight, output_type)
+        super().__init__(num_centroids, input_dim, temperature, energy_weight, output_type, learning_rate)
 
     def neighborhood(self, distances: NDArray, training_now: bool) -> tuple[None, NDArray]:
         return None, np.ones(len(distances), dtype=GLOBAL_DTYPE)
@@ -306,6 +315,7 @@ class ParameterlessLayer(PrototypeLayer):
         temperature: float,
         energy_weight: float,
         output_type: str,
+        learning_rate: float,
     ):
         self.theta_min = theta_min
         self.theta_max = theta_max
@@ -317,7 +327,7 @@ class ParameterlessLayer(PrototypeLayer):
         self.epoch = 0
         self.frozen = False
         self.structure_trace: list[tuple[int, str, int]] = []
-        super().__init__(num_prototypes, input_dim, temperature, energy_weight, output_type)
+        super().__init__(num_prototypes, input_dim, temperature, energy_weight, output_type, learning_rate)
         self.hit_map = np.zeros(num_prototypes, dtype=GLOBAL_DTYPE)
         self.node_error = np.zeros(num_prototypes, dtype=GLOBAL_DTYPE)
 
@@ -427,6 +437,7 @@ class PLSOMLayer(ParameterlessLayer):
         temperature: float = 1.0,
         energy_weight: float = 1.0,
         output_type: str = "assignment",
+        learning_rate: float = 1.0,
     ):
         """
         Parameters
@@ -434,6 +445,8 @@ class PLSOMLayer(ParameterlessLayer):
         theta_decay : weight on the previous running_epsilon when it is updated
             with a batch's mean epsilon; 0 uses the current batch alone
         hit_decay : per-epoch decay on the hit and error records
+        learning_rate : prototype step size under adaptive optimizers (Adam);
+            SGD uses its own rate. 1.0 is the classic PLSOM step
         """
         self.width = width
         self.height = height
@@ -449,6 +462,7 @@ class PLSOMLayer(ParameterlessLayer):
             temperature,
             energy_weight,
             output_type,
+            learning_rate,
         )
 
     def build_lattice(self) -> None:
@@ -515,6 +529,7 @@ class GPLSOMLayer(PLSOMLayer):
         temperature: float = 1.0,
         energy_weight: float = 1.0,
         output_type: str = "assignment",
+        learning_rate: float = 1.0,
     ):
         """
         Parameters
@@ -538,7 +553,7 @@ class GPLSOMLayer(PLSOMLayer):
         self.last_structural_epoch = -settle_epochs
         super().__init__(
             width, height, input_dim, theta_min, theta_max, r_decay, theta_decay, hit_decay,
-            temperature, energy_weight, output_type,
+            temperature, energy_weight, output_type, learning_rate,
         )
 
     def restructure(self) -> Optional[str]:
@@ -725,6 +740,7 @@ class FreePLSOMLayer(ParameterlessLayer):
         temperature: float = 1.0,
         energy_weight: float = 1.0,
         output_type: str = "assignment",
+        learning_rate: float = 1.0,
     ):
         """
         Parameters
@@ -750,7 +766,7 @@ class FreePLSOMLayer(ParameterlessLayer):
         self.last_structural_epoch = -settle_epochs
         super().__init__(
             n_neurons, input_dim, theta_min, theta_max if theta_max else max(1.0, n_neurons / 2),
-            r_decay, theta_decay, hit_decay, temperature, energy_weight, output_type,
+            r_decay, theta_decay, hit_decay, temperature, energy_weight, output_type, learning_rate,
         )
 
     @property

@@ -49,6 +49,7 @@ def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
 # ------------------------------------------------------------------
 class Layer(ABC):
     preserves_shape: bool = False
+    adaptive: bool = True
     training: bool = True
     registry_name: Optional[str] = None
     _registry: dict[str, type] = {}
